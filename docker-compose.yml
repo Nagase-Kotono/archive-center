@@ -1,0 +1,99 @@
+# Archive Center 단일 스택 (Go 백엔드 + MariaDB + ChromaDB).
+# 실행: cp .env.docker.example .env → 값 채우고 → docker compose up -d --build
+# 이 포크 운영용 파일 (원본 레포엔 없음).
+name: archive-center
+
+services:
+  # 정본 저장소 (MariaDB). 001_schema.sql을 initdb.d에 넣어 최초 기동 때 자동 스키마.
+  # 주의: initdb.d는 빈 볼륨 최초 1회만 실행. 스키마 변경 시 수동 마이그레이션 필요 (DOCKER.md 참고).
+  ac-mariadb:
+    image: mariadb:11.8          # 패치까지 핀 (재현성). upstream 11.x 자동 업글 방지.
+    container_name: ac-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: archive_center
+      MARIADB_USER: ac_user
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?set MARIADB_PASSWORD in .env}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?set MARIADB_ROOT_PASSWORD in .env}
+    volumes:
+      - /Volumes/Nagase_K/archive-center/mariadb:/var/lib/mysql
+      - ./migrations/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 2g                # 환경 맞게 조정 (맥미니 램에 맞춰)
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ac-net]
+
+  # 벡터 검색 가속기 (ChromaDB). 미리 계산된 임베딩을 upsert/query만 함.
+  # 1.5.9는 /data 에 자동 persist (실측 확인). persist env는 버전 의존이라 안 넣음.
+  ac-chroma:
+    image: chromadb/chroma:1.5.9
+    container_name: ac-chroma
+    restart: unless-stopped
+    environment:
+      ANONYMIZED_TELEMETRY: "FALSE"   # 외부 익명 텔레메트리 차단
+    volumes:
+      - /Volumes/Nagase_K/archive-center/chroma:/data
+    healthcheck:
+      # 이미지에 curl/wget/python 없고 bash만 있음. bash /dev/tcp 로 8000 포트 리슨 확인.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ac-net]
+
+  # Go 백엔드. Tailscale IP:28080 에만 노출, bearer token 인증.
+  ac-go:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: archive-center-kotono:local
+    container_name: ac-go
+    restart: unless-stopped
+    environment:
+      AC_BUILD_VERSION: "3.0.1"
+      AC_BIND_ADDR: "0.0.0.0:28080"
+      # live + mariadb_authority = 실제 영속 저장. DSN은 parseTime 필수 + collation을 스키마(utf8mb4_unicode_ci)와 일치.
+      AC_MODE: "live"
+      AC_STORE_MODE: "mariadb_authority"
+      AC_MARIADB_DSN: "ac_user:${MARIADB_PASSWORD}@tcp(ac-mariadb:3306)/archive_center?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&loc=UTC"
+      # endpoint만 주면 config가 full_local+bundled 프로파일로 자동 배선.
+      AC_CHROMA_ENDPOINT: "http://ac-chroma:8000"
+      AC_CHROMA_API_PATH: "/api/v2"
+      # 주 컬렉션/reference 컬렉션은 config 기본값 사용 (Validate가 서로 다름을 강제).
+      AC_ENFORCE_AUTH: "true"
+      AC_BEARER_TOKEN: ${AC_BEARER_TOKEN:?set AC_BEARER_TOKEN in .env}
+      # 컨테이너는 이미지 재빌드로 업데이트 → 자기 바이너리 자동 교체(updater) 끔.
+      AC_UPDATE_ENABLED: "false"
+      AC_ALLOWED_ORIGINS: "*"
+    volumes:
+      # 프롬프트 편집 UI를 쓰므로 host 바인드 (편집분이 재빌드에도 유지). 소유권 65532(nonroot) 필요.
+      - /Volumes/Nagase_K/archive-center/prompts:/app/prompts
+    ports:
+      # Tailscale IP 인터페이스에만 바인드. 빈값이면 0.0.0.0 전체 노출되므로 :? 가드로 강제.
+      - "${AC_HOST_IP:?set AC_HOST_IP in .env (tailscale ip -4)}:28080:28080"
+    depends_on:
+      ac-mariadb:
+        condition: service_healthy
+      ac-chroma:
+        condition: service_healthy   # heartbeat 통과 후에만 기동 (초기 플래핑 방지)
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ac-net]
+
+networks:
+  ac-net:
+    driver: bridge

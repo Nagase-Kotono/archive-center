@@ -1,0 +1,9 @@
+# 빌드 context 슬림 + 시크릿/오염 방지
+.git
+.gitignore
+.env
+.env.*
+!.env*.example
+.updates
+# prompts 복사본은 이미지에 넣지 않음 (host 바인드가 실제 사용본)
+prompts/*복사본*
