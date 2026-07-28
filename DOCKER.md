@@ -46,13 +46,50 @@ docker exec pocketrisu-ts wget -qO- http://127.0.0.1:28080/ready
 ## 업데이트
 
 컨테이너는 자기 바이너리를 덮어쓰지 않아요(`AC_UPDATE_ENABLED=false`). 재빌드로 업데이트해요.
+upstream 업데이트를 반영할 땐 **백업 → 빌드만 → 스키마 → 검증 → 기동** 순서를 지켜요.
+새 코드가 새 테이블 없이 먼저 뜨면 해당 요청만 500으로 실패해요.
 
 ```bash
-git pull
-docker compose up -d --build
+git fetch upstream && git merge upstream/main
+
+# 1) 논리 백업 + 롤백용 이미지 태그
+docker exec ac-mariadb sh -c 'mariadb-dump --single-transaction --routines --events \
+  -uroot -p"$MARIADB_ROOT_PASSWORD" archive_center' \
+  > /Volumes/Nagase_K/archive-center/backups/archive_center-$(date +%Y%m%d-%H%M%S).sql
+docker tag archive-center-kotono:local archive-center-kotono:<이전버전>-rollback
+
+# 2) 이미지 빌드만 (아직 기동 안 함)
+docker compose build ac-go
+
+# 3) 스키마 델타 적용 → 4) 검증 → 5) 기동
+docker exec -i ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" archive_center' \
+  < migrations/00N_....sql
+docker exec pocketrisu-ts wget -qO- http://127.0.0.1:28080/ready
+docker compose up -d --no-build
 ```
 
+`AC_BUILD_VERSION` 도 새 버전으로 맞춰요 (표기용이라 기능에 영향은 없지만 `/version` 이 이 값을 그대로 내보내요).
+
+**프롬프트 주의**: `prompts/` 는 호스트 바인드라 이미지의 새 프롬프트를 가려요. upstream이
+`critic_system.txt` / `supervisor_system.txt` 를 바꾸면 호스트 쪽을 직접 갱신해야 반영돼요.
+편집분이 있으면 덮어쓰기 전에 병합하세요.
+
 RisuAI 플러그인 창의 "업데이트"는 **JS 어댑터**용이라 이 백엔드 컨테이너와 별개예요.
+`Archive Center.js` 가 바뀌면 리수 쪽 플러그인도 따로 갱신해야 해요.
+
+### 스키마 마이그레이션 (initdb.d 우회)
+
+`001_schema.sql` 은 MariaDB 볼륨이 빈 최초 1회만 적용돼요. 이미 돌던 DB엔 델타 SQL을 직접 먹여요.
+upstream은 새 스키마를 `migrations/00N_*.sql` 로 따로 내면서 `001_schema.sql` 에도 같은 문장을
+등록해요 (그래서 새로 만드는 DB는 `001` 만으로 완전해요). 델타 파일은 `CREATE TABLE IF NOT EXISTS`
+라 재실행해도 안전하지만, DDL은 원자적이지 않으니 적용 후 테이블 수를 꼭 확인하세요.
+
+```bash
+docker exec ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N \
+  -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"archive_center\""'
+```
+
+적용 이력: 3.0.1 → 3.5.0 에서 `002_canon_pack_storage.sql` 적용 (테이블 52 → 62).
 
 ## 데이터 / 백업
 
@@ -70,7 +107,7 @@ docker exec ac-mariadb sh -c 'mariadb-dump --single-transaction -uroot -p"$MARIA
 
 ## 운영 주의 (이중 리뷰 반영)
 
-- **스키마 마이그레이션**: `001_schema.sql`은 MariaDB 볼륨이 빈 최초 1회만 적용돼요. upstream이 스키마를 바꾸면 수동 `ALTER` 또는 백업 후 볼륨 초기화가 필요해요.
+- **스키마 마이그레이션**: `001_schema.sql`은 MariaDB 볼륨이 빈 최초 1회만 적용돼요. 이미 돌던 DB에 upstream 스키마 변경을 넣는 절차는 위 "스키마 마이그레이션" 항목 참고.
 - **외장 SSD**: `/Volumes/Nagase_K/...` 바인드라, SSD 미마운트 상태로 기동하면 엉뚱한 위치에 빈 DB가 생길 수 있어요. 기동 전 마운트 확인.
 - **namespace 의존**: `pocketrisu-ts` 가 재생성되면 ac 서비스도 network가 끊기니 재기동(`docker compose up -d`)이 필요해요.
 - **비밀번호**: DSN에 들어가므로 `openssl rand -hex 32` 같은 DSN-safe(hex) 값을 쓰세요. `@ : / ?` 특수문자는 DSN 파싱을 깨요.
