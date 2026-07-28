@@ -1,18 +1,25 @@
-# Archive Center 2.1 Windows Package
+# Archive Center 3.5 Windows Auto Install Package
 
-This is the Windows package for Archive Center 2.1.
+This is the lightweight Windows auto-install package for Archive Center 3.5.
 
 It includes:
 
 - Go backend
 - next-start package updater
-- MariaDB runtime
-- ChromaDB/Python runtime
+- per-user MariaDB runtime installer
 - Archive Center.js
 - migrations
 - prompts
 
-Normal users do not need to install MariaDB or ChromaDB manually.
+MariaDB and ChromaDB are not contained in the Archive Center ZIP. On first
+start, the launcher downloads the pinned official MariaDB ZIP, verifies its
+SHA-256, and installs it under
+`%LOCALAPPDATA%\ArchiveCenter\runtime\MariaDB`.
+
+The default runtime profile is `core_lite` with vector mode `fallback`, so
+ChromaDB is not required for the normal first start. Users who need vector
+search can configure an external ChromaDB endpoint or a separately installed
+local ChromaDB runtime.
 
 ## Start
 
@@ -23,7 +30,9 @@ Double-click:
 ```
 
 The launcher binds the backend to `0.0.0.0:28080`, so the same file works for both same-PC and remote-browser use.
-It creates `.env.full.local` if it does not exist, starts bundled MariaDB, starts bundled ChromaDB, applies schema migrations, and starts the Go backend.
+It creates `.env.full.local` if it does not exist, prepares or starts the
+separate per-user MariaDB runtime, applies schema migrations, and starts the Go
+backend. It does not install a Windows service or require administrator rights.
 
 Leave the console window open while using Archive Center.
 
@@ -50,8 +59,10 @@ cannot prove either `no_mutation` or a safe rollback, startup stops with a
 recovery error instead of running a mixed package.
 
 Updates do not move, replace, or copy `.runtime/`, `.updates/`,
-`.env.full.local`, or `.env.full.local.protected`. MariaDB and ChromaDB keep
-using their existing package-local data directories. The v1 automatic updater
+`.env.full.local`, or `.env.full.local.protected`. MariaDB and any separately
+configured ChromaDB keep using their existing data directories. The MariaDB
+executable runtime remains outside the versioned package under
+`%LOCALAPPDATA%\ArchiveCenter`. The v1 automatic updater
 rejects a package that adds or changes managed migration SQL or
 `mariadb-schema.exe`; database-changing releases require a separately reviewed
 manual migration path.
@@ -100,20 +111,10 @@ See `WINDOWS_TRUST_AND_DEFENDER.md` for the submission checklist.
 
 ## Optional 1.0 DB migration
 
-If you have an old Archive Center 1.0 `memory.db`, start Archive Center 2.1 first,
-then double-click:
-
-```text
-06_migrate_1_0_to_2_0_windows.bat
-```
-
-The first pass is a dry-run only. It reads the old SQLite DB in read-only mode,
-exports recognized tables, validates the export, and writes a report under
-`.runtime/legacy-migration/`. It imports into MariaDB only after you type `YES`.
-
-After importing, open the Archive Center UI and confirm sessions/timeline data.
-Run vector reindex if imported memories should become searchable through
-ChromaDB.
+Legacy 1.0 migration executables are not part of the normal Windows package.
+They are offline migration utilities, not normal startup dependencies. Users
+who still need to migrate an old `memory.db` must use the separately published
+Legacy Migration Tools package that matches this Archive Center release.
 
 ## Protect local env secrets
 
@@ -138,6 +139,7 @@ Edit `.env.full.local`, then run `04_protect_env_windows.bat` again.
 Do not put these into a release zip:
 
 - `.runtime/`
+- MariaDB or ChromaDB runtime binaries
 - database files
 - ChromaDB persist data
 - API keys

@@ -1,9 +1,8 @@
 param(
     [string]$OutputRoot,
     [string]$PackageName = "",
-    [string]$PackageKind = "full",
-    [string]$PackageVersion = "3.0.0",
-    [string]$MariaDBRuntime = "",
+    [string]$PackageKind = "managed",
+    [string]$PackageVersion = "3.5.0",
     [string]$ChromaRuntime = "",
     [string]$CodeSigningCertThumbprint = "",
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -38,7 +37,7 @@ function Copy-File([string]$Source, [string]$DestRelative) {
     Copy-Item -LiteralPath $src -Destination $dest -Force
 }
 
-function Copy-Directory([string]$Source, [string]$DestRelative) {
+function Copy-Directory([string]$Source, [string]$DestRelative, [string[]]$ExcludeNames = @()) {
     $src = Join-Path $repoRoot $Source
     if (-not (Test-Path -LiteralPath $src -PathType Container)) {
         throw "Missing source directory: $src"
@@ -46,7 +45,9 @@ function Copy-Directory([string]$Source, [string]$DestRelative) {
     $dest = Join-Path $targetFull $DestRelative
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     Get-ChildItem -LiteralPath $src -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
+        if ($ExcludeNames -notcontains $_.Name) {
+            Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force
+        }
     }
 }
 
@@ -71,15 +72,32 @@ function Copy-RuntimePayload([string]$Source, [string]$DestRelative) {
     return $true
 }
 
-function Find-MariaDBProvider([string]$Root) {
-    $hits = Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ieq "mariadbd.exe" -or $_.Name -ieq "mysqld.exe" } |
-        Sort-Object FullName |
-        Select-Object -First 1
-    if ($null -eq $hits) {
-        return ""
+function Install-ChromaRuntimeLicenseFiles([string]$RuntimeRoot) {
+    $apacheLicense = Join-Path $repoRoot "licenses\Apache-2.0.txt"
+    if (-not (Test-Path -LiteralPath $apacheLicense -PathType Leaf)) {
+        throw "Missing required Apache-2.0 license text: $apacheLicense"
     }
-    return $hits.FullName
+
+    $required = @(
+        [ordered]@{ Package = "flatbuffers"; Version = "25.12.19" },
+        [ordered]@{ Package = "tokenizers"; Version = "0.23.1" }
+    )
+    foreach ($item in $required) {
+        $distInfoName = "$($item.Package)-$($item.Version).dist-info"
+        $distInfo = Get-ChildItem -LiteralPath $RuntimeRoot -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ieq $distInfoName } |
+            Select-Object -First 1
+        if ($null -eq $distInfo) {
+            throw "Required ChromaDB dependency metadata was not found: $distInfoName"
+        }
+        $licenseDir = Join-Path $distInfo.FullName "licenses"
+        New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+        $destination = Join-Path $licenseDir "LICENSE.Apache-2.0"
+        Copy-Item -LiteralPath $apacheLicense -Destination $destination -Force
+        if (-not (Test-Path -LiteralPath $destination -PathType Leaf) -or (Get-Item -LiteralPath $destination).Length -eq 0) {
+            throw "Failed to install required license text: $destination"
+        }
+    }
 }
 
 function Find-ChromaRuntime([string]$Root) {
@@ -116,16 +134,26 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.0.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
+    $packageLabel = if ($PackageKind -eq "managed") {
+        "Archive Center $version Windows Auto Install Package"
+    } else {
+        "Archive Center $version Windows Package"
+    }
+    $startupLabel = if ($PackageKind -eq "managed") {
+        "Starting Archive Center $version Windows auto-install package"
+    } else {
+        "Starting Archive Center $version package"
+    }
     $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-    $text = $text.Replace("Archive Center 2.1 Windows Full Package", "Archive Center $version Windows Package")
-    $text = $text.Replace("Starting Archive Center 2.1 full package", "Starting Archive Center $version package")
+    $text = $text.Replace("Archive Center 2.1 Windows Full Package", $packageLabel)
+    $text = $text.Replace("Starting Archive Center 2.1 full package", $startupLabel)
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($Path, $text, $utf8NoBom)
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.0.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $patterns = @("*.md", "*.txt", "*.bat", "*.cmd", "*.ps1", "*.sh", "*.command")
     foreach ($pattern in $patterns) {
@@ -293,7 +321,7 @@ function Write-PackageTrustEvidence([string]$Root) {
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
         scope = "managed_package_payloads"
         signature_scope = "executable_and_script_payloads"
-        package_root = $Root
+        package_root = "."
         automatic_defender_exclusions = $false
         checked_files = $items.Count
         managed_file_count = $items.Count
@@ -329,25 +357,39 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 
 $PackageKind = $PackageKind.Trim().ToLowerInvariant()
-if ($PackageKind -ne "full") {
-    throw "Unsupported PackageKind: $PackageKind. Archive Center builds the standard package only."
+if ($PackageKind -notin @("managed", "full")) {
+    throw "Unsupported PackageKind: $PackageKind. Use managed or full."
 }
 
 if ([string]::IsNullOrWhiteSpace($PackageName)) {
-    $PackageName = "Archive Center $PackageVersion Windows Package"
+    $PackageName = if ($PackageKind -eq "managed") {
+        "Archive Center $PackageVersion Windows Auto Install Package"
+    } else {
+        "Archive Center $PackageVersion Windows Package"
+    }
 }
 
-$runtimeProfileDefault = "full_local"
-$vectorModeDefault = "bundled"
-$packageProfile = "windows_full_local"
 $vectorEngine = "chromadb"
-$requiredRuntimePayloads = @("mariadb", "chromadb")
+if ($PackageKind -eq "managed") {
+    if (-not [string]::IsNullOrWhiteSpace($ChromaRuntime)) {
+        throw "Managed Windows packages must not bundle ChromaDB. Remove -ChromaRuntime or use -PackageKind full for an internal full build."
+    }
+    $runtimeProfileDefault = "core_lite"
+    $vectorModeDefault = "fallback"
+    $packageProfile = "windows_managed_auto_install"
+    $requiredRuntimePayloads = @()
+} else {
+    $runtimeProfileDefault = "full_local"
+    $vectorModeDefault = "bundled"
+    $packageProfile = "windows_full_local"
+    $requiredRuntimePayloads = @("chromadb")
+}
 
 $outputRootFull = Resolve-FullPath $OutputRoot
 $targetFull = Resolve-FullPath (Join-Path $outputRootFull $PackageName)
 
 if (-not (Test-PathInside $targetFull $repoRoot)) {
-    throw "Refusing to write full package outside Archive Center 2.0: $targetFull"
+    throw "Refusing to write full package outside the Archive Center workspace: $targetFull"
 }
 
 if ((Test-Path -LiteralPath $targetFull) -and -not $ForceRefresh) {
@@ -388,20 +430,6 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "go build mariadb-schema failed."
     }
-    $migrationTools = @(
-        "sqlite-export",
-        "dry-run-validator",
-        "compare-dry-run",
-        "mariadb-dry-run-import",
-        "mariadb-import",
-        "legacy10-migrate"
-    )
-    foreach ($tool in $migrationTools) {
-        & go build -buildvcs=false -trimpath -ldflags "-s -w" -o (Join-Path $targetFull "bin\$tool.exe") "./cmd/$tool"
-        if ($LASTEXITCODE -ne 0) {
-            throw "go build $tool failed."
-        }
-    }
 } finally {
     Pop-Location
 }
@@ -409,7 +437,8 @@ try {
 Copy-File "Archive Center.js" "Archive Center.js"
 Copy-File ".env.example" ".env.source.example"
 Copy-Directory "migrations" "migrations"
-Copy-Directory "prompts" "prompts"
+Copy-File "prompts/critic_system.txt" "prompts/critic_system.txt"
+Copy-File "prompts/supervisor_system.txt" "prompts/supervisor_system.txt"
 
 Copy-File "ops/full-package/README_FULL_PACKAGE.md" "README.md"
 Copy-File "ops/full-package/README_FULL_PACKAGE.md" "README_FULL_PACKAGE.md"
@@ -420,28 +449,36 @@ Copy-File "ops/full-package/02_smoke_test_windows.bat" "02_smoke_test_windows.ba
 Copy-File "ops/full-package/03_run_backend.bat" "03_run_backend.bat"
 Copy-File "ops/full-package/04_protect_env_windows.bat" "04_protect_env_windows.bat"
 Copy-File "ops/full-package/05_unprotect_env_windows.bat" "05_unprotect_env_windows.bat"
-Copy-File "ops/full-package/06_migrate_1_0_to_2_0_windows.bat" "06_migrate_1_0_to_2_0_windows.bat"
 Copy-File "ops/full-package/.env.full.example" ".env.full.example"
-Copy-Directory "ops/full-package/scripts" "scripts"
+Copy-Directory "ops/full-package/scripts" "scripts" @("migrate-legacy-1.0-windows.ps1")
 Copy-File "ops/install-windows.ps1" "tools/install-windows.ps1"
+Copy-File "LICENSE" "LICENSE"
+Copy-File "NOTICE" "NOTICE"
+Copy-File "THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"
+Copy-Directory "licenses" "licenses"
 Set-RuntimeDefaultsInEnvExample (Join-Path $targetFull ".env.full.example") $runtimeProfileDefault $vectorModeDefault $PackageVersion
 Set-CopiedPackageKindText (Join-Path $targetFull "01_start_archive_center_windows.bat") $PackageKind $PackageVersion
 Set-CopiedPackageKindText (Join-Path $targetFull "scripts\start-full-windows.ps1") $PackageKind $PackageVersion
 Set-CopiedPackageVersionText $targetFull $PackageVersion
 
-$mariadbCopied = Copy-RuntimePayload $MariaDBRuntime "runtime\MariaDB"
-$chromaCopied = Copy-RuntimePayload $ChromaRuntime "runtime\ChromaDB"
+$chromaCopied = $false
+if ($PackageKind -eq "full") {
+    $chromaCopied = Copy-RuntimePayload $ChromaRuntime "runtime\ChromaDB"
+}
 
 $runtimeRoot = Join-Path $targetFull "runtime"
-$mariadbProvider = Find-MariaDBProvider $runtimeRoot
-$chromaRuntimeFound = Find-ChromaRuntime $runtimeRoot
+$chromaRuntimeFound = if (Test-Path -LiteralPath $runtimeRoot -PathType Container) {
+    Find-ChromaRuntime $runtimeRoot
+} else {
+    ""
+}
+if ($chromaCopied) {
+    Install-ChromaRuntimeLicenseFiles (Join-Path $runtimeRoot "ChromaDB")
+}
 $codeSigning = Set-OwnPayloadSignatures $targetFull $CodeSigningCertThumbprint $TimestampServer
 $trustEvidence = Write-PackageTrustEvidence $targetFull
 $missing = @()
-if ([string]::IsNullOrWhiteSpace($mariadbProvider)) {
-    $missing += "mariadb_runtime"
-}
-if ([string]::IsNullOrWhiteSpace($chromaRuntimeFound)) {
+if ($PackageKind -eq "full" -and [string]::IsNullOrWhiteSpace($chromaRuntimeFound)) {
     $missing += "chromadb_runtime"
 }
 
@@ -453,7 +490,7 @@ if (-not $releaseReady -and -not $AllowMissingRuntimePayloads) {
         package_profile = $packageProfile
         status = "blocked_missing_runtime_payloads"
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
-        target_root = $targetFull
+        target_root = "."
         runtime_profile_default = $runtimeProfileDefault
         vector_mode_default = $vectorModeDefault
         required_runtime_payloads = $requiredRuntimePayloads
@@ -476,27 +513,29 @@ $manifest = [ordered]@{
     package_kind = $PackageKind
     package_profile = $packageProfile
     generated_at = [DateTimeOffset]::UtcNow.ToString("o")
-    source_root = $repoRoot
-    target_root = $targetFull
+    source_root = "release-source"
+    target_root = "."
     release_ready = $releaseReady
     status = if ($releaseReady) { "green" } else { "red_missing_runtime_payloads" }
     size_bytes = [int64]$sizeBytes
     canonical_store = "mariadb"
     vector_engine = $vectorEngine
-    includes_runtime_binaries = $releaseReady
+    includes_runtime_binaries = [bool]$chromaCopied
+    mariadb_distribution = "separate_official_runtime_install"
     runtime_profile_default = $runtimeProfileDefault
     vector_mode_default = $vectorModeDefault
     go_toolchain = $goVersionText
-    chromadb_version = "1.5.9"
+    chromadb_version = if ($chromaCopied) { "1.5.9" } else { "not_bundled" }
     chromadb_api_path = "/api/v2"
     required_runtime_payloads = $requiredRuntimePayloads
     runtime_payloads = [ordered]@{
-        mariadb_copied_from = $MariaDBRuntime
-        mariadb_payload_copied = [bool]$mariadbCopied
-        mariadb_provider_path = $mariadbProvider
-        chromadb_copied_from = $ChromaRuntime
+        mariadb_payload_copied = $false
+        mariadb_install_tool = "tools/install-windows.ps1"
+        mariadb_external_runtime_root = "%LOCALAPPDATA%\ArchiveCenter\runtime\MariaDB"
+        chromadb_copied_from = if ($chromaCopied) { "release-runtime-input" } else { "" }
         chromadb_payload_copied = [bool]$chromaCopied
         chromadb_runtime_path = $chromaRuntimeFound
+        chromadb_default_behavior = if ($PackageKind -eq "managed") { "fallback; configure an external or separately installed local ChromaDB to enable vector mode" } else { "bundled" }
     }
     windows_trust = [ordered]@{
         automatic_defender_exclusions = $false
@@ -509,13 +548,11 @@ $manifest = [ordered]@{
         "bin/archive-center-go.exe",
         "bin/archive-center-updater.exe",
         "bin/mariadb-schema.exe",
-        "bin/legacy10-migrate.exe",
-        "bin/sqlite-export.exe",
-        "bin/dry-run-validator.exe",
-        "bin/compare-dry-run.exe",
-        "bin/mariadb-dry-run-import.exe",
-        "bin/mariadb-import.exe",
         "Archive Center.js",
+        "LICENSE",
+        "NOTICE",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses",
         "WINDOWS_TRUST_AND_DEFENDER.md",
         "PACKAGE_FILE_MANIFEST.json",
         "SHA256SUMS.txt",
@@ -526,7 +563,6 @@ $manifest = [ordered]@{
         "03_run_backend.bat",
         "04_protect_env_windows.bat",
         "05_unprotect_env_windows.bat",
-        "06_migrate_1_0_to_2_0_windows.bat",
         "scripts",
         "tools/install-windows.ps1"
     )
@@ -537,6 +573,8 @@ $manifest = [ordered]@{
         "go-service source",
         "test binaries",
         "database files",
+        "MariaDB runtime binaries",
+        "legacy 1.0 migration tools and launcher",
         "ChromaDB persist data",
         "backup/release/deploy outputs"
     )
@@ -552,7 +590,8 @@ if ($Zip -and $UpdateZip) {
     throw "Use either -Zip for the full installation archive or -UpdateZip for the managed automatic-update archive, not both."
 }
 if ($UpdateZip) {
-    $updatePackageName = $PackageName -replace '(?i)Windows Package$', 'Windows Update Package'
+    $updatePackageName = $PackageName -replace '(?i)Windows Auto Install Package$', 'Windows Update Package'
+    $updatePackageName = $updatePackageName -replace '(?i)Windows Package$', 'Windows Update Package'
     if ($updatePackageName -eq $PackageName) {
         $updatePackageName = "$PackageName Update"
     }
@@ -621,7 +660,7 @@ if ($Zip -or $UpdateZip) {
             }
             $manifestEntry = $manifestEntries[0]
             $packagePrefix = $manifestEntry.Substring(0, $manifestEntry.Length - "PACKAGE_FILE_MANIFEST.json".Length)
-            foreach ($requiredEntry in @("PACKAGE_FILE_MANIFEST.json", "bin/archive-center-go.exe", "bin/archive-center-updater.exe", "Archive Center.js")) {
+            foreach ($requiredEntry in @("PACKAGE_FILE_MANIFEST.json", "bin/archive-center-go.exe", "bin/archive-center-updater.exe", "Archive Center.js", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/Apache-2.0.txt")) {
                 $expectedEntry = $packagePrefix + $requiredEntry
                 if (-not $entryMap.ContainsKey($expectedEntry) -or $entryMap[$expectedEntry].Length -le 0) {
                     throw "Generated ZIP is missing required package entry: $expectedEntry"

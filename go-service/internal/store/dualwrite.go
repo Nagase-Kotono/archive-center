@@ -60,9 +60,87 @@ func (d *dualWriteStore) SaveChatLog(ctx context.Context, log *ChatLog) error {
 	return nil
 }
 
+func (d *dualWriteStore) ReplaceLogicalTurn(ctx context.Context, replacement LogicalTurnReplacement) error {
+	primary, primaryOK := d.primary.(LogicalTurnReplacementStore)
+	shadow, shadowOK := d.shadow.(LogicalTurnReplacementStore)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := primary.ReplaceLogicalTurn(ctx, replacement); err != nil {
+			return err
+		}
+	}
+	if shadowOK {
+		if err := shadow.ReplaceLogicalTurn(ctx, replacement); err != nil {
+			d.recordShadowErr(err)
+			if !primaryOK {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ListChatLogs reads from primary only.
 func (d *dualWriteStore) ListChatLogs(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]ChatLog, error) {
 	return d.primary.ListChatLogs(ctx, chatSessionID, fromTurn, toTurn)
+}
+
+func (d *dualWriteStore) LatestSessionTurnIndex(ctx context.Context, chatSessionID string) (int, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return 0, ErrNotEnabled
+	}
+	return reader.LatestSessionTurnIndex(ctx, chatSessionID)
+}
+
+func (d *dualWriteStore) ListMemoriesRange(ctx context.Context, chatSessionID string, fromTurn, toTurn int, includeIDs []int64) ([]Memory, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListMemoriesRange(ctx, chatSessionID, fromTurn, toTurn, includeIDs)
+}
+
+func (d *dualWriteStore) ListEvidenceRange(ctx context.Context, chatSessionID string, fromTurn, toTurn int, includeIDs []int64) ([]DirectEvidence, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListEvidenceRange(ctx, chatSessionID, fromTurn, toTurn, includeIDs)
+}
+
+func (d *dualWriteStore) ListKGTriplesRange(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]KGTriple, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListKGTriplesRange(ctx, chatSessionID, fromTurn, toTurn)
+}
+
+func (d *dualWriteStore) ListCharacterStatesCurrent(ctx context.Context, chatSessionID string) ([]CharacterState, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListCharacterStatesCurrent(ctx, chatSessionID)
+}
+
+func (d *dualWriteStore) ListActiveStatesRange(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]ActiveState, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListActiveStatesRange(ctx, chatSessionID, fromTurn, toTurn)
+}
+
+func (d *dualWriteStore) ListCanonicalStateLayersRange(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]CanonicalStateLayer, error) {
+	reader, ok := d.primary.(PrepareTurnRangeStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListCanonicalStateLayersRange(ctx, chatSessionID, fromTurn, toTurn)
 }
 
 // ReadSessionStateSnapshot reads from primary only, preserving the same

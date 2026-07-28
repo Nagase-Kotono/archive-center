@@ -17,6 +17,34 @@ type durableRoutingBaselineStore struct {
 	baseline *store.SessionRoutingBaseline
 }
 
+type rollbackDecisionChatLogStore struct {
+	store.Store
+	logs []store.ChatLog
+}
+
+type sessionIdentityRoutingStore struct {
+	store.Store
+	sessions []store.SessionSummary
+	logs     map[string][]store.ChatLog
+	baseline *store.SessionRoutingBaseline
+}
+
+func (s *sessionIdentityRoutingStore) ListSessions(context.Context) ([]store.SessionSummary, error) {
+	return s.sessions, nil
+}
+
+func (s *sessionIdentityRoutingStore) ListChatLogs(_ context.Context, sid string, _, _ int) ([]store.ChatLog, error) {
+	return s.logs[sid], nil
+}
+
+func (s *sessionIdentityRoutingStore) GetSessionRoutingBaseline(context.Context, string) (*store.SessionRoutingBaseline, error) {
+	return s.baseline, nil
+}
+
+func (s *rollbackDecisionChatLogStore) ListChatLogs(_ context.Context, _ string, _, _ int) ([]store.ChatLog, error) {
+	return s.logs, nil
+}
+
 func (s *durableRoutingBaselineStore) GetSessionRoutingBaseline(context.Context, string) (*store.SessionRoutingBaseline, error) {
 	return s.baseline, nil
 }
@@ -63,6 +91,196 @@ func TestSessionRoutingHandlerUsesDurableCopiedBaselineWhenClientBaselineIsMissi
 	}
 	if !response.BaselineApplied || response.TurnIndex != 9 || response.ProtectedBeforeTurn != 8 || response.MinFromTurn != 9 {
 		t.Fatalf("durable copied baseline was not applied: %+v", response)
+	}
+}
+
+func TestSessionRoutingIdentityKeepsExistingCIDWhenCharacterIndexChanges(t *testing.T) {
+	const (
+		hostChatID = "76eff0e5-8439-446f-a164-1271a7cc2089"
+		existingID = "char_1_cid_" + hostChatID
+		requested  = "char_0_cid_" + hostChatID
+	)
+	server := &Server{Store: &sessionIdentityRoutingStore{
+		Store:    store.NewNoopStore(),
+		sessions: []store.SessionSummary{{ChatSessionID: existingID, ChatLogsCount: 68}},
+		logs:     map[string][]store.ChatLog{},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"`+requested+`",
+		"mode":"identity",
+		"host_chat_id":"`+hostChatID+`",
+		"host_chat_id_state":"observed"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ChatSessionID != existingID || response.IdentityResolution != "existing_host_chat_id" {
+		t.Fatalf("same observed CID was split by character index: %+v", response)
+	}
+}
+
+func TestSessionRoutingIdentityUsesObservedTailAcrossExistingIndexAliases(t *testing.T) {
+	const hostChatID = "same-host-chat"
+	oldID, currentID := "char_0_cid_"+hostChatID, "char_1_cid_"+hostChatID
+	server := &Server{Store: &sessionIdentityRoutingStore{
+		Store: store.NewNoopStore(),
+		sessions: []store.SessionSummary{
+			{ChatSessionID: oldID, ChatLogsCount: 8},
+			{ChatSessionID: currentID, ChatLogsCount: 68},
+		},
+		logs: map[string][]store.ChatLog{
+			oldID: {
+				{ChatSessionID: oldID, TurnIndex: 4, Role: "user", Content: "old user"},
+				{ChatSessionID: oldID, TurnIndex: 4, Role: "assistant", Content: "old assistant"},
+			},
+			currentID: {
+				{ChatSessionID: currentID, TurnIndex: 51, Role: "user", Content: "current user"},
+				{ChatSessionID: currentID, TurnIndex: 51, Role: "assistant", Content: "current assistant"},
+			},
+		},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"`+oldID+`",
+		"mode":"identity",
+		"host_chat_id":"`+hostChatID+`",
+		"host_chat_id_state":"observed",
+		"latest_user_hash":"`+prepareOR1CHash("current user")+`",
+		"latest_assistant_hash":"`+prepareOR1CHash("current assistant")+`"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ChatSessionID != currentID || response.IdentityResolution != "existing_host_chat_tail_match" {
+		t.Fatalf("observed active tail did not select the matching session: %+v", response)
+	}
+}
+
+func TestSessionRoutingIdentityDoesNotReuseMismatchedCIDTail(t *testing.T) {
+	const hostChatID = "same-host-chat"
+	existingID, requestedID := "char_1_cid_"+hostChatID, "char_0_cid_"+hostChatID
+	server := &Server{Store: &sessionIdentityRoutingStore{
+		Store:    store.NewNoopStore(),
+		sessions: []store.SessionSummary{{ChatSessionID: existingID, ChatLogsCount: 68}},
+		logs: map[string][]store.ChatLog{
+			existingID: {
+				{ChatSessionID: existingID, TurnIndex: 51, Role: "user", Content: "wrong old user"},
+				{ChatSessionID: existingID, TurnIndex: 51, Role: "assistant", Content: "wrong old assistant"},
+			},
+		},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"`+requestedID+`",
+		"mode":"identity",
+		"host_chat_id":"`+hostChatID+`",
+		"host_chat_id_state":"observed",
+		"latest_user_hash":"`+prepareOR1CHash("actual turn 35 user")+`",
+		"latest_assistant_hash":"`+prepareOR1CHash("actual turn 35 assistant")+`"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ChatSessionID != requestedID || response.IdentityResolution != "existing_host_chat_tail_mismatch" {
+		t.Fatalf("mismatched backend tail was reused: %+v", response)
+	}
+}
+
+func TestSessionRoutingIdentityRejectsMatchingContentAtWrongTurnNumber(t *testing.T) {
+	const hostChatID = "same-host-chat"
+	existingID, requestedID := "char_1_cid_"+hostChatID, "char_0_cid_"+hostChatID
+	server := &Server{Store: &sessionIdentityRoutingStore{
+		Store:    store.NewNoopStore(),
+		sessions: []store.SessionSummary{{ChatSessionID: existingID, ChatLogsCount: 68}},
+		logs: map[string][]store.ChatLog{
+			existingID: {
+				{ChatSessionID: existingID, TurnIndex: 51, Role: "user", Content: "actual turn 35 user"},
+				{ChatSessionID: existingID, TurnIndex: 51, Role: "assistant", Content: "actual turn 35 assistant"},
+			},
+		},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"`+requestedID+`",
+		"mode":"identity",
+		"host_chat_id":"`+hostChatID+`",
+		"host_chat_id_state":"observed",
+		"visible_completed_turns":35,
+		"latest_user_hash":"`+prepareOR1CHash("actual turn 35 user")+`",
+		"latest_assistant_hash":"`+prepareOR1CHash("actual turn 35 assistant")+`"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.ChatSessionID != requestedID || response.IdentityResolution != "existing_host_chat_turn_mismatch" {
+		t.Fatalf("matching content at backend turn 51 was mistaken for RisuAI turn 35: %+v", response)
+	}
+}
+
+func TestSessionRoutingMatchingCanonicalTailDisablesLostCopyOffset(t *testing.T) {
+	const (
+		hostChatID = "copy-target"
+		sid        = "char_1_cid_" + hostChatID
+	)
+	server := &Server{Store: &sessionIdentityRoutingStore{
+		Store:    store.NewNoopStore(),
+		sessions: []store.SessionSummary{{ChatSessionID: sid, ChatLogsCount: 38}},
+		logs: map[string][]store.ChatLog{
+			sid: {
+				{ChatSessionID: sid, TurnIndex: 19, Role: "user", Content: "turn 19 user"},
+				{ChatSessionID: sid, TurnIndex: 19, Role: "assistant", Content: "turn 19 assistant"},
+			},
+		},
+		baseline: &store.SessionRoutingBaseline{
+			Mode: store.SessionMigrationModeCopyKeepSource, ImportedThroughTurn: 17,
+		},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"`+sid+`",
+		"mode":"pair",
+		"host_chat_id":"`+hostChatID+`",
+		"host_chat_id_state":"observed",
+		"visible_completed_turns":19,
+		"risu_user_message_index":38,
+		"observed_pair_ordinal":20,
+		"latest_user_hash":"`+prepareOR1CHash("turn 19 user")+`",
+		"latest_assistant_hash":"`+prepareOR1CHash("turn 19 assistant")+`"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.TurnIndex != 20 || response.Resolution != "canonical_tail_aligned" || response.BaselineApplied {
+		t.Fatalf("lost local copy baseline added 17 turns again: %+v", response)
 	}
 }
 
@@ -173,6 +391,95 @@ func TestVerifiedTailDeleteWithoutClientBaselineExecutesOnlyBackendTail(t *testi
 	}
 }
 
+func TestRollbackDecisionHandlerVerifiesIncompleteUserOnlyBackendTail(t *testing.T) {
+	const sid = "char_1_cid_user_only_tail"
+	server := &Server{Store: &rollbackDecisionChatLogStore{
+		Store: store.NewNoopStore(),
+		logs:  []store.ChatLog{{ChatSessionID: sid, TurnIndex: 9, Role: "user", Content: "saved input only"}},
+	}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/rollback/decision", strings.NewReader(`{
+		"chat_session_id":"`+sid+`",
+		"request_source":"auto",
+		"candidate_from_turn":9,
+		"removed_assistant_count":0,
+		"removed_user_count":1,
+		"removed_message_count":1,
+		"visible_completed_turns":8,
+		"backend_latest_turn":9,
+		"deletion_observed":true,
+		"incomplete_tail_candidate":true
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response rollbackDecisionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Allowed || response.FromTurn != 9 || response.DecisionToken == "" {
+		t.Fatalf("user-only tail decision=%+v", response)
+	}
+}
+
+func TestRollbackDecisionRejectsUnverifiedIncompleteTailCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		logs []store.ChatLog
+	}{
+		{name: "no backend rows"},
+		{name: "assistant row exists", logs: []store.ChatLog{
+			{ChatSessionID: "s", TurnIndex: 4, Role: "user", Content: "u"},
+			{ChatSessionID: "s", TurnIndex: 4, Role: "assistant", Content: "a"},
+		}},
+		{name: "candidate is not actual backend tail", logs: []store.ChatLog{
+			{ChatSessionID: "s", TurnIndex: 4, Role: "user", Content: "old incomplete"},
+			{ChatSessionID: "s", TurnIndex: 5, Role: "user", Content: "newer"},
+			{ChatSessionID: "s", TurnIndex: 5, Role: "assistant", Content: "newer answer"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &Server{Store: &rollbackDecisionChatLogStore{Store: store.NewNoopStore(), logs: tc.logs}}
+			mux := http.NewServeMux()
+			server.RegisterRoutes(mux)
+			req := httptest.NewRequest(http.MethodPost, "/rollback/decision", strings.NewReader(`{
+				"chat_session_id":"s",
+				"request_source":"auto",
+				"candidate_from_turn":4,
+				"removed_user_count":1,
+				"removed_message_count":1,
+				"backend_latest_turn":4,
+				"deletion_observed":true,
+				"incomplete_tail_candidate":true
+			}`))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			var response rollbackDecisionResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Allowed || response.Reason != "incomplete_tail_not_verified" || response.DecisionToken != "" {
+				t.Fatalf("unverified incomplete tail decision=%+v", response)
+			}
+		})
+	}
+}
+
+func TestRollbackDecisionHistoryTrimGuardBlocksVerifiedIncompleteTail(t *testing.T) {
+	response := calculateRollbackDecision(rollbackDecisionRequest{
+		ChatSessionID: "s", CandidateFromTurn: 4, BackendLatestTurn: 4,
+		DeletionObserved: true, IncompleteTailCandidate: true, BackendIncompleteTailVerified: true,
+		HistoryTrimGuard: true,
+	})
+	if response.Allowed || response.Reason != "history_trim_guard" {
+		t.Fatalf("history trim decision=%+v", response)
+	}
+}
+
 func TestCopiedSessionSevenPlusTwoDeletesOnlyTurnNine(t *testing.T) {
 	baseline := &routingTurnBaseline{BackendTurnAtRoute: 7, LocalPairsAtRoute: 0, Reason: "timeline_copy"}
 	resp := calculateRollbackDecision(rollbackDecisionRequest{
@@ -207,6 +514,35 @@ func TestRollbackDecisionBlocksHistoryTrimAndOutOfRange(t *testing.T) {
 	out := calculateRollbackDecision(rollbackDecisionRequest{ChatSessionID: "s", DeletionObserved: true, CandidateFromTurn: 9, BackendLatestTurn: 8})
 	if out.Allowed || out.Reason != "delete_anchor_after_backend_tail" {
 		t.Fatalf("out=%+v", out)
+	}
+}
+
+func TestRollbackDecisionDefersPocketRisuStyleTailRemovalDuringGeneration(t *testing.T) {
+	for _, observation := range []string{"before_request_observed", "generation_watch_active"} {
+		t.Run(observation, func(t *testing.T) {
+			resp := calculateRollbackDecision(rollbackDecisionRequest{
+				ChatSessionID: "session-1", RequestSource: "auto",
+				CandidateFromTurn: 4, PreviousTurnIndex: 4,
+				RemovedAssistantCount: 1, VisibleCompletedTurns: 3,
+				BackendLatestTurn: 4, DeletionObserved: true, LedgerVerified: true,
+				HostLifecycleObservation: observation,
+			})
+			if resp.Allowed || resp.Reason != "pending_output_guard" || resp.DecisionToken != "" {
+				t.Fatalf("pending generation tail removal must not authorize rollback: %+v", resp)
+			}
+		})
+	}
+}
+
+func TestRollbackDecisionStillAllowsVerifiedIdleTailDeletion(t *testing.T) {
+	resp := calculateRollbackDecision(rollbackDecisionRequest{
+		ChatSessionID: "session-1", RequestSource: "auto",
+		CandidateFromTurn: 4, PreviousTurnIndex: 4,
+		RemovedAssistantCount: 1, VisibleCompletedTurns: 3,
+		BackendLatestTurn: 4, DeletionObserved: true, LedgerVerified: true,
+	})
+	if !resp.Allowed || resp.FromTurn != 4 {
+		t.Fatalf("verified idle deletion should retain existing rollback behavior: %+v", resp)
 	}
 }
 

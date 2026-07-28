@@ -264,8 +264,8 @@ func TestSeq165P93TraceBudgetInspectable(t *testing.T) {
 			t.Fatalf("budget_decisions missing %q", k)
 		}
 	}
-	if bd["final_budget_owner"] != "archive_center_js_assembleInjectionWithBudget" {
-		t.Fatalf("final_budget_owner=%v, want archive_center_js_assembleInjectionWithBudget", bd["final_budget_owner"])
+	if bd["final_budget_owner"] != "go_memory_delivery_plan" {
+		t.Fatalf("final_budget_owner=%v, want go_memory_delivery_plan", bd["final_budget_owner"])
 	}
 }
 
@@ -955,16 +955,8 @@ func TestSeq165P110ManualSettingAdaptiveGovernorTelemetryCap(t *testing.T) {
 		t.Fatalf("runtime_toggle missing input_context_enabled (manual setting)")
 	}
 
-	ap, ok := resp["autonomy_plan"].(map[string]any)
-	if !ok {
-		t.Fatalf("missing autonomy_plan")
-	}
-
-	if ap["status"] != "ready" && ap["status"] != "degraded" {
-		t.Fatalf("autonomy_plan status=%v, want ready or degraded", ap["status"])
-	}
-	if ap["would_call_llm"] != false {
-		t.Fatalf("autonomy_plan would_call_llm=%v, want false", ap["would_call_llm"])
+	if _, exists := resp["autonomy_plan"]; exists {
+		t.Fatalf("prepare-turn must not expose story autonomy planner: %#v", resp["autonomy_plan"])
 	}
 
 	gp, ok := resp["generation_packet"].(map[string]any)
@@ -1026,8 +1018,8 @@ func TestSeq165P114MandatoryAnchorSlot(t *testing.T) {
 	if !strings.Contains(ict, "[Recent Chat]") {
 		t.Fatalf("input_context_text missing [Recent Chat] mandatory slot")
 	}
-	if !strings.Contains(ict, "[Resume Pack]") {
-		t.Fatalf("input_context_text missing [Resume Pack] mandatory slot")
+	if strings.Contains(ict, "[Resume Pack]") {
+		t.Fatalf("resume pack bypassed its dedicated continuity lane")
 	}
 
 	cp, ok := resp["continuity_pack"].(map[string]any)

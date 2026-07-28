@@ -26,24 +26,28 @@ type routingTurnBaseline struct {
 }
 
 type rollbackDecisionRequest struct {
-	ChatSessionID         string               `json:"chat_session_id"`
-	RequestSource         string               `json:"request_source"`
-	Reason                string               `json:"reason"`
-	CandidateFromTurn     int                  `json:"candidate_from_turn"`
-	PreviousTurnIndex     int                  `json:"previous_turn_index"`
-	FirstRemovedTurn      int                  `json:"first_removed_turn"`
-	LedgerAnchorTurn      int                  `json:"ledger_anchor_turn"`
-	RemovedAssistantCount int                  `json:"removed_assistant_count"`
-	RemovedMessageCount   int                  `json:"removed_message_count"`
-	VisibleCompletedTurns int                  `json:"visible_completed_turns"`
-	BackendLatestTurn     int                  `json:"backend_latest_turn"`
-	DeletionObserved      bool                 `json:"deletion_observed"`
-	LedgerVerified        bool                 `json:"ledger_verified"`
-	HistoryTrimGuard      bool                 `json:"history_trim_guard"`
-	DuplicateBlocked      bool                 `json:"duplicate_blocked"`
-	PendingOutputGuard    bool                 `json:"pending_output_guard"`
-	AllowManualCandidate  bool                 `json:"allow_manual_candidate"`
-	Baseline              *routingTurnBaseline `json:"baseline,omitempty"`
+	ChatSessionID                 string               `json:"chat_session_id"`
+	RequestSource                 string               `json:"request_source"`
+	Reason                        string               `json:"reason"`
+	CandidateFromTurn             int                  `json:"candidate_from_turn"`
+	PreviousTurnIndex             int                  `json:"previous_turn_index"`
+	FirstRemovedTurn              int                  `json:"first_removed_turn"`
+	LedgerAnchorTurn              int                  `json:"ledger_anchor_turn"`
+	RemovedAssistantCount         int                  `json:"removed_assistant_count"`
+	RemovedUserCount              int                  `json:"removed_user_count"`
+	RemovedMessageCount           int                  `json:"removed_message_count"`
+	VisibleCompletedTurns         int                  `json:"visible_completed_turns"`
+	BackendLatestTurn             int                  `json:"backend_latest_turn"`
+	DeletionObserved              bool                 `json:"deletion_observed"`
+	LedgerVerified                bool                 `json:"ledger_verified"`
+	IncompleteTailCandidate       bool                 `json:"incomplete_tail_candidate"`
+	BackendIncompleteTailVerified bool                 `json:"-"`
+	HistoryTrimGuard              bool                 `json:"history_trim_guard"`
+	DuplicateBlocked              bool                 `json:"duplicate_blocked"`
+	PendingOutputGuard            bool                 `json:"pending_output_guard"`
+	HostLifecycleObservation      string               `json:"host_lifecycle_observation"`
+	AllowManualCandidate          bool                 `json:"allow_manual_candidate"`
+	Baseline                      *routingTurnBaseline `json:"baseline,omitempty"`
 }
 
 type rollbackDecisionResponse struct {
@@ -127,6 +131,36 @@ func (s *Server) handleRollbackDecision(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	req.Baseline = s.resolveDurableSessionRoutingBaseline(r.Context(), req.ChatSessionID, req.Baseline)
+	if req.IncompleteTailCandidate &&
+		req.DeletionObserved &&
+		req.RemovedAssistantCount == 0 &&
+		req.RemovedUserCount == 1 &&
+		req.RemovedMessageCount == 1 &&
+		req.BackendLatestTurn > 0 &&
+		req.CandidateFromTurn == req.BackendLatestTurn &&
+		s.Store != nil {
+		logs, err := s.Store.ListChatLogs(r.Context(), strings.TrimSpace(req.ChatSessionID), 0, 0)
+		if err == nil && len(logs) > 0 {
+			actualLatestTurn := 0
+			for _, item := range logs {
+				if item.TurnIndex > actualLatestTurn {
+					actualLatestTurn = item.TurnIndex
+				}
+			}
+			userRowsOnly := actualLatestTurn == req.BackendLatestTurn
+			latestRows := 0
+			for _, item := range logs {
+				if item.TurnIndex != actualLatestTurn {
+					continue
+				}
+				latestRows++
+				if !strings.EqualFold(strings.TrimSpace(item.Role), "user") {
+					userRowsOnly = false
+				}
+			}
+			req.BackendIncompleteTailVerified = userRowsOnly && latestRows > 0
+		}
+	}
 	resp := calculateRollbackDecision(req)
 	if resp.Allowed {
 		record := s.rollbackDecisionLedger().issue(resp.ChatSessionID, resp.FromTurn, req.RequestSource)
@@ -155,12 +189,16 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 		resp.Reason = "duplicate_rollback_blocked"
 		return resp
 	}
-	if req.PendingOutputGuard {
+	if req.PendingOutputGuard || rollbackObservationHasPendingGeneration(req.HostLifecycleObservation) {
 		resp.Reason = "pending_output_guard"
 		return resp
 	}
 	manual := strings.EqualFold(strings.TrimSpace(req.RequestSource), "manual")
 	if !req.DeletionObserved && !(manual && req.AllowManualCandidate) {
+		return resp
+	}
+	if req.IncompleteTailCandidate && !req.BackendIncompleteTailVerified {
+		resp.Reason = "incomplete_tail_not_verified"
 		return resp
 	}
 
@@ -175,7 +213,9 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 	}
 
 	fromTurn := 0
-	if req.LedgerVerified && req.RemovedAssistantCount > 0 && req.BackendLatestTurn > 0 {
+	if req.BackendIncompleteTailVerified && req.BackendLatestTurn > 0 {
+		fromTurn = req.BackendLatestTurn
+	} else if req.LedgerVerified && req.RemovedAssistantCount > 0 && req.BackendLatestTurn > 0 {
 		if req.RemovedAssistantCount > req.BackendLatestTurn {
 			resp.Reason = "ledger_removed_count_exceeds_backend_tail"
 			return resp
@@ -219,15 +259,29 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 	return resp
 }
 
+func rollbackObservationHasPendingGeneration(observation string) bool {
+	switch strings.ToLower(strings.TrimSpace(observation)) {
+	case "before_request_observed", "generation_watch_active":
+		return true
+	default:
+		return false
+	}
+}
+
 type sessionRoutingTurnResolutionRequest struct {
 	ChatSessionID         string                   `json:"chat_session_id"`
 	Mode                  string                   `json:"mode"`
+	HostChatID            string                   `json:"host_chat_id,omitempty"`
+	HostChatIDState       string                   `json:"host_chat_id_state,omitempty"`
+	LatestUserHash        string                   `json:"latest_user_hash,omitempty"`
+	LatestAssistantHash   string                   `json:"latest_assistant_hash,omitempty"`
 	LocalTurnIndex        int                      `json:"local_turn_index"`
 	VisibleCompletedTurns int                      `json:"visible_completed_turns"`
 	RisuUserMessageIndex  *int                     `json:"risu_user_message_index,omitempty"`
 	ObservedPairOrdinal   int                      `json:"observed_pair_ordinal,omitempty"`
 	Observations          []routingTurnObservation `json:"observations,omitempty"`
 	Baseline              *routingTurnBaseline     `json:"baseline,omitempty"`
+	canonicalTailAligned  bool
 }
 
 type routingTurnObservation struct {
@@ -249,6 +303,8 @@ type routingTurnResolvedObservation struct {
 type sessionRoutingTurnResolutionResponse struct {
 	Status               string                           `json:"status"`
 	ContractVersion      string                           `json:"contract_version"`
+	ChatSessionID        string                           `json:"chat_session_id,omitempty"`
+	IdentityResolution   string                           `json:"identity_resolution,omitempty"`
 	Resolution           string                           `json:"resolution"`
 	TurnIndex            int                              `json:"turn_index"`
 	CompletedTurns       int                              `json:"completed_turns"`
@@ -266,8 +322,115 @@ func (s *Server) handleSessionRoutingTurnResolution(w http.ResponseWriter, r *ht
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "code": "invalid_session_routing_observation"})
 		return
 	}
+	canonicalSessionID, identityResolution, canonicalTailAligned := s.resolveObservedRisuSessionIdentity(r.Context(), req)
+	if canonicalSessionID != "" {
+		req.ChatSessionID = canonicalSessionID
+	}
+	req.canonicalTailAligned = canonicalTailAligned
 	req.Baseline = s.resolveDurableSessionRoutingBaseline(r.Context(), req.ChatSessionID, req.Baseline)
-	writeJSON(w, http.StatusOK, calculateSessionRoutingTurnResolution(req))
+	resp := calculateSessionRoutingTurnResolution(req)
+	resp.ChatSessionID = strings.TrimSpace(req.ChatSessionID)
+	resp.IdentityResolution = identityResolution
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req sessionRoutingTurnResolutionRequest) (string, string, bool) {
+	requested := strings.TrimSpace(req.ChatSessionID)
+	hostChatID := strings.TrimSpace(req.HostChatID)
+	if req.HostChatIDState != "observed" || hostChatID == "" || s.Store == nil {
+		return requested, "host_chat_id_unobserved", false
+	}
+	sessions, err := s.Store.ListSessions(ctx)
+	if err != nil {
+		return requested, "session_list_unavailable", false
+	}
+	suffix := "_cid_" + hostChatID
+	candidates := make([]store.SessionSummary, 0, 2)
+	for _, session := range sessions {
+		sid := strings.TrimSpace(session.ChatSessionID)
+		if sid == "cid_"+hostChatID || strings.HasSuffix(sid, suffix) {
+			candidates = append(candidates, session)
+		}
+	}
+	if len(candidates) == 0 {
+		return requested, "new_host_chat_id", false
+	}
+
+	userHash := strings.TrimSpace(req.LatestUserHash)
+	assistantHash := strings.TrimSpace(req.LatestAssistantHash)
+	turnMismatchObserved := false
+	if userHash != "" || assistantHash != "" {
+		matched := make([]store.SessionSummary, 0, len(candidates))
+		for _, candidate := range candidates {
+			logs, listErr := s.Store.ListChatLogs(ctx, candidate.ChatSessionID, 0, 0)
+			if listErr != nil {
+				continue
+			}
+			latestTurn := 0
+			latestUser, latestAssistant := "", ""
+			for _, log := range logs {
+				if log.TurnIndex > latestTurn {
+					latestTurn = log.TurnIndex
+					latestUser, latestAssistant = "", ""
+				}
+				if log.TurnIndex != latestTurn {
+					continue
+				}
+				switch strings.ToLower(strings.TrimSpace(log.Role)) {
+				case "user":
+					latestUser = log.Content
+				case "assistant":
+					latestAssistant = log.Content
+				}
+			}
+			userMatches := userHash == "" || prepareOR1CHash(strings.TrimSpace(latestUser)) == userHash
+			assistantMatches := assistantHash == "" || prepareOR1CHash(strings.TrimSpace(latestAssistant)) == assistantHash
+			if userMatches && assistantMatches {
+				if req.VisibleCompletedTurns > 0 && latestTurn != req.VisibleCompletedTurns {
+					turnMismatchObserved = true
+					continue
+				}
+				matched = append(matched, candidate)
+			}
+		}
+		if len(matched) == 1 {
+			return strings.TrimSpace(matched[0].ChatSessionID), "existing_host_chat_tail_match", true
+		}
+		if len(matched) > 1 {
+			candidates = matched
+		} else if len(candidates) == 1 {
+			// A matching CID alone is not enough to reconnect an index alias.
+			// Copy/cold-start damage can leave that CID attached to a backend
+			// tail that is not the chat RisuAI is currently showing.
+			if turnMismatchObserved {
+				return requested, "existing_host_chat_turn_mismatch", false
+			}
+			return requested, "existing_host_chat_tail_mismatch", false
+		}
+	}
+	if len(candidates) == 1 {
+		return strings.TrimSpace(candidates[0].ChatSessionID), "existing_host_chat_id", false
+	}
+
+	best := candidates[0]
+	bestTied := false
+	for _, candidate := range candidates[1:] {
+		if candidate.ChatLogsCount > best.ChatLogsCount {
+			best = candidate
+			bestTied = false
+		} else if candidate.ChatLogsCount == best.ChatLogsCount {
+			bestTied = true
+		}
+	}
+	if !bestTied {
+		return strings.TrimSpace(best.ChatSessionID), "existing_host_chat_most_complete", false
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.ChatSessionID) == requested {
+			return requested, "existing_host_chat_requested_alias", false
+		}
+	}
+	return requested, "host_chat_id_ambiguous", false
 }
 
 func (s *Server) resolveDurableSessionRoutingBaseline(ctx context.Context, sessionID string, clientBaseline *routingTurnBaseline) *routingTurnBaseline {
@@ -341,6 +504,10 @@ func calculateSessionRoutingTurnResolution(req sessionRoutingTurnResolutionReque
 		resp.TurnIndex = localTurn
 	}
 	baseline := req.Baseline
+	if req.canonicalTailAligned {
+		resp.Resolution = "canonical_tail_aligned"
+		return resp
+	}
 	if baseline == nil || !routingBaselineReasonSupported(baseline.Reason) || baseline.BackendTurnAtRoute <= 0 {
 		return resp
 	}

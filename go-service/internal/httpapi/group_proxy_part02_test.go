@@ -48,16 +48,10 @@ func TestSupervisorStorylineFeedbackReplayAssumedRuntimeGate(t *testing.T) {
 		}
 		response := map[string]any{
 			"choices": []any{map[string]any{"message": map[string]any{"content": `{
-				"directive": {
-					"story_author": {
-						"current_arc": "` + currentArc + `",
-						"narrative_goal": "` + narrativeGoal + `"
-					},
-					"director": {
-						"pressure_level": "normal",
-						"required_outcomes": ["` + requiredOutcome + `"],
-						"forbidden_moves": ["repeat stale storyline"]
-					}
+				"supervisor_scene_proposal": {
+					"fidelity_warnings": [{"text":"` + currentArc + `","source_refs":["memory:test:1"]}],
+					"portrayal_notes": [{"text":"` + narrativeGoal + `","source_refs":["memory:test:1"]}],
+					"may_advance": [{"text":"` + requiredOutcome + `","source_refs":["memory:test:1"]}]
 				}
 			}`}}},
 			"model": "supervisor-replay",
@@ -97,7 +91,9 @@ func TestSupervisorStorylineFeedbackReplayAssumedRuntimeGate(t *testing.T) {
 		body := `{
 			"chat_session_id":"` + sid + `",
 			"guide_mode":"standard",
+			"guide_strength":"strong",
 			"narrative_stance":"balanced",
+			"response_execution_contract":{"contract_version":"response_execution_contract.v1","status":"ready","active":true,"source_refs":{"all":["input:test","memory:test:1"],"current_input":["input:test"],"native_system":[],"memory":["memory:test:1"]}},
 			"wake_up_context":"The forged seal is in the guard captain's hand.",
 			"persistent_guidance":"Avoid repeating stale hooks.",
 			"context_messages":[
@@ -130,44 +126,35 @@ func TestSupervisorStorylineFeedbackReplayAssumedRuntimeGate(t *testing.T) {
 	if callCount != 4 || len(capturedPrompts) != 4 {
 		t.Fatalf("runtime replay calls = %d prompts = %d, want 4/4", callCount, len(capturedPrompts))
 	}
-	if strings.Contains(capturedPrompts[0], freshContext) {
-		t.Fatalf("feedback-off prompt should not include storyline context: %s", capturedPrompts[0])
-	}
-	for i, prompt := range capturedPrompts[1:] {
-		if !strings.Contains(prompt, freshContext) {
-			t.Fatalf("feedback-on replay %d prompt missing fresh storyline context: %s", i+1, prompt)
-		}
-		for _, forbidden := range []string{staleContext, suppressedContext, "Resolved apology should remain summary-only."} {
+	for i, prompt := range capturedPrompts {
+		for _, forbidden := range []string{freshContext, staleContext, suppressedContext, "Resolved apology should remain summary-only."} {
 			if strings.Contains(prompt, forbidden) {
-				t.Fatalf("feedback-on replay %d prompt contains stale/resolved/suppressed storyline %q: %s", i+1, forbidden, prompt)
+				t.Fatalf("replay %d passed storyline prose to memory fidelity reviewer %q: %s", i+1, forbidden, prompt)
 			}
 		}
 	}
 
 	onPack := onResp["supervisor_input_pack"].(map[string]any)
 	selection := onPack["storyline_selection"].(map[string]any)
-	if selection["selected_count"] != float64(1) || selection["stale_dropped_count"] != float64(1) || selection["suppressed_count"] != float64(1) || selection["resolved_summary_count"] != float64(1) {
-		t.Fatalf("unexpected storyline selection summary: %+v", selection)
+	if selection["selected_count"] != float64(0) {
+		t.Fatalf("standalone supervisor selected storyline guidance: %+v", selection)
 	}
 
-	offArc := supervisorCurrentArc(offResp)
-	onArc := supervisorCurrentArc(onResp)
-	if offArc != "baseline_continue" || onArc != "gate_confrontation_push" {
-		t.Fatalf("current_arc off/on = %q/%q, want baseline_continue/gate_confrontation_push", offArc, onArc)
+	offArc := supervisorProposalText(offResp, "fidelity_warnings")
+	onArc := supervisorProposalText(onResp, "fidelity_warnings")
+	if offArc != "baseline_continue" || onArc != "baseline_continue" {
+		t.Fatalf("storyline store changed fidelity result off/on = %q/%q", offArc, onArc)
 	}
 	for i, resp := range []map[string]any{onResp2, onResp3} {
-		if arc := supervisorCurrentArc(resp); arc != onArc {
+		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != onArc {
 			t.Fatalf("feedback-on replay %d current_arc = %q, want stable %q", i+2, arc, onArc)
 		}
 	}
-	onDirector := supervisorDirector(onResp)
-	required, _ := onDirector["required_outcomes"].([]any)
-	if len(required) == 0 || extractionStringFromAny(required[0]) != "advance fresh confrontation" {
-		t.Fatalf("director.required_outcomes = %+v, want advance fresh confrontation", onDirector["required_outcomes"])
+	if got := supervisorProposalText(onResp, "may_advance"); got != "" {
+		t.Fatalf("story advancement proposal leaked: %q", got)
 	}
-	forbidden, _ := onDirector["forbidden_moves"].([]any)
-	if len(forbidden) == 0 || !strings.Contains(extractionStringFromAny(forbidden[0]), "stale") {
-		t.Fatalf("director.forbidden_moves = %+v, want stale-repeat guard", onDirector["forbidden_moves"])
+	if got := supervisorProposalText(onResp, "portrayal_notes"); got != "Continue from recent chat without storyline feedback." {
+		t.Fatalf("portrayal_notes = %q, want context-only result", got)
 	}
 }
 
@@ -176,15 +163,14 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		mode             string
 		suffixNeedle     string
 		emphasisNeedle   string
-		forbiddenNeedle  string
 		expectedArc      string
 		expectedResponse string
 	}
 	cases := []modeCase{
 		{mode: "off", expectedArc: "baseline_arc", expectedResponse: "baseline continuation"},
-		{mode: "romantic", suffixNeedle: "Romantic", emphasisNeedle: "emotional resonance", forbiddenNeedle: "trivializing emotional moments", expectedArc: "romantic_arc", expectedResponse: "romantic emotional beat"},
-		{mode: "action", suffixNeedle: "Action", emphasisNeedle: "combat choreography", forbiddenNeedle: "excessive monologuing during action", expectedArc: "action_arc", expectedResponse: "action forward motion"},
-		{mode: "mature_soft", suffixNeedle: "Mature (Sensual)", emphasisNeedle: "sensory atmosphere", forbiddenNeedle: "ignoring character consent", expectedArc: "mature_soft_arc", expectedResponse: "sensual consent-aware beat"},
+		{mode: "romantic", suffixNeedle: "emotional nuance", emphasisNeedle: "relationship-aware subtext", expectedArc: "romantic_arc", expectedResponse: "romantic emotional beat"},
+		{mode: "action", suffixNeedle: "clear cause and effect", emphasisNeedle: "grounded physical consequences", expectedArc: "action_arc", expectedResponse: "action forward motion"},
+		{mode: "mature_soft", suffixNeedle: "sensory atmosphere", emphasisNeedle: "emotional and interpersonal nuance", expectedArc: "mature_soft_arc", expectedResponse: "sensual consent-aware beat"},
 	}
 
 	callByMode := map[string]int{}
@@ -223,7 +209,7 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 			"action":      "action forward motion",
 			"mature_soft": "sensual consent-aware beat",
 		}[mode]
-		content := `{"directive":{"story_author":{"current_arc":"` + arc + `","narrative_goal":"` + responseText + `"},"director":{"pressure_level":"normal","required_outcomes":["` + responseText + `"],"forbidden_moves":["mode-specific guard"]}}}`
+		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[{"text":"` + arc + `","source_refs":["memory:test:1"]}],"portrayal_notes":[{"text":"` + responseText + `","source_refs":["memory:test:1"]}],"may_advance":[{"text":"` + responseText + `","source_refs":["memory:test:1"]}]}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -247,7 +233,9 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		body := `{
 			"chat_session_id":"sess-guide-effect",
 			"guide_mode":"` + tc.mode + `",
+			"guide_strength":"strong",
 			"narrative_stance":"balanced",
+			"response_execution_contract":{"contract_version":"response_execution_contract.v1","status":"ready","active":true,"source_refs":{"all":["input:test","memory:test:1"],"current_input":["input:test"],"native_system":[],"memory":["memory:test:1"]}},
 			"auto_advance_trigger":"none",
 			"wake_up_context":"Same scene: Chloe faces the locked archive door.",
 			"persistent_guidance":"Use the requested narrative mode without changing the factual scene.",
@@ -277,67 +265,49 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		if trace["guide_mode"] != tc.mode {
 			t.Fatalf("%s trace guide_mode = %v", tc.mode, trace["guide_mode"])
 		}
-		suffix, _ := pack["guide_suffix"].(string)
-		directorOverrides := pack["director_overrides"].(map[string]any)
-		emphasis, _ := directorOverrides["emphasis"].([]any)
-		forbidden, _ := directorOverrides["forbidden_moves"].([]any)
+		focus := stringSliceFromAny(pack["guide_focus"])
+		focusText := strings.Join(focus, " / ")
 		if tc.mode == "off" {
-			if suffix != "" || len(emphasis) != 0 || len(forbidden) != 0 || trace["guide_suffix_present"] != false {
-				t.Fatalf("off mode should not add suffix/overrides, suffix=%q emphasis=%+v forbidden=%+v trace=%+v", suffix, emphasis, forbidden, trace["guide_suffix_present"])
+			if len(focus) != 0 {
+				t.Fatalf("off mode should not add guide focus: %#v", focus)
 			}
 		} else {
-			if !strings.Contains(suffix, tc.suffixNeedle) || trace["guide_suffix_present"] != true {
-				t.Fatalf("%s suffix/trace mismatch: suffix=%q trace=%+v", tc.mode, suffix, trace["guide_suffix_present"])
-			}
-			if !anySliceContains(emphasis, tc.emphasisNeedle) {
-				t.Fatalf("%s emphasis missing %q: %+v", tc.mode, tc.emphasisNeedle, emphasis)
-			}
-			if !anySliceContains(forbidden, tc.forbiddenNeedle) {
-				t.Fatalf("%s forbidden_moves missing %q: %+v", tc.mode, tc.forbiddenNeedle, forbidden)
+			if !strings.Contains(focusText, tc.suffixNeedle) || !strings.Contains(focusText, tc.emphasisNeedle) {
+				t.Fatalf("%s optional guide focus mismatch: %#v", tc.mode, focus)
 			}
 			if !strings.Contains(capturedPromptByMode[tc.mode], tc.suffixNeedle) || !strings.Contains(capturedPromptByMode[tc.mode], tc.emphasisNeedle) {
-				t.Fatalf("%s upstream prompt missing suffix/emphasis: %s", tc.mode, capturedPromptByMode[tc.mode])
+				t.Fatalf("%s upstream prompt missing optional guide focus: %s", tc.mode, capturedPromptByMode[tc.mode])
 			}
 		}
-		if arc := supervisorCurrentArc(resp); arc != tc.expectedArc {
+		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != tc.expectedArc {
 			t.Fatalf("%s current_arc = %q, want %q", tc.mode, arc, tc.expectedArc)
 		}
-		director := supervisorDirector(resp)
-		outcomes, _ := director["required_outcomes"].([]any)
-		if len(outcomes) == 0 || !strings.Contains(extractionStringFromAny(outcomes[0]), tc.expectedResponse) {
-			t.Fatalf("%s required_outcomes = %+v, want %q", tc.mode, outcomes, tc.expectedResponse)
+		if got := supervisorProposalText(resp, "may_advance"); got != "" {
+			t.Fatalf("%s story advancement proposal leaked: %q", tc.mode, got)
+		}
+		if got := supervisorProposalText(resp, "portrayal_notes"); !strings.Contains(got, tc.expectedResponse) {
+			t.Fatalf("%s portrayal guidance = %q, want %q", tc.mode, got, tc.expectedResponse)
 		}
 	}
 	if len(callByMode) != len(cases) {
 		t.Fatalf("runtime calls by mode = %+v, want all modes", callByMode)
 	}
-	if supervisorCurrentArc(results["off"]) == supervisorCurrentArc(results["romantic"]) ||
-		supervisorCurrentArc(results["romantic"]) == supervisorCurrentArc(results["action"]) ||
-		supervisorCurrentArc(results["action"]) == supervisorCurrentArc(results["mature_soft"]) {
+	if supervisorProposalText(results["off"], "fidelity_warnings") == supervisorProposalText(results["romantic"], "fidelity_warnings") ||
+		supervisorProposalText(results["romantic"], "fidelity_warnings") == supervisorProposalText(results["action"], "fidelity_warnings") ||
+		supervisorProposalText(results["action"], "fidelity_warnings") == supervisorProposalText(results["mature_soft"], "fidelity_warnings") {
 		t.Fatalf("guide mode arcs should diverge: off=%s romantic=%s action=%s mature=%s",
-			supervisorCurrentArc(results["off"]),
-			supervisorCurrentArc(results["romantic"]),
-			supervisorCurrentArc(results["action"]),
-			supervisorCurrentArc(results["mature_soft"]))
+			supervisorProposalText(results["off"], "fidelity_warnings"),
+			supervisorProposalText(results["romantic"], "fidelity_warnings"),
+			supervisorProposalText(results["action"], "fidelity_warnings"),
+			supervisorProposalText(results["mature_soft"], "fidelity_warnings"))
 	}
 }
 
-func TestNarrativeStanceModesControlledReplayDiverges(t *testing.T) {
-	type stanceCase struct {
-		mode          string
-		suffixNeedle  string
-		expectedBeats any
-		expectedArc   string
-		expectedGoal  string
-	}
-	cases := []stanceCase{
-		{mode: "reactive", suffixNeedle: "Story Initiative - Reactive", expectedBeats: float64(0), expectedArc: "reactive_hold", expectedGoal: "hold the current beat and avoid new hooks"},
-		{mode: "balanced", suffixNeedle: "Story Initiative - Balanced", expectedBeats: float64(1), expectedArc: "balanced_follow", expectedGoal: "advance one grounded beat"},
-		{mode: "proactive", suffixNeedle: "Story Initiative - Proactive", expectedBeats: float64(1), expectedArc: "proactive_push", expectedGoal: "introduce a grounded follow-up hook"},
-	}
+func TestNarrativeStanceDoesNotControlMemoryFidelityReviewer(t *testing.T) {
+	cases := []string{"reactive", "balanced", "proactive"}
 
-	callByMode := map[string]int{}
-	capturedPromptByMode := map[string]string{}
+	callCount := 0
+	capturedPrompts := []string{}
 	oldClient := proxyHTTPClient
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		var reqBody map[string]any
@@ -351,26 +321,9 @@ func TestNarrativeStanceModesControlledReplayDiverges(t *testing.T) {
 		}
 		userMessage, _ := messages[1].(map[string]any)
 		body := extractionStringFromAny(userMessage["content"])
-		mode := "balanced"
-		for _, candidate := range []string{"reactive", "balanced", "proactive"} {
-			if strings.Contains(body, `"narrative_stance": "`+candidate+`"`) {
-				mode = candidate
-				break
-			}
-		}
-		callByMode[mode]++
-		capturedPromptByMode[mode] = body
-		arc := map[string]string{
-			"reactive":  "reactive_hold",
-			"balanced":  "balanced_follow",
-			"proactive": "proactive_push",
-		}[mode]
-		goal := map[string]string{
-			"reactive":  "hold the current beat and avoid new hooks",
-			"balanced":  "advance one grounded beat",
-			"proactive": "introduce a grounded follow-up hook",
-		}[mode]
-		content := `{"directive":{"story_author":{"current_arc":"` + arc + `","narrative_goal":"` + goal + `"},"director":{"pressure_level":"normal","required_outcomes":["` + goal + `"],"forbidden_moves":["stance-specific guard"]}}}`
+		callCount++
+		capturedPrompts = append(capturedPrompts, body)
+		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[{"text":"preserve the supported recollection","source_refs":["memory:test:1"]}],"portrayal_notes":[{"text":"keep the supported relationship perceptible","source_refs":["memory:test:1"]}],"may_advance":[{"text":"must be rejected","source_refs":["memory:test:1"]}]}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -380,7 +333,7 @@ func TestNarrativeStanceModesControlledReplayDiverges(t *testing.T) {
 	defer func() { proxyHTTPClient = oldClient }()
 
 	results := map[string]map[string]any{}
-	for _, tc := range cases {
+	for _, mode := range cases {
 		mux := http.NewServeMux()
 		srv := setupTestServer()
 		srv.RuntimeConfig = RuntimeConfig{
@@ -394,7 +347,9 @@ func TestNarrativeStanceModesControlledReplayDiverges(t *testing.T) {
 		body := `{
 			"chat_session_id":"sess-stance-effect",
 			"guide_mode":"off",
-			"narrative_stance":"` + tc.mode + `",
+			"guide_strength":"strong",
+			"narrative_stance":"` + mode + `",
+			"response_execution_contract":{"contract_version":"response_execution_contract.v1","status":"ready","active":true,"source_refs":{"all":["input:test","memory:test:1"],"current_input":["input:test"],"native_system":[],"memory":["memory:test:1"]}},
 			"auto_advance_trigger":"none",
 			"wake_up_context":"Same scene: Chloe pauses at the archive door.",
 			"persistent_guidance":"Use the requested initiative mode without changing the factual scene.",
@@ -405,51 +360,53 @@ func TestNarrativeStanceModesControlledReplayDiverges(t *testing.T) {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("%s supervisor status = %d, want 200: %s", tc.mode, rec.Code, rec.Body.String())
+			t.Fatalf("%s supervisor status = %d, want 200: %s", mode, rec.Code, rec.Body.String())
 		}
 		var resp map[string]any
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("%s decode response: %v", tc.mode, err)
+			t.Fatalf("%s decode response: %v", mode, err)
 		}
 		if resp["source"] != "runtime_llm" || resp["would_call_llm"] != true {
-			t.Fatalf("%s did not use runtime supervisor path: %+v", tc.mode, resp)
+			t.Fatalf("%s did not use runtime supervisor path: %+v", mode, resp)
 		}
-		results[tc.mode] = resp
+		results[mode] = resp
 		pack := resp["supervisor_input_pack"].(map[string]any)
-		if pack["narrative_stance"] != tc.mode {
-			t.Fatalf("%s pack narrative_stance = %v", tc.mode, pack["narrative_stance"])
+		for _, key := range []string{"narrative_stance", "narrative_stance_suffix", "narrative_stance_bounds"} {
+			if _, exists := pack[key]; exists {
+				t.Fatalf("%s pack exposes story initiative field %q: %#v", mode, key, pack[key])
+			}
 		}
-		suffix := extractionStringFromAny(pack["narrative_stance_suffix"])
-		if !strings.Contains(suffix, tc.suffixNeedle) || !strings.Contains(capturedPromptByMode[tc.mode], tc.suffixNeedle) {
-			t.Fatalf("%s prompt/suffix missing %q: suffix=%q prompt=%s", tc.mode, tc.suffixNeedle, suffix, capturedPromptByMode[tc.mode])
+		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != "preserve the supported recollection" {
+			t.Fatalf("%s fidelity guidance = %q", mode, arc)
 		}
-		bounds, _ := pack["narrative_stance_bounds"].(map[string]any)
-		if bounds["max_new_beats"] != tc.expectedBeats {
-			t.Fatalf("%s max_new_beats = %v, want %v in bounds %+v", tc.mode, bounds["max_new_beats"], tc.expectedBeats, bounds)
-		}
-		trace := resp["trace_summary"].(map[string]any)
-		if trace["narrative_stance"] != tc.mode || trace["narrative_stance_suffix_present"] != true || trace["narrative_stance_bounds_present"] != true {
-			t.Fatalf("%s trace missing stance evidence: %+v", tc.mode, trace)
-		}
-		if arc := supervisorCurrentArc(resp); arc != tc.expectedArc {
-			t.Fatalf("%s current_arc = %q, want %q", tc.mode, arc, tc.expectedArc)
-		}
-		director := supervisorDirector(resp)
-		outcomes, _ := director["required_outcomes"].([]any)
-		if len(outcomes) == 0 || !strings.Contains(extractionStringFromAny(outcomes[0]), tc.expectedGoal) {
-			t.Fatalf("%s required_outcomes = %+v, want %q", tc.mode, outcomes, tc.expectedGoal)
+		if got := supervisorProposalText(resp, "may_advance"); got != "" {
+			t.Fatalf("%s story advancement proposal leaked: %q", mode, got)
 		}
 	}
-	if len(callByMode) != len(cases) {
-		t.Fatalf("runtime calls by stance = %+v, want all stances", callByMode)
+	if callCount != len(cases) || len(capturedPrompts) != len(cases) {
+		t.Fatalf("runtime calls/prompts = %d/%d, want %d", callCount, len(capturedPrompts), len(cases))
 	}
-	if supervisorCurrentArc(results["reactive"]) == supervisorCurrentArc(results["balanced"]) ||
-		supervisorCurrentArc(results["balanced"]) == supervisorCurrentArc(results["proactive"]) {
-		t.Fatalf("narrative stance arcs should diverge: reactive=%s balanced=%s proactive=%s",
-			supervisorCurrentArc(results["reactive"]),
-			supervisorCurrentArc(results["balanced"]),
-			supervisorCurrentArc(results["proactive"]))
+	for i, prompt := range capturedPrompts {
+		if strings.Contains(prompt, "narrative_stance") || strings.Contains(prompt, "Story Initiative") || strings.Contains(prompt, "max_new_beats") {
+			t.Fatalf("prompt %d contains story initiative control: %s", i+1, prompt)
+		}
 	}
+	if supervisorProposalText(results["reactive"], "fidelity_warnings") != supervisorProposalText(results["balanced"], "fidelity_warnings") ||
+		supervisorProposalText(results["balanced"], "fidelity_warnings") != supervisorProposalText(results["proactive"], "fidelity_warnings") {
+		t.Fatalf("narrative stance changed memory fidelity output: %#v", results)
+	}
+}
+
+func supervisorProposalText(resp map[string]any, field string) string {
+	result, _ := resp["supervisor_result"].(map[string]any)
+	directive, _ := result["directive"].(map[string]any)
+	proposal, _ := directive["supervisor_scene_proposal"].(map[string]any)
+	items, _ := proposal[field].([]any)
+	if len(items) == 0 {
+		return ""
+	}
+	item, _ := items[0].(map[string]any)
+	return extractionStringFromAny(item["text"])
 }
 
 func anySliceContains(values []any, needle string) bool {
@@ -461,28 +418,14 @@ func anySliceContains(values []any, needle string) bool {
 	return false
 }
 
-func supervisorCurrentArc(resp map[string]any) string {
-	result, _ := resp["supervisor_result"].(map[string]any)
-	directive, _ := result["directive"].(map[string]any)
-	author, _ := directive["story_author"].(map[string]any)
-	return extractionStringFromAny(author["current_arc"])
-}
-
-func supervisorDirector(resp map[string]any) map[string]any {
-	result, _ := resp["supervisor_result"].(map[string]any)
-	directive, _ := result["directive"].(map[string]any)
-	director, _ := directive["director"].(map[string]any)
-	return director
-}
-
 func TestConfigUpdateProjectGUISettingsTraceMasksSecrets(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := setupTestServer()
 	srv.RegisterRoutes(mux)
 
-	const mainKey = "sk-main-secret-seq02"
-	const criticKey = "sk-critic-secret-seq02"
-	const embeddingKey = "sk-embedding-secret-seq02"
+	const mainKey = "test-main-secret-seq02"
+	const criticKey = "test-critic-secret-seq02"
+	const embeddingKey = "test-embedding-secret-seq02"
 	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(`{
 		"mainProvider":"ollama",
 		"mainApiKey":"`+mainKey+`",
@@ -704,7 +647,7 @@ func TestHandleSupervisorFailOpenOnRuntimeLLMError(t *testing.T) {
 		t.Fatalf("config/update status = %d, body=%s", updateRec.Code, updateRec.Body.String())
 	}
 
-	body := `{"chat_session_id":"sess-sv-fail","guide_mode":"strict","narrative_stance":"immersive","auto_advance_trigger":"none","wake_up_context":"hello","persistent_guidance":"be kind","context_messages":[{"role":"user","content":"move forward"}]}`
+	body := `{"chat_session_id":"sess-sv-fail","guide_mode":"standard","guide_strength":"weak","narrative_stance":"immersive","auto_advance_trigger":"none","wake_up_context":"hello","persistent_guidance":"be kind","response_execution_contract":{"contract_version":"response_execution_contract.v1","status":"ready","active":true,"source_refs":{"all":["input:test","memory:test:1"],"current_input":["input:test"],"native_system":[],"memory":["memory:test:1"]}},"context_messages":[{"role":"user","content":"move forward"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/supervisor", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -729,6 +672,66 @@ func TestHandleSupervisorFailOpenOnRuntimeLLMError(t *testing.T) {
 	}
 	if trace["llm_call"] != "failed" || trace["fail_open"] != true {
 		t.Fatalf("trace did not expose failed fail-open call: %+v", trace)
+	}
+}
+
+func TestHandleSupervisorSkipsRuntimeLLMWithoutExecutionContract(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := setupTestServer()
+	srv.RegisterRoutes(mux)
+
+	callCount := 0
+	oldClient := proxyHTTPClient
+	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		callCount++
+		t.Fatalf("supervisor upstream must not be called without a ready execution contract")
+		return nil, nil
+	})}
+	defer func() { proxyHTTPClient = oldClient }()
+
+	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(`{
+		"supervisorProvider":"openai",
+		"supervisorApiKey":"sk-supervisor-gated",
+		"supervisorEndpoint":"https://api.example.com/v1",
+		"supervisorModel":"supervisor-model",
+		"supervisorTimeout":30
+	}`)))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("config/update status = %d, body=%s", updateRec.Code, updateRec.Body.String())
+	}
+
+	body := `{"chat_session_id":"sess-sv-gated","guide_mode":"standard","guide_strength":"strong","context_messages":[{"role":"user","content":"move forward"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/supervisor", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected gated status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if callCount != 0 {
+		t.Fatalf("supervisor upstream call count = %d, want 0", callCount)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode gated response: %v", err)
+	}
+	if resp["source"] != "execution_contract_gate" || resp["would_call_llm"] != false {
+		t.Fatalf("unexpected execution-contract gate response: %+v", resp)
+	}
+	result := mapFromAny(resp["supervisor_result"])
+	proposal := mapFromAny(mapFromAny(result["directive"])["supervisor_scene_proposal"])
+	if proposal["status"] != "degraded_missing_execution_contract" ||
+		proposal["reason_code"] != "supervisor_execution_contract_missing" {
+		t.Fatalf("missing execution contract did not produce bounded degraded result: %+v", proposal)
+	}
+	if len(anySliceFromAny(proposal["fidelity_warnings"])) != 0 ||
+		len(anySliceFromAny(proposal["portrayal_notes"])) != 0 ||
+		len(anySliceFromAny(proposal["may_advance"])) != 0 {
+		t.Fatalf("gated proposal delivered unsupported items: %+v", proposal)
 	}
 }
 

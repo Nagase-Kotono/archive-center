@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/risulongmemory/archive-center-go/internal/store"
@@ -253,12 +254,71 @@ func characterPrivateRecollectionSecretGuardActive(entries []store.ProtagonistEn
 }
 
 func personaMemoryEntryIsCharacterPrivate(entry store.PersonaMemoryEntry) bool {
+	ownerRole := strings.ToLower(strings.TrimSpace(personaMemoryEntryTagValue(personaMemoryEntryTags(entry), "owner_entity_role")))
+	return (ownerRole == "npc" || ownerRole == "supporting_character" || ownerRole == "supporting-character") &&
+		personaMemoryEntryHasPrivateMarker(entry)
+}
+
+func personaMemoryEntryHasPrivateMarker(entry store.PersonaMemoryEntry) bool {
 	source := strings.ToLower(strings.Join([]string{
 		entry.Portability,
 		entry.InjectionPolicy,
 		entry.TagsJSON,
 	}, " "))
 	return strings.Contains(source, "npc_private") || strings.Contains(source, "character_private_recollection")
+}
+
+func prepareTurnProtectedPrivateGuardKey(turn int, owner, text string) string {
+	owner = normalizeCharacterKey(owner)
+	text = normalizeSubjectiveMemoryDuplicateText(text)
+	if turn <= 0 || owner == "" || text == "" {
+		return ""
+	}
+	return fmt.Sprintf("%d|%s|%s", turn, owner, text)
+}
+
+func prepareTurnProtectedPrivateGuardIndex(memories []store.Memory) map[string]bool {
+	index := map[string]bool{}
+	add := func(turn int, owner, text string) {
+		if key := prepareTurnProtectedPrivateGuardKey(turn, owner, text); key != "" {
+			index[key] = true
+		}
+	}
+	for _, memory := range memories {
+		parsed := parseJSONMap(memory.SummaryJSON)
+		for _, raw := range sliceFromAny(parsed["protected_secrets"]) {
+			secret := mapFromAny(raw)
+			add(memory.TurnIndex, stringFromMap(secret, "owner"), stringFromMap(secret, "summary"))
+		}
+		for _, raw := range sliceFromAny(parsed["character_identity_accuracy"]) {
+			identity := mapFromAny(raw)
+			owner := extractionFirstNonEmpty(
+				stringFromMap(identity, "canonical_entity_name"),
+				stringFromMap(identity, "true_identity_name"),
+				stringFromMap(identity, "surface_identity_name"),
+			)
+			add(memory.TurnIndex, owner, protectedIdentityGuardSummary(identity))
+		}
+	}
+	return index
+}
+
+func prepareTurnProtectedMemoryOwnsPrivateGuard(index map[string]bool, entry store.ProtagonistEntityMemory) bool {
+	var tags []string
+	if json.Unmarshal([]byte(strings.TrimSpace(entry.TagsJSON)), &tags) == nil {
+		for _, tag := range tags {
+			switch strings.ToLower(strings.TrimSpace(tag)) {
+			case "derived_from_protected_secret", "derived_from_identity_accuracy":
+				return true
+			}
+		}
+	}
+	for _, owner := range []string{entry.OwnerEntityKey, entry.OwnerEntityName, entry.PersonaEntityKey, entry.PersonaEntityName} {
+		if index[prepareTurnProtectedPrivateGuardKey(entry.SourceTurn, owner, entry.MemoryText)] {
+			return true
+		}
+	}
+	return false
 }
 
 func personaMemoryEntryAsCharacterPrivateMemory(entry store.PersonaMemoryEntry, targetSID string) store.ProtagonistEntityMemory {
@@ -338,22 +398,233 @@ func personaMemoryEntryHasTag(tags []string, needle string) bool {
 }
 
 type prepareTurnRecollectionContext struct {
-	rawUserInput       string
-	immediateChatText  string
-	currentSceneStates string
+	rawUserInput              string
+	previousEventSummary      string
+	previousEventGuardSummary string
+	currentSceneStates        string
+	unresolvedGoals           string
+	currentEntities           string
+	latestAssistantTurn       int
+	currentSceneTurn          int
+	currentSceneIsCurrent     bool
 }
 
-func filterPrepareTurnEntityRecollections(rawUserInput string, chatLogs []store.ChatLog, activeStates []store.ActiveState, canonicalLayers []store.CanonicalStateLayer, personaEntries []store.PersonaMemoryEntry, characterPrivateMemories *[]store.ProtagonistEntityMemory) map[string]any {
-	const characterPrivateTotalCap = 2
-	ctx := buildPrepareTurnRecollectionContext(rawUserInput, chatLogs, activeStates, canonicalLayers)
+func (ctx prepareTurnRecollectionContext) relevanceText() string {
+	return strings.TrimSpace(strings.Join(nonEmptyStrings([]string{
+		ctx.rawUserInput,
+		ctx.previousEventSummary,
+		ctx.currentSceneStates,
+		ctx.unresolvedGoals,
+		ctx.currentEntities,
+	}), "\n"))
+}
+
+type prepareTurnRequestEntityScope struct {
+	Direct []string
+	Scene  []string
+	Known  []string
+}
+
+func buildPrepareTurnRequestEntityScope(rawUserInput, currentSceneEntities string, knownNames []string) prepareTurnRequestEntityScope {
+	scope := prepareTurnRequestEntityScope{}
+	addUnique := func(target *[]string, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || prepareTurnRelationshipNameInList(value, *target) {
+			return
+		}
+		*target = append(*target, value)
+	}
+	for _, name := range knownNames {
+		addUnique(&scope.Known, name)
+	}
+	aliases := prepareTurnObservedShortNameAliases(scope.Known)
+	for _, name := range scope.Known {
+		if prepareTurnDirectEntityMentionRank(rawUserInput, name, aliases) > 0 {
+			addUnique(&scope.Direct, name)
+		}
+	}
+	for _, observed := range nonEmptyStrings(strings.Split(currentSceneEntities, "\n")) {
+		canonical := observed
+		for _, known := range scope.Known {
+			if normalizePrepareTurnEntityNeedle(known) == normalizePrepareTurnEntityNeedle(observed) {
+				canonical = known
+				break
+			}
+		}
+		addUnique(&scope.Scene, canonical)
+	}
+	return scope
+}
+
+func prepareTurnEntityScopeQuery(rawUserInput string, names ...[]string) string {
+	parts := []string{strings.TrimSpace(rawUserInput)}
+	for _, group := range names {
+		parts = append(parts, strings.Join(group, "\n"))
+	}
+	return strings.TrimSpace(strings.Join(nonEmptyStrings(parts), "\n"))
+}
+
+func prepareTurnEntityRecollectionCandidateLimit(deliveryLimit int) int {
+	return minInt(1000, maxInt(80, deliveryLimit*4))
+}
+
+func prepareTurnDirectEntityMemoryOwners(rawUserInput string, owners []store.ProtagonistEntityMemoryOwner) []store.ProtagonistEntityMemoryOwner {
+	names := make([]string, 0, len(owners))
+	for _, owner := range owners {
+		names = append(names, strings.TrimSpace(firstNonEmpty(owner.OwnerEntityName, owner.OwnerEntityKey)))
+	}
+	aliases := prepareTurnObservedShortNameAliases(names)
+	out := make([]store.ProtagonistEntityMemoryOwner, 0)
+	seen := map[string]bool{}
+	for _, owner := range owners {
+		name := strings.TrimSpace(firstNonEmpty(owner.OwnerEntityName, owner.OwnerEntityKey))
+		if prepareTurnDirectEntityMentionRank(rawUserInput, name, aliases) == 0 {
+			continue
+		}
+		key := strings.TrimSpace(owner.OwnerEntityKey)
+		identity := strings.ToLower(firstNonEmpty(key, name))
+		if identity == "" || seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		out = append(out, owner)
+	}
+	return out
+}
+
+func prepareTurnEntityMentionPosition(rawUserInput, ownerName string, aliases map[string][]string) int {
+	haystack := strings.ToLower(rawUserInput)
+	best := len(haystack) + 1
+	candidates := []string{strings.TrimSpace(ownerName)}
+	canonical := normalizePrepareTurnEntityNeedle(ownerName)
+	candidates = append(candidates, aliases[canonical]...)
+	for _, candidate := range candidates {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" || !prepareTurnRecallContainsAnchor(rawUserInput, candidate) {
+			continue
+		}
+		if pos := strings.Index(haystack, candidate); pos >= 0 && pos < best {
+			best = pos
+		}
+	}
+	return best
+}
+
+func mergePrepareTurnEntityMemories(priority, fallback []store.ProtagonistEntityMemory) []store.ProtagonistEntityMemory {
+	out := make([]store.ProtagonistEntityMemory, 0, len(priority)+len(fallback))
+	seen := map[int64]bool{}
+	add := func(item store.ProtagonistEntityMemory) {
+		if item.ID > 0 {
+			if seen[item.ID] {
+				return
+			}
+			seen[item.ID] = true
+		}
+		out = append(out, item)
+	}
+	for _, item := range priority {
+		add(item)
+	}
+	for _, item := range fallback {
+		add(item)
+	}
+	return out
+}
+
+func filterPrepareTurnEntityRecollections(rawUserInput string, memories []store.Memory, activeStates []store.ActiveState, canonicalLayers []store.CanonicalStateLayer, pendingThreads []store.PendingThread, personaEntries []store.PersonaMemoryEntry, characterPrivateMemories *[]store.ProtagonistEntityMemory, chatLogGroups ...[]store.ChatLog) map[string]any {
+	ctx := buildPrepareTurnRecollectionContext(rawUserInput, memories, activeStates, canonicalLayers, pendingThreads, chatLogGroups...)
 	beforePrivate := len(*characterPrivateMemories)
 	filteredPrivate := make([]store.ProtagonistEntityMemory, 0, beforePrivate)
+	ownerNames := make([]string, 0, beforePrivate)
+	for _, item := range *characterPrivateMemories {
+		ownerNames = append(ownerNames, prepareTurnMemoryOwnerLabel(item.OwnerEntityKey, item.OwnerEntityName))
+	}
+	ownerAliases := prepareTurnObservedShortNameAliases(ownerNames)
+	directOwnerKeys := map[string]bool{}
+	for _, item := range *characterPrivateMemories {
+		owner := prepareTurnMemoryOwnerLabel(item.OwnerEntityKey, item.OwnerEntityName)
+		if prepareTurnDirectEntityMentionRank(rawUserInput, owner, ownerAliases) > 0 {
+			directOwnerKeys[prepareTurnMemoryOwnerIdentity(item.OwnerEntityKey, item.OwnerEntityName)] = true
+		}
+	}
+	relevanceQuery := prepareTurnEntityScopeQuery(ctx.rawUserInput, nonEmptyStrings(strings.Split(ctx.currentEntities, "\n")))
+	sort.SliceStable(*characterPrivateMemories, func(i, j int) bool {
+		left := (*characterPrivateMemories)[i]
+		right := (*characterPrivateMemories)[j]
+		leftOwner := prepareTurnMemoryOwnerLabel(left.OwnerEntityKey, left.OwnerEntityName)
+		rightOwner := prepareTurnMemoryOwnerLabel(right.OwnerEntityKey, right.OwnerEntityName)
+		leftDirect := prepareTurnDirectEntityMentionRank(rawUserInput, leftOwner, ownerAliases)
+		rightDirect := prepareTurnDirectEntityMentionRank(rawUserInput, rightOwner, ownerAliases)
+		if leftDirect != rightDirect {
+			return leftDirect > rightDirect
+		}
+		leftIdentity := prepareTurnMemoryOwnerIdentity(left.OwnerEntityKey, left.OwnerEntityName)
+		rightIdentity := prepareTurnMemoryOwnerIdentity(right.OwnerEntityKey, right.OwnerEntityName)
+		if leftIdentity != rightIdentity {
+			leftPosition := prepareTurnEntityMentionPosition(rawUserInput, leftOwner, ownerAliases)
+			rightPosition := prepareTurnEntityMentionPosition(rawUserInput, rightOwner, ownerAliases)
+			if leftPosition != rightPosition {
+				return leftPosition < rightPosition
+			}
+			return false
+		}
+		leftText := strings.Join(nonEmptyStrings([]string{left.MemoryText, left.EvidenceExcerpt, left.TagsJSON}), " ")
+		rightText := strings.Join(nonEmptyStrings([]string{right.MemoryText, right.EvidenceExcerpt, right.TagsJSON}), " ")
+		leftOverlap := prepareTurnRecallOverlapCount(relevanceQuery, leftText)
+		rightOverlap := prepareTurnRecallOverlapCount(relevanceQuery, rightText)
+		if leftOverlap != rightOverlap {
+			return leftOverlap > rightOverlap
+		}
+		if left.EmotionalWeight != right.EmotionalWeight {
+			return left.EmotionalWeight > right.EmotionalWeight
+		}
+		if left.Importance10 != right.Importance10 {
+			return left.Importance10 > right.Importance10
+		}
+		if left.SourceTurn != right.SourceTurn {
+			return left.SourceTurn > right.SourceTurn
+		}
+		return left.ID > right.ID
+	})
 	selectedOwners := []string{}
 	selectedOwnerKeys := map[string]bool{}
 	droppedOwners := []string{}
 	dropped := []map[string]any{}
+	protectedPrivateGuardIndex := prepareTurnProtectedPrivateGuardIndex(memories)
 	for _, item := range *characterPrivateMemories {
 		ownerKey := prepareTurnMemoryOwnerIdentity(item.OwnerEntityKey, item.OwnerEntityName)
+		ownerRole := strings.ToLower(strings.TrimSpace(item.OwnerEntityRole))
+		if ownerRole != "npc" && ownerRole != "supporting_character" && ownerRole != "supporting-character" {
+			dropped = append(dropped, map[string]any{
+				"id":                item.ID,
+				"owner_entity_key":  item.OwnerEntityKey,
+				"owner_entity_name": item.OwnerEntityName,
+				"reason":            "non_npc_memory_domain",
+			})
+			continue
+		}
+		if item.SecretGuard && prepareTurnProtectedMemoryOwnsPrivateGuard(protectedPrivateGuardIndex, item) {
+			dropped = append(dropped, map[string]any{
+				"id":                item.ID,
+				"owner_entity_key":  item.OwnerEntityKey,
+				"owner_entity_name": item.OwnerEntityName,
+				"reason":            "protected_secret_owned_by_protected_lane",
+			})
+			continue
+		}
+		if len(directOwnerKeys) > 0 && !directOwnerKeys[ownerKey] {
+			owner := prepareTurnMemoryOwnerLabel(item.OwnerEntityKey, item.OwnerEntityName)
+			if owner != "" && !stringSliceContains(droppedOwners, owner) {
+				droppedOwners = append(droppedOwners, owner)
+			}
+			dropped = append(dropped, map[string]any{
+				"id":                item.ID,
+				"owner_entity_key":  item.OwnerEntityKey,
+				"owner_entity_name": item.OwnerEntityName,
+				"reason":            "owner_not_confirmed_in_current_input",
+			})
+			continue
+		}
 		if ownerKey != "" && selectedOwnerKeys[ownerKey] {
 			owner := prepareTurnMemoryOwnerLabel(item.OwnerEntityKey, item.OwnerEntityName)
 			if owner != "" && !stringSliceContains(droppedOwners, owner) {
@@ -367,20 +638,7 @@ func filterPrepareTurnEntityRecollections(rawUserInput string, chatLogs []store.
 			})
 			continue
 		}
-		if ok, reason := prepareTurnCharacterPrivateMemoryRelevant(item, ctx); ok {
-			if len(filteredPrivate) >= characterPrivateTotalCap {
-				owner := prepareTurnMemoryOwnerLabel(item.OwnerEntityKey, item.OwnerEntityName)
-				if owner != "" && !stringSliceContains(droppedOwners, owner) {
-					droppedOwners = append(droppedOwners, owner)
-				}
-				dropped = append(dropped, map[string]any{
-					"id":                item.ID,
-					"owner_entity_key":  item.OwnerEntityKey,
-					"owner_entity_name": item.OwnerEntityName,
-					"reason":            "private_recollection_total_capped",
-				})
-				continue
-			}
+		if ok, reason := prepareTurnCharacterPrivateMemoryRelevant(item, ctx, ownerAliases); ok {
 			filteredPrivate = append(filteredPrivate, item)
 			if ownerKey != "" {
 				selectedOwnerKeys[ownerKey] = true
@@ -404,62 +662,202 @@ func filterPrepareTurnEntityRecollections(rawUserInput string, chatLogs []store.
 	}
 	*characterPrivateMemories = filteredPrivate
 	return map[string]any{
-		"version":                         "pmc19.prepare_turn_entity_relevance.v1",
-		"status":                          "active",
-		"persona_recollection_count":      len(personaEntries),
-		"persona_recollection_rule":       "protagonist_or_player_recollection_allowed_as_support_only_when_explicitly_attached",
-		"character_private_before_filter": beforePrivate,
-		"character_private_after_filter":  len(filteredPrivate),
-		"character_private_dropped_count": beforePrivate - len(filteredPrivate),
-		"character_private_gate":          "owner_entity_must_match_current_user_input_immediate_chat_or_current_scene_state",
-		"character_private_owner_cap":     1,
-		"character_private_total_cap":     characterPrivateTotalCap,
-		"selected_owner_entities":         selectedOwners,
-		"dropped_owner_entities":          droppedOwners,
-		"dropped":                         dropped,
-		"blocks_unrelated_session_memory": true,
-		"blocks_unrelated_entity_memory":  true,
-		"truth_authority":                 false,
-		"canonical_write":                 false,
-		"context_sources":                 []string{"current_user_input", "immediate_chat_tail", "latest_active_states"},
+		"version":                                 "pmc19.prepare_turn_entity_relevance.v1",
+		"status":                                  "active",
+		"persona_recollection_count":              len(personaEntries),
+		"persona_recollection_rule":               "protagonist_or_player_recollection_allowed_as_support_only_when_explicitly_attached",
+		"character_private_before_filter":         beforePrivate,
+		"character_private_after_filter":          len(filteredPrivate),
+		"character_private_dropped_count":         beforePrivate - len(filteredPrivate),
+		"character_private_gate":                  "owner_entity_must_match_current_user_input_or_observed_current_scene_entity",
+		"character_private_owner_cap":             1,
+		"character_private_total_cap":             "final_subjective_relationship_char_budget",
+		"character_private_unique_short_aliases":  len(ownerAliases),
+		"character_private_candidate_order":       "direct_owner_then_scene_overlap_then_emotional_weight_then_importance_then_recency",
+		"current_input_owner_count":               len(directOwnerKeys),
+		"current_input_owner_memory_cap":          1,
+		"protagonist_npc_memory_domains_separate": true,
+		"selected_owner_entities":                 selectedOwners,
+		"dropped_owner_entities":                  droppedOwners,
+		"dropped":                                 dropped,
+		"blocks_unrelated_session_memory":         true,
+		"blocks_unrelated_entity_memory":          true,
+		"truth_authority":                         false,
+		"canonical_write":                         false,
+		"context_sources":                         []string{"current_user_input", "confirmed_current_entities"},
 	}
 }
 
-func buildPrepareTurnRecollectionContext(rawUserInput string, chatLogs []store.ChatLog, activeStates []store.ActiveState, canonicalLayers []store.CanonicalStateLayer) prepareTurnRecollectionContext {
-	_ = canonicalLayers
-	immediate := []string{}
-	start := len(chatLogs) - 2
-	if start < 0 {
-		start = 0
-	}
-	for _, item := range chatLogs[start:] {
-		if text := strings.TrimSpace(item.Content); text != "" {
-			immediate = append(immediate, text)
+func buildPrepareTurnRecollectionContext(rawUserInput string, memories []store.Memory, activeStates []store.ActiveState, canonicalLayers []store.CanonicalStateLayer, pendingThreads []store.PendingThread, chatLogGroups ...[]store.ChatLog) prepareTurnRecollectionContext {
+	previousEventTurn := 0
+	for _, item := range memories {
+		if item.TurnIndex > previousEventTurn {
+			previousEventTurn = item.TurnIndex
 		}
 	}
+	previousEventCandidates := []string{}
+	for _, item := range memories {
+		if item.TurnIndex != previousEventTurn {
+			continue
+		}
+		if summary := compactPrepareTurnLine(prepareTurnMemorySummary(item), 360); summary != "" && !stringSliceContains(previousEventCandidates, summary) {
+			previousEventCandidates = append(previousEventCandidates, summary)
+			if len(previousEventCandidates) >= 3 {
+				break
+			}
+		}
+	}
+	latestAssistantTurn := 0
+	if len(chatLogGroups) > 0 {
+		for _, item := range chatLogGroups[0] {
+			if strings.EqualFold(strings.TrimSpace(item.Role), "assistant") && item.TurnIndex > latestAssistantTurn {
+				latestAssistantTurn = item.TurnIndex
+			}
+		}
+	}
+	previousEventGuardSummary := ""
+	if previousEventTurn > 0 && previousEventTurn == latestAssistantTurn {
+		previousEventGuardSummary = strings.Join(previousEventCandidates, "\n")
+	}
 	state := []string{}
+	currentEntities := []string{}
+	addSceneEntities := func(content string) {
+		payload := parseJSONMap(content)
+		for _, key := range []string{"present_entities", "present_characters"} {
+			for _, name := range stringsFromAny(payload[key]) {
+				name = strings.TrimSpace(name)
+				if name != "" && !stringSliceContains(currentEntities, name) {
+					currentEntities = append(currentEntities, name)
+				}
+			}
+		}
+	}
 	latestStateTurn := 0
 	for _, item := range activeStates {
 		if item.TurnIndex > latestStateTurn {
 			latestStateTurn = item.TurnIndex
 		}
 	}
-	for _, item := range activeStates {
-		if latestStateTurn > 0 && item.TurnIndex != latestStateTurn {
+	// Active-state rows are the current-state owner. Older databases may not
+	// have a turn index on that row, so zero remains an explicit unversioned
+	// current value; a positive turn can be rejected when it trails the latest
+	// completed assistant turn.
+	activeStateIsCurrent := len(activeStates) > 0 &&
+		(latestStateTurn == 0 || latestAssistantTurn == 0 || latestStateTurn >= latestAssistantTurn)
+	if activeStateIsCurrent {
+		for _, item := range activeStates {
+			stateType := strings.ToLower(strings.TrimSpace(item.StateType))
+			if item.TurnIndex != latestStateTurn || (stateType != "scene" && stateType != "scene_state" && stateType != "state_deltas") {
+				continue
+			}
+			if stateType == "state_deltas" {
+				payload, ok := parseSurfacePayload(item.Content).(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, ok := payload["scene_state"].(map[string]any); !ok {
+					continue
+				}
+			}
+			if text := prepareTurnSceneStateWithoutUnresolvedThreads(item.Content); text != "" && !stringSliceContains(state, text) {
+				addSceneEntities(text)
+				state = append(state, text)
+			}
+		}
+	}
+	if len(state) == 0 {
+		latestCanonicalTurn := 0
+		for _, item := range canonicalLayers {
+			if item.LayerType != "scene_state" {
+				continue
+			}
+			if item.TurnIndex > latestCanonicalTurn {
+				latestCanonicalTurn = item.TurnIndex
+			}
+		}
+		canonicalSceneCount := 0
+		for _, item := range canonicalLayers {
+			if item.LayerType == "scene_state" && item.TurnIndex == latestCanonicalTurn {
+				canonicalSceneCount++
+			}
+		}
+		canonicalStateIsCurrent := canonicalSceneCount > 0 &&
+			(latestCanonicalTurn == 0 || latestAssistantTurn == 0 || latestCanonicalTurn >= latestAssistantTurn)
+		if canonicalStateIsCurrent {
+			latestStateTurn = latestCanonicalTurn
+			for _, item := range canonicalLayers {
+				if item.TurnIndex != latestCanonicalTurn || item.LayerType != "scene_state" {
+					continue
+				}
+				addSceneEntities(item.Content)
+				if text := prepareTurnSceneStateWithoutUnresolvedThreads(item.Content); text != "" && !stringSliceContains(state, text) {
+					state = append(state, text)
+				}
+			}
+		}
+	}
+	sceneQuery := strings.TrimSpace(strings.Join(nonEmptyStrings([]string{
+		strings.TrimSpace(rawUserInput),
+		strings.Join(state, "\n"),
+		strings.Join(currentEntities, "\n"),
+	}), "\n"))
+	previousEventQuery := strings.TrimSpace(rawUserInput)
+	if len(prepareTurnRecallTerms(previousEventQuery)) < 2 {
+		previousEventQuery = sceneQuery
+	}
+	sparseCurrentContext := len(prepareTurnRecallTerms(previousEventQuery)) < 2
+	previousEvents := []string{}
+	for _, summary := range previousEventCandidates {
+		if !sparseCurrentContext && !prepareTurnSupportRecallEligible(previousEventQuery, summary) {
 			continue
 		}
-		if text := strings.TrimSpace(item.Content); text != "" {
-			state = append(state, text)
+		previousEvents = append(previousEvents, summary)
+	}
+	goalQuery := strings.TrimSpace(strings.Join(nonEmptyStrings([]string{sceneQuery, strings.Join(previousEvents, "\n")}), "\n"))
+	goals := []string{}
+	for _, item := range openNarrativeThreads(pendingThreads) {
+		goal := strings.TrimSpace(firstNonEmpty(item.Description, item.Title, item.ThreadKey))
+		if goal == "" {
+			continue
+		}
+		if !prepareTurnSupportRecallEligible(goalQuery, goal) {
+			continue
+		}
+		goals = append(goals, compactPrepareTurnLine(goal, 240))
+		if len(goals) >= 8 {
+			break
 		}
 	}
 	return prepareTurnRecollectionContext{
-		rawUserInput:       strings.TrimSpace(rawUserInput),
-		immediateChatText:  strings.Join(immediate, "\n"),
-		currentSceneStates: strings.Join(state, "\n"),
+		rawUserInput:              strings.TrimSpace(rawUserInput),
+		previousEventSummary:      strings.Join(previousEvents, "\n"),
+		previousEventGuardSummary: previousEventGuardSummary,
+		currentSceneStates:        strings.Join(state, "\n"),
+		unresolvedGoals:           strings.Join(goals, "\n"),
+		currentEntities:           strings.Join(currentEntities, "\n"),
+		latestAssistantTurn:       latestAssistantTurn,
+		currentSceneTurn:          latestStateTurn,
+		currentSceneIsCurrent:     len(state) > 0,
 	}
 }
 
-func prepareTurnCharacterPrivateMemoryRelevant(item store.ProtagonistEntityMemory, ctx prepareTurnRecollectionContext) (bool, string) {
+func prepareTurnSceneStateWithoutUnresolvedThreads(content string) string {
+	surface := parseSurfacePayload(content)
+	payload, ok := surface.(map[string]any)
+	if !ok {
+		return compactPrepareTurnLine(prepareTurnSurfaceText(surface), 420)
+	}
+	if nested, nestedOK := payload["scene_state"].(map[string]any); nestedOK {
+		payload = nested
+	}
+	delete(payload, "unresolved_threads")
+	if !hasMeaningfulPayload(payload) {
+		return ""
+	}
+	return compactPrepareTurnLine(prepareTurnSurfaceText(payload), 420)
+}
+
+func prepareTurnCharacterPrivateMemoryRelevant(item store.ProtagonistEntityMemory, ctx prepareTurnRecollectionContext, aliasMaps ...map[string][]string) (bool, string) {
 	ownerTokens := prepareTurnOwnerTokens(item.OwnerEntityKey, item.OwnerEntityName)
 	if len(ownerTokens) == 0 {
 		return false, "missing_owner_entity"
@@ -467,13 +865,27 @@ func prepareTurnCharacterPrivateMemoryRelevant(item store.ProtagonistEntityMemor
 	if prepareTurnAnyOwnerTokenMatches(ownerTokens, ctx.rawUserInput) {
 		return true, "explicit_current_user_input"
 	}
-	if prepareTurnAnyOwnerTokenMatches(ownerTokens, ctx.immediateChatText) {
-		return true, "immediate_chat_mention"
+	var aliases []string
+	if len(aliasMaps) > 0 {
+		for _, identity := range []string{item.OwnerEntityName, item.OwnerEntityKey, prepareTurnMemoryOwnerIdentity(item.OwnerEntityKey, item.OwnerEntityName)} {
+			identity = normalizePrepareTurnEntityNeedle(identity)
+			for _, alias := range aliasMaps[0][identity] {
+				if !stringSliceContains(aliases, alias) {
+					aliases = append(aliases, alias)
+				}
+			}
+		}
 	}
-	if prepareTurnAnyOwnerTokenMatches(ownerTokens, ctx.currentSceneStates) {
-		return true, "current_scene_state_mention"
+	if prepareTurnAnyOwnerTokenMatches(aliases, ctx.rawUserInput) {
+		return true, "explicit_current_user_input_unique_short_alias"
 	}
-	return false, "owner_not_in_current_input_immediate_chat_or_current_state"
+	if prepareTurnAnyOwnerTokenMatches(ownerTokens, ctx.currentEntities) {
+		return true, "observed_current_scene_entity"
+	}
+	if prepareTurnAnyOwnerTokenMatches(aliases, ctx.currentEntities) {
+		return true, "observed_current_scene_entity_unique_short_alias"
+	}
+	return false, "owner_not_in_current_input_or_observed_scene"
 }
 
 func prepareTurnOwnerTokens(ownerKey, ownerName string) []string {

@@ -27,7 +27,7 @@ func TestArchiveCenterJSCriticLedgerDebugRendererIsDefined(t *testing.T) {
 func TestArchiveCenterJSReferenceLibraryUIMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	for _, marker := range []string{
-		`body: { auto_review: true, client_meta:`,
+		`body: { auto_review: false, client_meta:`,
 		`/library`,
 		`data-reference-panel="library"`,
 		`data-reference-panel="import"`,
@@ -54,36 +54,129 @@ func TestArchiveCenterJSReferenceLibraryUIMarkers(t *testing.T) {
 	}
 }
 
+func TestArchiveCenterJSCanonPackAndDiscoveryUIMarkers(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	for _, marker := range []string{
+		`data-reference-panel="canon"`,
+		`data-tab="reference">📚 원작 자료</button>`,
+		`/canon-registry/v1?q=`,
+		`/canon-packs/preview/v1`,
+		`/canon-packs/install/v1`,
+		`/diagnostics/v1`,
+		`/lifecycle/v1`,
+		`/source-discovery/preview/v1`,
+		`/source-discovery/jobs/v1`,
+		`rawBody: true`,
+		`headers: { "Content-Type": "application/zip" }`,
+		`찾은 내용은 검토 대기로 저장되며 승인 전까지 원작 검색에 사용되지 않습니다.`,
+		`공개 자료 주소로 직접 찾기`,
+		`if (!draft.sourceUrl)`,
+		`if (preview.search_provider_required)`,
+		`const searchDiagnostic = result.search_llm || {};`,
+		`const discoverySearch = discoveryResult.search_llm`,
+		`allowed_source_types: draft.sourceUrl`,
+		`["community_wiki"]`,
+		`body.work_id = state.selectedWorkId;`,
+		`body.continuity_id = state.selectedContinuityId;`,
+		`timeoutMs: getSourceDiscoveryRequestTimeoutMs()`,
+		`/admit/v1`,
+		`confirm_evidence_validated_batch: true`,
+		`max_completion_tokens: getSubLlmMaxCompletionTokensSetting(settings.subLlmMaxCompletionTokens)`,
+		`id="mo-discovery-admit"`,
+		`discoveryCandidates.length === 0`,
+		`searchDiagnostic.status === "completed_no_results"`,
+		`discoverySearch.status || "") === "completed_no_results"`,
+		`sourceSearchPlannerTemperature: sanitizeNumber(`,
+		`sourceSearchPlannerReasoningEffort: normalizeReasoningEffort(`,
+		`id="mo-sourceSearchPlannerTemperature"`,
+		`id="mo-sourceSearchPlannerReasoningEffort"`,
+		`id="mo-sourceSearchPlannerMaxCompletionTokens" value="' + Number(s.sourceSearchPlannerMaxCompletionTokens ?? 512) + '" min="1" max="128000"`,
+		`<div class="mo-section">원작 자료 검색</div>`,
+		`선택한 Provider의 웹 검색 기능으로 공개 출처를 찾습니다.`,
+		`>Ollama Search Agent</option>`,
+		`ollama: { endpoint: "https://ollama.com"`,
+		`generationOptions.style.display = ""`,
+		`Ollama 검색 에이전트 · effort none은 think=false`,
+		`const discoveryExceptions = Array.isArray(discoveryResult.exceptions)`,
+		`' · 검색 URL ' + Number(discoverySearch.result_count || 0)`,
+		`'개 · 수집 실패 ' + discoveryExceptions.length`,
+		`data-reference-panel="search_settings">검색 설정</button>`,
+		`sourceSearchPlannerProvider: readValue("mo-sourceSearchPlannerProvider", settings.sourceSearchPlannerProvider, true)`,
+		`id="mo-reference-work-edit"`,
+		`id="mo-reference-work-delete"`,
+		`expected_revision: Number(work.revision)`,
+		`장기 기억은 변경하지 않았습니다.`,
+		`<strong>선택한 원작 DB:</strong>`,
+		`현재 실행 중인 백엔드에 작품 삭제 API가 없습니다.`,
+		`온라인 팩 카탈로그가 아니라 이 PC에 설치된 Canon Pack을 검색합니다.`,
+	} {
+		if !strings.Contains(src, marker) {
+			t.Fatalf("Archive Center.js missing Canon Pack UI marker %q", marker)
+		}
+	}
+	if count := strings.Count(src, `<div class="mo-section">원작 자료 검색</div>`); count != 1 {
+		t.Fatalf("source-search LLM settings panel count = %d, want 1", count)
+	}
+	previewStart := strings.Index(src, `if (!draft.sourceUrl) {`)
+	if previewStart < 0 {
+		t.Fatal("title-only Source Discovery preview guard missing")
+	}
+	previewEnd := strings.Index(src[previewStart:], `body.client_meta = buildAdminRuntimeClientMeta`)
+	if previewEnd < 0 || !strings.Contains(src[previewStart:previewStart+previewEnd], `if (preview.search_provider_required)`) {
+		t.Fatal("title-only Source Discovery must stop only when the backend reports a missing search provider")
+	}
+	for _, removed := range []string{
+		`mo-discovery-original-title`,
+		`mo-discovery-language`,
+		`mo-discovery-edition`,
+		`mo-discovery-requested-domains`,
+		`mo-discovery-approved-domains`,
+		`mo-discovery-provider-endpoint`,
+		`mo-discovery-provider-api-key`,
+		`mo-discovery-policy-confirmed`,
+		`mo-sourceSearchProvider`,
+		`mo-sourceSearchApiKey`,
+		`<option value="brave"`,
+		`<option value="tavily"`,
+		`<div class="mo-section">원작 자료 검색 API</div>`,
+		`<div class="mo-section">검색 계획 LLM</div>`,
+		`["reference", "원작 자료"]`,
+		`id="mo-source-search-llm-save"`,
+		`renderReferenceBindingPanel(selector)`,
+		`data.result && data.result.search_provider`,
+		`찾은 자료는 검토 대기 상태로 저장했습니다.`,
+	} {
+		if strings.Contains(src, removed) {
+			t.Fatalf("Archive Center.js still exposes removed Source Discovery field %q", removed)
+		}
+	}
+	referencePanelStart := strings.Index(src, `data-tab-panel="reference"`)
+	if referencePanelStart < 0 {
+		t.Fatal("top-level reference panel missing")
+	}
+	referencePanelEnd := strings.Index(src[referencePanelStart:], `data-tab-panel="archive"`)
+	if referencePanelEnd < 0 || strings.Contains(src[referencePanelStart:referencePanelStart+referencePanelEnd], `settingsSubtabsHtml("reference")`) {
+		t.Fatal("reference workspace must not render the settings subtab bar")
+	}
+}
+
 func TestArchiveCenterJSConsumesReferenceLaneOutsideMainInjectionBudget(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	for _, marker := range []string{
 		`reference_injection_budget_basis_chars: settings.maxInjectionChars || DEFAULT_SETTINGS.maxInjectionChars,`,
 		`reference_recall_limit: sanitizeTopKSetting(settings.topK, DEFAULT_SETTINGS.topK),`,
 		`reference_injection_enabled: settings.injectionEnabled !== false,`,
-		`const primaryCanonBaseText = (_ip && _ip.primary_canon_base_text) ? String(_ip.primary_canon_base_text).trim() : "";`,
-		`const referenceInjectionText = [primaryCanonBaseText, referenceText].filter(Boolean).join("\n\n");`,
-		`const effectiveAuxiliaryText = [referenceInjectionText, fullInjectionText].filter(Boolean).join("\n\n");`,
-		`injectAuxiliaryBlock(payload, effectiveAuxiliaryText)`,
-		`primaryCanonBaseIncluded: injected && primaryCanonBaseText.length > 0`,
+		`payloadApplicationPlan: result.payload_application_plan`,
+		`const auxiliaryText = String(plan.auxiliary_text || "")`,
+		`injectAuxiliaryBlock(finalPayload, auxiliaryText)`,
+		`referenceIncluded: !!(laneByKey.original_work && laneByKey.original_work.applied)`,
 	} {
 		if !strings.Contains(src, marker) {
 			t.Fatalf("Archive Center.js missing primary Canon Base host-consumption marker %q", marker)
 		}
 	}
-	budgetStart := strings.Index(src, `const budgetResult = assembleInjectionWithBudget(`)
-	if budgetStart < 0 {
-		t.Fatal("Archive Center.js main injection budget assembly start missing")
-	}
-	budgetEnd := strings.Index(src[budgetStart:], `const chapterDelivered =`)
-	if budgetEnd < 0 {
-		t.Fatal("Archive Center.js main injection budget assembly end missing")
-	}
-	budgetCall := src[budgetStart : budgetStart+budgetEnd]
-	if strings.Contains(budgetCall, "primaryCanonBaseText") || strings.Contains(budgetCall, "referenceText") {
-		t.Fatal("the reference lane must remain outside assembleInjectionWithBudget")
-	}
-	if strings.Contains(src, "trimBySections(primaryCanonBaseText") || strings.Contains(src, "trimBySections(referenceText") {
-		t.Fatal("the reference lane must not be re-trimmed by the host adapter")
+	if strings.Contains(src, "await runSupervisor(") {
+		t.Fatal("host adapter must not create a second supervisor path")
 	}
 }
 
@@ -104,7 +197,7 @@ let _effectiveInputAwaitingNewTurn = false;
 let lastOrchResult = null;
 function resolveLatestTransparencyTrace() { return currentTrace; }
 function composeEffectiveInputFromTransparency() { return "REFERENCE\n\nMAIN"; }
-function renderBackendEffectiveInputPreviewBlock() { return ""; }
+function isBackendEffectiveInputPreview(value) { return !!(value && value.contract_version === "effective_input_preview.v1"); }
 function formatLanguageContextBlock() { return ""; }
 function t(key) { return key; }
 function escapeAttr(value) { return String(value == null ? "" : value); }
@@ -115,12 +208,37 @@ function renderItBlock(title, text) { return '<BLOCK title="' + title + '">' + t
 currentTrace = {_inputTransparency: {injection: {
   mainInjectionPreview: "MAIN",
   referenceInjectionPreview: "REFERENCE",
+  guidanceInjectionPreview: "GUIDANCE",
   auxiliaryPreview: "REFERENCE\n\nMAIN"
 }}};
 let html = renderEffectiveInputSection();
 assert(html.includes('<BLOCK title="Assembled Auxiliary Context">MAIN</BLOCK>'), "main context pane is not isolated");
 assert(html.includes('<BLOCK title="Original Work Reference Context">REFERENCE</BLOCK>'), "reference context pane is not isolated");
+assert(html.includes('<BLOCK title="Output Guidance Context">GUIDANCE</BLOCK>'), "guidance context pane is not isolated");
 assert(!html.includes('<BLOCK title="Assembled Auxiliary Context">REFERENCE\n\nMAIN</BLOCK>'), "combined context leaked into main pane");
+
+currentTrace = {_inputTransparency: {
+  backendEffectiveInputPreview: {contract_version: "effective_input_preview.v1", final_user_text: "ACTUAL USER"},
+  inputContext: {text: "INPUT CONTEXT"},
+  injection: {
+    mainInjectionPreview: "PRIORITY\n\nDIRECT\n\nEVENT",
+    referenceInjectionPreview: "REFERENCE",
+    protection: {text: "PRIORITY"},
+    memoryDeliveryPlan: {classes: [
+      {key: "direct_evidence", title: "Latest Direct Evidence", used_chars: 6, reserved_chars: 100, text: "[Latest Direct Evidence]\nDIRECT"},
+      {key: "event_recent", title: "Event and Recent Memories", used_chars: 5, reserved_chars: 100, text: "[Event and Recent Memories]\nEVENT"}
+    ]}
+  }
+}};
+html = renderEffectiveInputSection();
+assert(html.includes('<BLOCK title="Actual User Input">ACTUAL USER</BLOCK>'), "actual user pane is missing");
+assert(html.includes('<BLOCK title="Priority and Base Rules">PRIORITY</BLOCK>'), "priority pane is missing");
+assert(html.includes('title="Latest Direct Evidence · 사용 6 chars · 기본 배정 100 chars"'), "direct evidence pane is missing");
+assert(html.includes('title="Event and Recent Memories · 사용 5 chars · 기본 배정 100 chars"'), "event memory pane is missing");
+assert(html.includes('<BLOCK title="Input Context">INPUT CONTEXT</BLOCK>'), "input context pane is missing");
+assert(!html.includes('title="Assembled Auxiliary Context"'), "planned classes fell back to one combined pane");
+assert(!html.includes('Backend Effective Input Preview'), "diagnostic preview metadata leaked into final input panes");
+assert(!html.includes('Final Payload Parity'), "payload parity diagnostics leaked into final input panes");
 
 currentTrace = {_inputTransparency: {injection: {
   mainInjectionPreview: "",
@@ -137,6 +255,109 @@ assert(html.includes('<BLOCK title="Original Work Reference Context">REFERENCE_O
 	}
 }
 
+func TestArchiveCenterJSGoPayloadPlanPreservesLanePreviewsForTransparency(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Fatalf("node is required for Go payload plan runtime smoke; set ARCHIVE_CENTER_NODE_BINARY: %v", err)
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractJSFunctionBlockForTest(t, src, "function computeOrchestrationDirtyHashOr1c("),
+		extractJSFunctionBlockForTest(t, src, "function sanitizeEnumValue("),
+		extractJSFunctionBlockForTest(t, src, "function normalizeAuxiliaryInjectionPlacement("),
+		extractJSFunctionBlockForTest(t, src, "function normalizeAuxiliaryInjectionAnchorMarker("),
+		extractJSFunctionBlockForTest(t, src, "function normalizeRollbackMessageRole("),
+		extractJSFunctionBlockForTest(t, src, "function extractMessageContentCandidate("),
+		extractJSFunctionBlockForTest(t, src, "function extractComparableMessageRoleAndContent("),
+		extractJSFunctionBlockForTest(t, src, "function auxiliaryMessageContentText("),
+		extractJSFunctionBlockForTest(t, src, "function getPayloadMessageRoleAndText("),
+		extractJSFunctionBlockForTest(t, src, "function isChatMessageLike("),
+		extractJSFunctionBlockForTest(t, src, "function isChatMessageArray("),
+		extractJSFunctionBlockForTest(t, src, "function getPayloadPathValue("),
+		extractJSFunctionBlockForTest(t, src, "function buildPayloadPathRebuilder("),
+		extractJSFunctionBlockForTest(t, src, "function findPayloadMessagesPath("),
+		extractJSFunctionBlockForTest(t, src, "function extractMessages("),
+		extractJSFunctionBlockForTest(t, src, "function findFirstSystemInsertionIndex("),
+		extractJSFunctionBlockForTest(t, src, "function findLatestUserInsertionIndex("),
+		extractJSFunctionBlockForTest(t, src, "function findAnchorMarkerInsertionIndex("),
+		extractJSFunctionBlockForTest(t, src, "function findLastCachePointInsertionIndex("),
+		extractJSFunctionBlockForTest(t, src, "function resolveAuxiliaryInjectionPlacement("),
+		extractJSFunctionBlockForTest(t, src, "function injectAuxiliaryBlock("),
+		extractJSFunctionBlockForTest(t, src, "function injectInputContextBeforeUser("),
+		extractJSFunctionBlockForTest(t, src, "function observeGoPayloadApplication("),
+		extractJSFunctionBlockForTest(t, src, "function applyGoPayloadApplicationPlan("),
+	}, "\n")
+	script := functions + `
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const AUXILIARY_INJECTION_PLACEMENT_OPTIONS = Object.freeze(["auto", "before_latest_user", "after_anchor_marker", "after_last_cache_point", "after_first_system", "end"]);
+const DEFAULT_SETTINGS = {auxiliaryInjectionPlacement:"before_latest_user"};
+const settings = {auxiliaryInjectionPlacement:"before_latest_user",auxiliaryInjectionAnchorMarker:""};
+const runtimeUpdates = [];
+function updateRuntimeState(key,status,detail) { runtimeUpdates.push({key,status,detail}); }
+function warnLog() { throw new Error("unexpected production warning"); }
+const memoryDeliveryPlan = {
+  contract_version: "memory_delivery_plan.v1",
+  classes: [{key: "event_recent", text: "MEMORY"}]
+};
+const auxiliaryText = "REFERENCE\n\nMEMORY\n\nGUIDANCE";
+const inputContextText = "INPUT";
+const exactAuxiliary = "[Archive Center — Auxiliary Context]\n\n" + auxiliaryText;
+const exactInputContext = "[Archive Center — Input Context]\n\n" + inputContextText;
+const plan = {
+  contract_version: "payload_application_plan.v1",
+  owner: "go",
+  apply_rule: "apply_exact_text_without_reassembly",
+  status: "ready",
+  auxiliary_text: auxiliaryText,
+  input_context_text: inputContextText,
+  auxiliary_observation_hash: computeOrchestrationDirtyHashOr1c(exactAuxiliary),
+  input_context_observation_hash: computeOrchestrationDirtyHashOr1c(exactInputContext),
+  lanes: [
+    {key: "original_work", text: "REFERENCE", applied: true, status: "applied"},
+    {key: "long_term_memory", text: "MEMORY", applied: true, status: "applied"},
+    {key: "output_guidance", text: "GUIDANCE", applied: true, status: "applied"}
+  ]
+};
+const originalPayload = [
+  {role:"system",content:"host preset"},
+  {role:"assistant",content:"previous answer"},
+  {role:"user",content:"continue"}
+];
+const applied = applyGoPayloadApplicationPlan(
+  originalPayload,
+  {
+    _injectionPack: {payload_application_plan: plan, memory_delivery_plan: memoryDeliveryPlan},
+    _sourceToPayloadLineage: {lineage_id:"stl_preview",payload_plan_id:"stp_preview",source_refs:[],execution_items:[]},
+    _trace: {}
+  },
+  {}
+);
+assert(applied.injectionResult.applied === true, "production payload application was not confirmed");
+assert(applied.injectionResult.mainInjectionPreview === "MEMORY", "long-term memory preview was not preserved");
+assert(applied.injectionResult.referenceInjectionPreview === "REFERENCE", "original-work preview was not preserved");
+assert(applied.injectionResult.guidanceInjectionPreview === "GUIDANCE", "output-guidance preview was not preserved");
+assert(applied.injectionResult.memoryDeliveryPlan === memoryDeliveryPlan, "memory delivery plan was not preserved");
+assert(originalPayload.length === 3, "production payload application mutated the original array");
+const returnedMessages = extractMessages(applied.payload).messages;
+const auxiliaryMatches = returnedMessages.filter((message) => getPayloadMessageRoleAndText(message).text === exactAuxiliary);
+const inputMatches = returnedMessages.filter((message) => getPayloadMessageRoleAndText(message).text === exactInputContext);
+assert(auxiliaryMatches.length === 1, "Go-owned auxiliary text was not applied exactly once");
+assert(inputMatches.length === 1, "Go-owned input context was not applied exactly once");
+assert(returnedMessages[returnedMessages.length - 1].content === "continue", "latest user message was not preserved");
+assert(applied.injectionResult.payloadApplicationObservation.payload_application_status === "applied", "returned payload was not observed");
+assert(runtimeUpdates.length === 1 && runtimeUpdates[0].status === "ok", "successful production runtime state was not recorded once");
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Go payload plan transparency runtime smoke failed: %v\n%s", err, out)
+	}
+}
+
 func archiveCenterRoot(t *testing.T) string {
 	t.Helper()
 	candidates := []string{
@@ -145,9 +366,6 @@ func archiveCenterRoot(t *testing.T) string {
 	}
 	if root := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_ROOT")); root != "" {
 		candidates = append([]string{filepath.Join(root, "Archive Center.js")}, candidates...)
-	}
-	if runtime.GOOS == "windows" {
-		candidates = append(candidates, filepath.Join(`M:\risulongmemory`, "Archive Center 2.0", "Archive Center.js"))
 	}
 	if _, file, _, ok := runtime.Caller(0); ok {
 		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "..", "Archive Center.js"))
@@ -260,7 +478,7 @@ func TestArchiveCenterJSRerollRollbackPath(t *testing.T) {
 		"function detectRollbackNeed",
 		"async function checkAndAutoRollback",
 		"async function executeAutoRollback",
-		"await checkAndAutoRollback(orchSessionId, rollbackComparable.messages)",
+		"await checkAndAutoRollback(orchSessionId, rollbackComparable.messages, {",
 		`rollbackParams.set("req_source", requestSource);`,
 		"method: \"DELETE\"",
 		"requestSource = options && options.requestSource ? String(options.requestSource) : \"auto\"",
@@ -316,7 +534,7 @@ func TestArchiveCenterJSProjectConfigGUIRuntimeMarkers(t *testing.T) {
 	}
 }
 
-func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndBudgetPreviewMarkers(t *testing.T) {
+func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndNoStaleBudgetPreview(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
 		`const _i18n = {`,
@@ -333,11 +551,8 @@ func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndBudgetPreviewMarkers(t
 		`<label>${t('settings.label.auxiliaryInjectionPlacement')}</label>`,
 		`${t('settings.option.auxiliaryInjectionPlacement.auto')}`,
 		`${t('settings.hint.auxiliaryInjectionAnchorMarker')}`,
-		`const estimatedBudget = estimatedParts.budgetLimit;`,
-		`const automaticBudget = Number(estimatedParts.automaticBudgetLimit || 0);`,
-		`const extraBudget = Number(estimatedParts.userExtraBudgetChars || 0);`,
-		`function readCurrentInjectionBudgetPreviewSettings()`,
-		`renderSettingsInjectionBudgetPreview(readCurrentInjectionBudgetPreviewSettings())`,
+		`const prepareInjectionBudget = estimateAdaptiveInjectionBudgetParts(settings, prepareOptions.runtimeTokenInfo || null);`,
+		`max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.budgetLimit,`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -349,6 +564,9 @@ func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndBudgetPreviewMarkers(t
 		`<label>Memory Anchor Marker</label>`,
 		`<small>Controls where the large Archive Center memory block is inserted.`,
 		`const estimatedBudget = info.budgetLimit || estimatedParts.budgetLimit;`,
+		`function renderSettingsInjectionBudgetPreview(`,
+		`mo-injection-budget-preview`,
+		`settings.label.injectionBudgetPreview`,
 	}
 	for _, needle := range forbidden {
 		if strings.Contains(src, needle) {
@@ -367,7 +585,6 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 		`inputImprovementApplied`,
 		`rewriteAllowed: applyModeName === 'reviewed_apply' && !!settings.pluginMainRewriteLegacyOptIn && payloadRewritten`,
 		`<select id="mo-pluginMainApplyMode">`,
-		`mo-injection-budget-preview`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -378,6 +595,7 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 		`id="mo-enabled"`,
 		`id="mo-dbEnabled"`,
 		`id="mo-supervisorEnabled"`,
+		`mo-injection-budget-preview`,
 	}
 	for _, needle := range forbidden {
 		if strings.Contains(src, needle) {
@@ -421,7 +639,7 @@ func TestSeq01NarrativeGuideAutoTraceDashboardAndLegacyCleanupMarkers(t *testing
 		`narrativeGuideMode: "auto"`,
 		`"settings.label.narrativeGuideMode.help": "Auto mode combines recent input, scene pressure, emotional intensity, combat, and relationship signals, then exposes the resolved mode in trace and dashboard."`,
 		`let _guideModeRuntimeCache = { lastMode: null, lastProbe: "", consecutiveSame: 0 };`,
-		`result._guideModeBasis = "auto_inferred";`,
+		`const supervisorResult = (preparedBundle && preparedBundle.supervisorResult)`,
 		`guideModeBasis: (supervisorResult && supervisorResult._guideModeBasis) || "manual"`,
 		`const guideModeDashboardState = lastGuideSupervisor && lastGuideSupervisor.guideMode`,
 		`guide_mode_state: guideModeDashboardState`,
@@ -470,7 +688,7 @@ func TestSeq01RuntimeStateNarrativeTypeAndSearchCallMarkers(t *testing.T) {
 	required := []string{
 		`function updateRuntimeState(key, status, extra = {})`,
 		`function isNarrativeType(type)`,
-		`if (!isNarrativeType(type) || !settings.enabled) return payload;`,
+		`if (!settings.enabled || !isSaveType(type)) return payload;`,
 		`async function runMemorySearch(userInput, options = {})`,
 		`() => bridgeFetch("/search", { method: "POST", body, timeoutMs: getRequestTimeoutSettingMs() })`,
 		`updateRuntimeState("lastSearchStatus", "fail"`,
@@ -1008,7 +1226,7 @@ func TestArchiveCenterJSSameTurnOverlayFreshnessRuntimeBehavior(t *testing.T) {
 	}
 	src := readArchiveCenterJS(t)
 	start := strings.Index(src, "function normalizeStorylineStatus")
-	end := strings.Index(src, "// E-1d: Storyline Sync")
+	end := strings.Index(src, "function makeEmptyContinuityPackResult")
 	if start < 0 || end < 0 || end <= start {
 		t.Fatalf("Archive Center.js missing same-turn overlay helper block")
 	}
@@ -1087,9 +1305,9 @@ func TestArchiveCenterJSSameTurnOverlayWiringMarkers(t *testing.T) {
 		`freshness: storylineResult.freshness || summarizeOverlayFreshness([], "last_turn"),`,
 		`usedOverlay: !!worldRulesResult.usedOverlay,`,
 		`freshness: worldRulesResult.freshness || summarizeOverlayFreshness([], "source_turn"),`,
-		"var directive = supervisorResult.directive || supervisorResult;",
-		"if (!directive.section_world || directive.section_world.applies !== true) return null;",
-		"supervisor_response: directive,",
+		"var directive = supervisorResult && (supervisorResult.directive || supervisorResult);",
+		"var sw = directive.section_world;",
+		`if (!sw || typeof sw !== "object" || sw.applies === false) return [];`,
 		"storylineResult = await fetchStorylines(chatSessionId);",
 		"worldRulesResult = await fetchWorldRules(chatSessionId);",
 	}

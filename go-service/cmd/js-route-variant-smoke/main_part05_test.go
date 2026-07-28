@@ -35,7 +35,7 @@ func TestArchiveCenterJSSeq165P142InputContextSlotGovernorMarkers(t *testing.T) 
 func TestArchiveCenterJSSeq165P143TransparencyPreviewRuntimeTraceExtendMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"function buildInputTransparency(userInput, recentContext, searchResult, wakeUpContext, supervisorResult, continuityInfo, kgRecallResult, extractedEntities, activeStatesResult, episodeRecallResult, expandedEntities, languageContext, backendInputTransparencyModel, backendEffectiveInputPreview, weakInputPlanner, plannerExecutionContract, progressionChoice, step25ValidationGate) {",
+		"function buildInputTransparency(userInput, recentContext, searchResult, wakeUpContext, supervisorResult, continuityInfo, kgRecallResult, extractedEntities, activeStatesResult, episodeRecallResult, expandedEntities, languageContext, backendInputTransparencyModel, backendEffectiveInputPreview, responseExecutionContract) {",
 		"function logTurnTraceSummary() {",
 		"function renderTurnTraceRows() {",
 		"_inputTransparency = buildInputTransparency(",
@@ -54,6 +54,11 @@ func TestArchiveCenterJSSeq165P143TransparencyPreviewRuntimeTraceExtendMarkers(t
 			t.Fatalf("Archive Center.js missing SEQ-16.5-P143 transparency/preview/runtime trace marker %q", needle)
 		}
 	}
+	for _, forbidden := range []string{"weakInputPlanner", "progressionChoiceLedger", "step25ValidationGate"} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains removed story-control transparency marker %q", forbidden)
+		}
+	}
 }
 
 // SEQ-16.5-P144: backend/main.py input_context_text handoff anchor metadata
@@ -61,16 +66,11 @@ func TestArchiveCenterJSSeq165P143TransparencyPreviewRuntimeTraceExtendMarkers(t
 func TestArchiveCenterJSSeq165P144HandoffAnchorMetadataAlignmentMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"buildInputContext(orchResult._userInput || \"\", orchResult, _ip ? (_ip.input_context_text || \"\") : \"\"",
-		"inputCtx = buildInputContext(orchResult._userInput || \"\", orchResult, _ip ? (_ip.input_context_text || \"\") : \"\", {",
-		"injectionTextSource: _ip ? \"bundle\" : \"local\"",
-		"const _ip = orchResult._injectionPack || null",
-		"const memoryText = (_ip && _ip.memory_text) ? _ip.memory_text : formatMemoryBlock(searchResult, sanitizeTopKSetting(settings.topK, DEFAULT_SETTINGS.topK))",
-		"const kgText = (_ip && _ip.kg_text) ? _ip.kg_text : formatKGBlock(kgRecallResult)",
-		"const fallbackText = (_ip && _ip.fallback_text) ? _ip.fallback_text : (includeFallback ? formatFallbackBlock(searchResult) : \"\")",
-		"const latestDirectEvidenceText = (_ip && _ip.latest_direct_evidence_text) ? String(_ip.latest_direct_evidence_text) : \"\"",
-		"const recentRawTurnText = (_ip && _ip.recent_raw_turn_text) ? String(_ip.recent_raw_turn_text) : \"\"",
-		"const canonicalStateLayerText = (_ip && _ip.canon_text) ? String(_ip.canon_text) : \"\"",
+		"const inputContextText = String(plan.input_context_text || \"\")",
+		"injectInputContextBeforeUser(finalPayload, inputContextText)",
+		"injectionTextSource: \"go_payload_application_plan.v1\"",
+		"input_context_hash",
+		"apply_exact_text_without_reassembly",
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -117,10 +117,14 @@ func TestArchiveCenterJSSeq165P169DecisionAdaptiveFloorCeilingMarkers(t *testing
 	src := readArchiveCenterJS(t)
 	required := []string{
 		"const manualBudgetLimit = Math.max(500, settings.maxInjectionChars || DEFAULT_SETTINGS.maxInjectionChars);",
-		"mid_context_300k: 6000",
-		"wide_context_500k: 9000",
-		"ultra_long_1m_plus: 14000",
-		"extreme_long_2m_plus: 18000",
+		"mid_context_300k: 9000",
+		"wide_context_500k: 18000",
+		"ultra_long_1m_plus: 27000",
+		"extreme_long_2m_plus: 36000",
+		"max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.budgetLimit",
+		"runtimeTokenInfo,",
+		"Math.min(51000, automaticBudgetLimit + userExtraBudgetChars)",
+		"parts.push(b.text);",
 		"const step13TokenTruthFloorCoreLabels = [\"latest_direct_evidence\", \"recent_raw_turn\", \"active_state\", \"canonical_state_layer\"];",
 		"const step13TokenTruthFloorContinuityLabels = [\"storylines\", \"episode\", \"chapter\", \"arc\", \"saga\"];",
 	}
@@ -128,6 +132,12 @@ func TestArchiveCenterJSSeq165P169DecisionAdaptiveFloorCeilingMarkers(t *testing
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing SEQ-16.5-P169 adaptive floor/ceiling decision marker %q", needle)
 		}
+	}
+	if strings.Contains(src, `parts.push("[Character Private Recollection]\n" + b.text);`) {
+		t.Fatal("Archive Center.js must not add a second Character Private Recollection heading")
+	}
+	if strings.Contains(src, `parts.push("[Persona Recollection]\n" + b.text);`) {
+		t.Fatal("Archive Center.js must not add a second Persona Recollection heading")
 	}
 }
 

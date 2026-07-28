@@ -12,20 +12,81 @@ import (
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
+const (
+	prepareTurnProductionProjectionV1 = "prepare_turn.production_compact.v1"
+	prepareTurnHistoryWindowTurns     = 300
+)
+
 func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	timing := newBackendTimingTrace("prepare_turn.backend_timing.v1")
 	decodeStartedAt := time.Now()
-	var req dto.PrepareTurnRequest
-	if err := dto.DecodeWithDefaults(r.Body, &req); err != nil {
+	var request dto.PrepareTurnContractRequest
+	if err := dto.DecodeWithDefaults(r.Body, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	req := request.PrepareTurnRequest
 	timing.addElapsed("request_decode", decodeStartedAt)
 
 	sid := strings.TrimSpace(req.ChatSessionID)
 	if sid == "" {
 		writeError(w, http.StatusBadRequest, "missing_param", "chat_session_id is required")
 		return
+	}
+	prepareSourceContract := buildPrepareTurnSourceContract(request, sid)
+	currentInputDecision, enforceCurrentInputContract := buildPrepareTurnCurrentInputDecision(request, sid)
+	sessionBootstrap := buildPrepareTurnSessionBootstrap(request, sid)
+	hostContextSnapshot := buildPrepareTurnRisuHostContextSnapshot(request, sid)
+	hostContextReferenceEvidence := buildPrepareTurnHostContextReferenceEvidence(hostContextSnapshot)
+	responseProjection := strings.TrimSpace(request.ResponseProjection)
+	if request.SourceDecisionOnly {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"source_contract":                 prepareSourceContract,
+			"current_input_decision":          currentInputDecision,
+			"message_source_envelope":         currentInputDecision.Envelope,
+			"session_bootstrap":               sessionBootstrap,
+			"risu_host_context_snapshot":      hostContextSnapshot,
+			"host_context_reference_evidence": hostContextReferenceEvidence,
+		})
+		return
+	}
+	if enforceCurrentInputContract && (!currentInputDecision.MemoryReadsAllowed || !currentInputDecision.ContextInjectionEligible) {
+		timing.addElapsed("source_decision", decodeStartedAt)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":                          "ok",
+			"source":                          "shadow",
+			"chat_session_id":                 sid,
+			"generated_at":                    time.Now().UTC().Format(time.RFC3339),
+			"request_type":                    stringPtrValue(req.RequestType, "model"),
+			"fallback_reason":                 currentInputDecision.ReasonCode,
+			"effective_user_input":            "",
+			"injection_text":                  "",
+			"input_context_text":              "",
+			"source_contract":                 prepareSourceContract,
+			"current_input_decision":          currentInputDecision,
+			"message_source_envelope":         currentInputDecision.Envelope,
+			"session_bootstrap":               sessionBootstrap,
+			"risu_host_context_snapshot":      hostContextSnapshot,
+			"host_context_reference_evidence": hostContextReferenceEvidence,
+			"recall_result": map[string]any{
+				"status": "not_applicable", "reason": currentInputDecision.ReasonCode,
+			},
+			"reference_recall": map[string]any{
+				"status": "not_applicable", "reason": currentInputDecision.ReasonCode, "items": []any{},
+			},
+			"reference_injection": map[string]any{
+				"enabled": false, "applied": false, "selected_count": 0, "injected_count": 0,
+			},
+			"trace_preview": map[string]any{
+				"would_call_llm": false, "would_write": false, "store_reads": 0,
+				"source_suppressed": true, "reason": currentInputDecision.ReasonCode,
+			},
+			"backend_timing": timing.snapshot(),
+		})
+		return
+	}
+	if enforceCurrentInputContract {
+		req.RawUserInput = &currentInputDecision.EffectiveUserInput
 	}
 
 	migrationStartedAt := time.Now()
@@ -35,40 +96,60 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	} else if lock != nil {
 		timing.addElapsed("migration_guard", migrationStartedAt)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":                "ok",
-			"source":                "shadow",
-			"chat_session_id":       sid,
-			"generated_at":          time.Now().UTC().Format(time.RFC3339),
-			"request_type":          stringPtrValue(req.RequestType, "model"),
-			"fallback_reason":       "source_session_migrated_away",
-			"effective_user_input":  stringPtrValue(req.RawUserInput, ""),
-			"injection_text":        "",
-			"input_context_text":    "",
-			"migration_source_lock": sessionMigrationLockPayload(lock),
-			"read_excluded":         true,
-			"read_exclusion_reason": "source_session_migrated_away",
-			"target_session_id":     lock.TargetSessionID,
-			"trace_preview":         map[string]any{"would_call_llm": false, "would_write": false, "migration_source_lock": sessionMigrationLockPayload(lock)},
-			"recall_result":         map[string]any{"status": "skipped", "reason": "source_session_migrated_away"},
-			"runtime_toggle":        map[string]any{"source_session_migrated_away": true, "target_session_id": lock.TargetSessionID},
-			"warnings":              []string{"source_session_migrated_away: continue in target_session_id " + lock.TargetSessionID},
-			"backend_timing":        timing.snapshot(),
+			"status":                          "ok",
+			"source":                          "shadow",
+			"chat_session_id":                 sid,
+			"generated_at":                    time.Now().UTC().Format(time.RFC3339),
+			"request_type":                    stringPtrValue(req.RequestType, "model"),
+			"fallback_reason":                 "source_session_migrated_away",
+			"effective_user_input":            stringPtrValue(req.RawUserInput, ""),
+			"injection_text":                  "",
+			"input_context_text":              "",
+			"migration_source_lock":           sessionMigrationLockPayload(lock),
+			"read_excluded":                   true,
+			"read_exclusion_reason":           "source_session_migrated_away",
+			"target_session_id":               lock.TargetSessionID,
+			"trace_preview":                   map[string]any{"would_call_llm": false, "would_write": false, "migration_source_lock": sessionMigrationLockPayload(lock)},
+			"recall_result":                   map[string]any{"status": "skipped", "reason": "source_session_migrated_away"},
+			"runtime_toggle":                  map[string]any{"source_session_migrated_away": true, "target_session_id": lock.TargetSessionID},
+			"warnings":                        []string{"source_session_migrated_away: continue in target_session_id " + lock.TargetSessionID},
+			"backend_timing":                  timing.snapshot(),
+			"source_contract":                 prepareSourceContract,
+			"current_input_decision":          currentInputDecision,
+			"message_source_envelope":         currentInputDecision.Envelope,
+			"session_bootstrap":               sessionBootstrap,
+			"risu_host_context_snapshot":      hostContextSnapshot,
+			"host_context_reference_evidence": hostContextReferenceEvidence,
 		})
 		return
 	}
 	timing.addElapsed("migration_guard", migrationStartedAt)
+	workflowRequestID := prepareTurnWorkflowRequestID(prepareSourceContract, request)
+	if s.TurnWorkflows != nil && workflowRequestID != "" {
+		s.TurnWorkflows.begin(workflowRequestID, sid, intPtrValue(req.TurnIndex, 0))
+		s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePrepareSource, "succeeded", "source_observation_eligible")
+		s.TurnWorkflows.startStage(workflowRequestID, turnWorkflowStageRecall)
+	}
 
 	// Resolve settings from the request/default DTO contract.
 	defaultSettings := dto.PrepareTurnSettings{}
 	defaultSettings.ApplyDefaults()
-	maxInjectionChars := 0
+	manualMaxInjectionChars := 0
 	if req.Settings.MaxInjectionChars != nil {
-		maxInjectionChars = *req.Settings.MaxInjectionChars
+		manualMaxInjectionChars = *req.Settings.MaxInjectionChars
 	} else if defaultSettings.MaxInjectionChars != nil {
-		maxInjectionChars = *defaultSettings.MaxInjectionChars
+		manualMaxInjectionChars = *defaultSettings.MaxInjectionChars
 	}
-	if maxInjectionChars < 0 {
-		maxInjectionChars = 0
+	if manualMaxInjectionChars < 0 {
+		manualMaxInjectionChars = 0
+	}
+	maxInjectionChars, memoryBudgetResolution := resolvePrepareTurnMemoryBudget(manualMaxInjectionChars, req.ClientMeta)
+	narrativeSupportMaxChars := 3000
+	if request.NarrativeSupportMaxChars != nil {
+		narrativeSupportMaxChars = *request.NarrativeSupportMaxChars
+	}
+	if narrativeSupportMaxChars < 0 {
+		narrativeSupportMaxChars = 0
 	}
 	referenceBudgetBasisChars := maxInjectionChars
 	if req.Settings.ReferenceInjectionBudgetBasisChars != nil {
@@ -88,7 +169,8 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			referenceRecallLimit = 0
 		}
 	}
-	supportRecallLimit := prepareTurnSupportRecallLimit(memoryTopK)
+	supportRecallLimit := prepareTurnSupportCandidateLimit(maxInjectionChars)
+	entityRecollectionReadLimit := prepareTurnEntityRecollectionCandidateLimit(supportRecallLimit)
 
 	if req.Settings.InjectionEnabled != nil {
 		injectionEnabled = *req.Settings.InjectionEnabled
@@ -104,6 +186,10 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	turnIndex := intPtrValue(req.TurnIndex, 0)
 	languageContext := completeTurnLanguageContextFromClientMeta(req.ClientMeta)
 	perspectiveContext := prepareTurnPerspectiveContextFromRequest(req)
+	vectorStartedAt := time.Now()
+	vectorShadow := s.prepareTurnVectorShadow(r.Context(), req, memoryTopK)
+	timing.addElapsed("vector_recall", vectorStartedAt)
+	vectorMemoryIDs, vectorEvidenceIDs := prepareTurnVectorHistoryRowIDs(vectorShadow)
 
 	// Read assembly from Store (no writes, no LLM).
 	var memories []store.Memory
@@ -121,34 +207,74 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	var episodeSums []store.EpisodeSummary
 	var personaEntries []store.PersonaMemoryEntry
 	var characterPrivateMemories []store.ProtagonistEntityMemory
+	directEntityOwnerIndexCount := 0
+	directEntityOwnerMatchCount := 0
+	directEntityMemoryReadCount := 0
 	var narrativeCurrentValues []store.StatusCurrentValue
 
 	readErrs := []error{}
 	readsOK := 0
 	sessionStateReads := map[string]bool{}
+	historyFromTurn := 0
+	historyToTurn := 0
+	boundedHistoryRead := false
+	materializationTrace := map[string]any{
+		"contract_version":              "prepare_turn.materialization_trace.v1",
+		"history_window_turns":          prepareTurnHistoryWindowTurns,
+		"bounded_history_store":         false,
+		"vector_memory_include_count":   len(vectorMemoryIDs),
+		"vector_evidence_include_count": len(vectorEvidenceIDs),
+	}
 
 	storeReadsStartedAt := time.Now()
 	if s.Store != nil {
 		ctx := r.Context()
-		if m, err := s.Store.ListMemories(ctx, sid, 0, 0); err == nil {
-			memories = m
-			readsOK++
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		rangeStore, hasRangeStore := s.Store.(store.PrepareTurnRangeStore)
+		if hasRangeStore {
+			if latest, err := rangeStore.LatestSessionTurnIndex(ctx, sid); err == nil {
+				historyFromTurn, historyToTurn = prepareTurnHistoryBounds(latest)
+				boundedHistoryRead = true
+				materializationTrace["bounded_history_store"] = true
+				materializationTrace["history_from_turn"] = historyFromTurn
+				materializationTrace["history_to_turn"] = historyToTurn
+			} else if !errors.Is(err, store.ErrNotEnabled) {
+				readErrs = append(readErrs, err)
+			}
 		}
-		if k, err := s.Store.ListKGTriples(ctx, sid); err == nil {
-			kgTriples = k
-			readsOK++
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		var memoryReadErr error
+		if boundedHistoryRead {
+			memories, memoryReadErr = rangeStore.ListMemoriesRange(ctx, sid, historyFromTurn, historyToTurn, vectorMemoryIDs)
+		} else {
+			memories, memoryReadErr = s.Store.ListMemories(ctx, sid, 0, 0)
 		}
-		if e, err := s.Store.ListEvidence(ctx, sid); err == nil {
-			evidence = e
+		if memoryReadErr == nil {
 			readsOK++
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		} else if !errors.Is(memoryReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, memoryReadErr)
 		}
-		if c, err := s.Store.ListChatLogs(ctx, sid, 0, 0); err == nil {
+		var kgReadErr error
+		if boundedHistoryRead {
+			kgTriples, kgReadErr = rangeStore.ListKGTriplesRange(ctx, sid, historyFromTurn, historyToTurn)
+		} else {
+			kgTriples, kgReadErr = s.Store.ListKGTriples(ctx, sid)
+		}
+		if kgReadErr == nil {
+			readsOK++
+		} else if !errors.Is(kgReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, kgReadErr)
+		}
+		var evidenceReadErr error
+		if boundedHistoryRead {
+			evidence, evidenceReadErr = rangeStore.ListEvidenceRange(ctx, sid, historyFromTurn, historyToTurn, vectorEvidenceIDs)
+		} else {
+			evidence, evidenceReadErr = s.Store.ListEvidence(ctx, sid)
+		}
+		if evidenceReadErr == nil {
+			readsOK++
+		} else if !errors.Is(evidenceReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, evidenceReadErr)
+		}
+		if c, err := s.Store.ListChatLogs(ctx, sid, historyFromTurn, historyToTurn); err == nil {
 			chatLogs = c
 			readsOK++
 			sessionStateReads["chat_logs"] = true
@@ -174,18 +300,25 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		} else if !errors.Is(err, store.ErrNotEnabled) {
 			readErrs = append(readErrs, err)
 		}
-		if cs, err := s.Store.ListCharacterStates(ctx, sid); err == nil {
-			charStates = cs
+		var characterStateReadErr error
+		if boundedHistoryRead {
+			charStates, characterStateReadErr = rangeStore.ListCharacterStatesCurrent(ctx, sid)
+		} else {
+			charStates, characterStateReadErr = s.Store.ListCharacterStates(ctx, sid)
+		}
+		if characterStateReadErr == nil {
 			readsOK++
 			sessionStateReads["character_states"] = true
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		} else if !errors.Is(characterStateReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, characterStateReadErr)
 		}
-		if ce, err := s.Store.ListCharacterEvents(ctx, sid, ""); err == nil {
-			charEvents = ce
-			sessionStateReads["character_events"] = true
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		if responseProjection != prepareTurnProductionProjectionV1 {
+			if ce, err := s.Store.ListCharacterEvents(ctx, sid, ""); err == nil {
+				charEvents = ce
+				sessionStateReads["character_events"] = true
+			} else if !errors.Is(err, store.ErrNotEnabled) {
+				readErrs = append(readErrs, err)
+			}
 		}
 		if pt, err := s.Store.ListPendingThreads(ctx, sid, ""); err == nil {
 			pendingThreads = pt
@@ -194,18 +327,28 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		} else if !errors.Is(err, store.ErrNotEnabled) {
 			readErrs = append(readErrs, err)
 		}
-		if as, err := s.Store.ListActiveStates(ctx, sid, ""); err == nil {
-			activeStates = as
+		var activeStateReadErr error
+		if boundedHistoryRead {
+			activeStates, activeStateReadErr = rangeStore.ListActiveStatesRange(ctx, sid, historyFromTurn, historyToTurn)
+		} else {
+			activeStates, activeStateReadErr = s.Store.ListActiveStates(ctx, sid, "")
+		}
+		if activeStateReadErr == nil {
 			readsOK++
 			sessionStateReads["active_states"] = true
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		} else if !errors.Is(activeStateReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, activeStateReadErr)
 		}
-		if cl, err := s.Store.ListCanonicalStateLayers(ctx, sid, ""); err == nil {
-			canonicalLayers = cl
+		var canonicalStateReadErr error
+		if boundedHistoryRead {
+			canonicalLayers, canonicalStateReadErr = rangeStore.ListCanonicalStateLayersRange(ctx, sid, historyFromTurn, historyToTurn)
+		} else {
+			canonicalLayers, canonicalStateReadErr = s.Store.ListCanonicalStateLayers(ctx, sid, "")
+		}
+		if canonicalStateReadErr == nil {
 			readsOK++
-		} else if !errors.Is(err, store.ErrNotEnabled) {
-			readErrs = append(readErrs, err)
+		} else if !errors.Is(canonicalStateReadErr, store.ErrNotEnabled) {
+			readErrs = append(readErrs, canonicalStateReadErr)
 		}
 		if es, err := s.Store.ListEpisodeSummaries(ctx, sid, supportRecallLimit, 0, 0); err == nil {
 			episodeSums = es
@@ -214,7 +357,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			readErrs = append(readErrs, err)
 		}
 		if personaStore, ok := s.Store.(store.PersonaCapsuleStore); ok {
-			if entries, err := personaStore.ListAttachedPersonaMemoryEntries(ctx, sid, supportRecallLimit); err == nil {
+			if entries, err := personaStore.ListAttachedPersonaMemoryEntries(ctx, sid, entityRecollectionReadLimit); err == nil {
 				for _, entry := range entries {
 					if personaMemoryEntryIsCharacterPrivate(entry) {
 						characterPrivateMemories = append(characterPrivateMemories, personaMemoryEntryAsCharacterPrivateMemory(entry, sid))
@@ -228,14 +371,37 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if entityStore, ok := s.Store.(store.ProtagonistEntityMemoryStore); ok {
-			memories, err := entityStore.ListProtagonistEntityMemories(ctx, store.ProtagonistEntityMemoryFilter{
+			memoryFilter := store.ProtagonistEntityMemoryFilter{
 				OwnerEntityRole:     "npc",
 				OwnerVisibility:     "owner_private",
 				SourceChatSessionID: sid,
-				Limit:               supportRecallLimit,
-			})
+				Limit:               entityRecollectionReadLimit,
+			}
+			if ownerStore, ownerOK := s.Store.(store.ProtagonistEntityMemoryOwnerIndexStore); ownerOK {
+				owners, ownerErr := ownerStore.ListProtagonistEntityMemoryOwners(ctx, store.ProtagonistEntityMemoryFilter{
+					OwnerEntityRole:     "npc",
+					OwnerVisibility:     "owner_private",
+					SourceChatSessionID: sid,
+				})
+				if ownerErr == nil {
+					directEntityOwnerIndexCount = len(owners)
+					directOwners := prepareTurnDirectEntityMemoryOwners(rawUserInput, owners)
+					directEntityOwnerMatchCount = len(directOwners)
+					for _, owner := range directOwners {
+						if key := strings.TrimSpace(owner.OwnerEntityKey); key != "" {
+							memoryFilter.OwnerEntityKeys = append(memoryFilter.OwnerEntityKeys, key)
+						}
+					}
+				} else if !errors.Is(ownerErr, store.ErrNotEnabled) {
+					readErrs = append(readErrs, ownerErr)
+				}
+			}
+			memories, err := entityStore.ListProtagonistEntityMemories(ctx, memoryFilter)
 			if err == nil {
 				characterPrivateMemories = append(characterPrivateMemories, memories...)
+				if len(memoryFilter.OwnerEntityKeys) > 0 {
+					directEntityMemoryReadCount = len(memories)
+				}
 				if len(memories) > 0 {
 					readsOK++
 				}
@@ -252,10 +418,42 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	storylines, pendingThreads, activeStates, canonicalLayers, supersededOpenGoalTrace := filterPrepareTurnSupersededOpenGoals(
+		narrativeCurrentValues,
+		storylines,
+		pendingThreads,
+		activeStates,
+		canonicalLayers,
+	)
+	materializationTrace["superseded_open_goals"] = supersededOpenGoalTrace
+	materializationTrace["memory_rows"] = len(memories)
+	materializationTrace["kg_rows"] = len(kgTriples)
+	materializationTrace["evidence_rows"] = len(evidence)
+	materializationTrace["chat_log_rows"] = len(chatLogs)
+	materializationTrace["character_state_rows"] = len(charStates)
+	materializationTrace["active_state_rows"] = len(activeStates)
+	materializationTrace["canonical_state_rows"] = len(canonicalLayers)
+	materializationTrace["character_event_rows"] = len(charEvents)
+	materializationTrace["total_history_rows"] = len(memories) + len(kgTriples) + len(evidence) + len(chatLogs)
+	materializationTrace["total_materialized_rows"] = len(memories) + len(kgTriples) + len(evidence) + len(chatLogs) + len(charStates) + len(activeStates) + len(canonicalLayers) + len(charEvents)
 	timing.addElapsed("store_reads", storeReadsStartedAt)
+	if s.TurnWorkflows != nil && workflowRequestID != "" {
+		s.TurnWorkflows.setLogicalTurn(workflowRequestID, resolvePrepareTurnWorkflowLogicalTurn(request, currentInputDecision, chatLogs))
+		s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStageRecall, "succeeded", "")
+		s.TurnWorkflows.startStage(workflowRequestID, turnWorkflowStageContext)
+	}
 
 	recollectionStartedAt := time.Now()
-	recollectionRelevance := filterPrepareTurnEntityRecollections(rawUserInput, chatLogs, activeStates, canonicalLayers, personaEntries, &characterPrivateMemories)
+	var personaRoleTrace map[string]any
+	characterPrivateMemories, personaRoleTrace = excludeRisuPersonaFromStoredNPCMemories(characterPrivateMemories, req.ClientMeta)
+	recollectionRelevance := filterPrepareTurnEntityRecollections(rawUserInput, memories, activeStates, canonicalLayers, pendingThreads, personaEntries, &characterPrivateMemories, chatLogs)
+	recollectionRelevance["risu_persona_role_resolution"] = personaRoleTrace
+	recollectionRelevance["candidate_read_limit"] = entityRecollectionReadLimit
+	recollectionRelevance["relevance_before_delivery_cap"] = true
+	recollectionRelevance["owner_index_count"] = directEntityOwnerIndexCount
+	recollectionRelevance["direct_owner_match_count"] = directEntityOwnerMatchCount
+	recollectionRelevance["direct_owner_memory_read_count"] = directEntityMemoryReadCount
+	recollectionRelevance["direct_owner_batch_query"] = directEntityOwnerMatchCount > 0
 	timing.addElapsed("recollection_filter", recollectionStartedAt)
 
 	degraded := readsOK == 0
@@ -279,19 +477,23 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	if profile == "" {
 		profile = "default"
 	}
+	guideStrength := normalizeNarrativeGuideStrength(stringPtrValue(req.Settings.GuideStrength, "weak"))
+	guideMode := resolveNarrativeGuideMode(stringPtrValue(req.Settings.GuideMode, "off"), nil, "", rawUserInput)
+	guideDisabled := guideStrength == "none"
+	if guideDisabled {
+		guideMode = "off"
+	}
 	injectionAssembly := prepareTurnInjectionAssembly{}
 	documents := []map[string]any{}
-	vectorStartedAt := time.Now()
-	vectorShadow := s.prepareTurnVectorShadow(r.Context(), req, memoryTopK)
-	timing.addElapsed("vector_recall", vectorStartedAt)
 	injectionStartedAt := time.Now()
 	if !degraded {
 		documents = buildUnifiedRetrievalDocuments(sid, memories, evidence, kgTriples, episodeSums, resumePack, chatLogs)
 		if injectionEnabled {
 			assemblyPerspectiveContext := prepareTurnPerspectiveWithNarrativeState(perspectiveContext, narrativeCurrentValues, activeStates)
-			injectionAssembly = buildPrepareTurnInjectionAssembly(memories, kgTriples, evidence, chatLogs, selectedStorylines, worldRules, charStates, pendingThreads, canonicalLayers, episodeSums, resumePack, personaEntries, characterPrivateMemories, memoryTopK, maxInjectionChars, rawUserInput, profile, documents, vectorShadow, languageContext, assemblyPerspectiveContext)
+			injectionAssembly = buildPrepareTurnInjectionAssemblyWithBudget(memories, kgTriples, evidence, chatLogs, selectedStorylines, worldRules, charStates, pendingThreads, canonicalLayers, episodeSums, resumePack, personaEntries, characterPrivateMemories, memoryTopK, maxInjectionChars, rawUserInput, profile, documents, vectorShadow, languageContext, stringPtrValue(req.Settings.MemoryDeliveryBudgetMode, "auto"), req.Settings.MemoryDeliveryBudgets, assemblyPerspectiveContext)
 		}
 	}
+	memoryDeliveryText := extractionStringFromAny(injectionAssembly.MemoryDeliveryPlan["final_text"])
 	timing.addElapsed("injection_assembly", injectionStartedAt)
 	referenceRecallStartedAt := time.Now()
 	referenceSceneContext := buildReferenceCoverageSceneContext(chatLogs, activeStates, canonicalLayers, worldRules, supportRecallLimit)
@@ -334,19 +536,27 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	referenceBudgetPolicy.RemainingChars = referenceBudgetPolicy.TotalCapChars - referenceBudgetPolicy.UsedChars
 	referenceBudgetPolicy.Truncated = primaryCanonBase.Truncated || (referenceInjectionEnabled && referenceInjectedCount < len(referenceRecall.InjectionItems))
 	referenceText := strings.Join(nonEmptyStrings([]string{primaryCanonBase.Text, referenceInjectionText}), "\n\n")
-	injectionText := strings.Join(nonEmptyStrings([]string{referenceText, injectionAssembly.Text}), "\n\n")
+	injectionText := strings.Join(nonEmptyStrings([]string{referenceText, memoryDeliveryText}), "\n\n")
 	injectionTruncated := injectionAssembly.Truncated
 
 	var inputContextText string
 	var inputContextTruncated bool
+	inputContextSource := "disabled"
 	if inputContextEnabled && !degraded {
-		inputContextText, inputContextTruncated = buildInputContextText(evidence, chatLogs, resumePack, activeStates, canonicalLayers, episodeSums, personaEntries, characterPrivateMemories, maxInputContextChars, supportRecallLimit)
+		inputContextLogs, source := prepareTurnInputContextChatLogs(request, currentInputDecision, chatLogs)
+		inputContextSource = source
+		inputContextText, inputContextTruncated = buildInputContextText(inputContextLogs, maxInputContextChars)
 	}
+	if injectionAssembly.Counts == nil {
+		injectionAssembly.Counts = map[string]any{}
+	}
+	injectionAssembly.Counts["input_context_source"] = inputContextSource
+	injectionAssembly.Counts["input_context_previous_completed_turn_only"] = true
+	injectionAssembly.Counts["input_context_active_state_delivery"] = "excluded_use_dedicated_delivery_classes"
 	responseAssemblyStartedAt := time.Now()
 	currentStoryClock19 := resolveCurrentStoryClock(activeStates, chatLogs, canonicalLayers)
 	temporalRelationLedger19 := buildTemporalRelationLedger(activeStates)
 	temporalSupportPacket := buildTemporalSupportPacket(currentStoryClock19, temporalRelationLedger19)
-	guideMode := resolveNarrativeGuideMode(stringPtrValue(req.Settings.GuideMode, "off"), nil, "", rawUserInput)
 	narrativeStance := stringPtrValue(req.Settings.NarrativeStance, "balanced")
 	continuityTriggerMode := stringPtrValue(req.ContinuityTriggerMode, "none")
 	continuityQuery := stringPtrValue(req.ContinuityQuery, "")
@@ -357,8 +567,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	evidenceCounts["storyline_selected_count"] = len(storylineSelection.Selected)
 	evidenceCounts["storyline_dropped_count"] = len(storylineSelection.Dropped)
 	evidenceCounts["storyline_stale_dropped_count"] = storylineSelectionSummary(storylineSelection)["stale_dropped_count"]
-	sectionSummary := prepareTurnSectionSummary(injectionAssembly.Text, inputContextText, injectionTruncated, inputContextTruncated)
-	guideStrength := normalizeNarrativeGuideStrength(stringPtrValue(req.Settings.GuideStrength, "weak"))
+	sectionSummary := prepareTurnSectionSummary(memoryDeliveryText, inputContextText, injectionTruncated, inputContextTruncated)
 	supervisorInputPack := buildSupervisorInputPack(
 		sid,
 		turnIndex,
@@ -387,23 +596,26 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 
 	queryPreview := rawUserInput
 
-	recallResult := buildRecallResult(
-		sid,
-		queryPreview,
-		degraded,
-		memories,
-		evidence,
-		kgTriples,
-		episodeSums,
-		chatLogs,
-		resumePack,
-		vectorShadow,
-		storylines,
-		worldRules,
-		pendingThreads,
-		profile,
-		memoryTopK,
-	)
+	recallResult := map[string]any{}
+	if responseProjection != prepareTurnProductionProjectionV1 {
+		recallResult = buildRecallResult(
+			sid,
+			queryPreview,
+			degraded,
+			memories,
+			evidence,
+			kgTriples,
+			episodeSums,
+			chatLogs,
+			resumePack,
+			vectorShadow,
+			storylines,
+			worldRules,
+			pendingThreads,
+			profile,
+			memoryTopK,
+		)
+	}
 
 	packetMode := "store_backed_shadow"
 	if degraded {
@@ -419,102 +631,243 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		inputContextOut = inputContextText
 	}
 
-	sessionState := buildSessionState(sid, degraded, activeStates, storylines, charStates, charEvents, chatLogs, worldRules, pendingThreads, sessionStateReads)
-	narrativeControl := buildNarrativeControl(degraded, storylines, worldRules, pendingThreads, charStates)
-	continuityPack := buildContinuityPack(sid, queryPreview, degraded, resumePack, episodeSums, chatLogs, activeStates, canonicalLayers, supportRecallLimit)
+	sessionState := map[string]any{}
+	narrativeControl := map[string]any{}
+	continuityPack := map[string]any{}
 	progressionLedger := buildProgressionLedger(sid, degraded, storylines, worldRules, pendingThreads, episodeSums, supportRecallLimit)
-	personaRecollection := buildPersonaRecollectionSurface(sid, personaEntries, injectionAssembly.PersonaText, supportRecallLimit)
-	characterPrivateRecollection := buildCharacterPrivateRecollectionSurface(sid, characterPrivateMemories, injectionAssembly.CharacterPrivateText, supportRecallLimit)
+	personaRecollection := map[string]any{}
+	characterPrivateRecollection := map[string]any{}
+	if responseProjection != prepareTurnProductionProjectionV1 {
+		sessionState = buildSessionState(sid, degraded, activeStates, storylines, charStates, charEvents, chatLogs, worldRules, pendingThreads, sessionStateReads)
+		narrativeControl = buildNarrativeControl(degraded, storylines, worldRules, pendingThreads, charStates)
+		continuityPack = buildContinuityPack(sid, queryPreview, degraded, resumePack, episodeSums, chatLogs, activeStates, canonicalLayers, supportRecallLimit)
+		personaRecollection = buildPersonaRecollectionSurface(sid, personaEntries, injectionAssembly.PersonaText, supportRecallLimit)
+		characterPrivateRecollection = buildCharacterPrivateRecollectionSurface(sid, characterPrivateMemories, injectionAssembly.CharacterPrivateText, supportRecallLimit)
+	}
 
-	// SEQ-16-P164/P165/P167/P168 contract surfaces.
-	retrievalRoleBoundary := buildRetrievalRoleBoundary(sid, storylines, worldRules, charStates, activeStates, pendingThreads, chatLogs)
-	retrievalIndexIR := buildRetrievalIndexIRSupportOnly(recallResult, memories, evidence, kgTriples, chatLogs, resumePack)
-	retrievalExtendAuthority := buildRetrievalExtendAuthority(retrievalRoleBoundary)
-	temporalReadValidityFirst := buildTemporalReadValidityFirst(chatLogs, episodeSums, len(chatLogs))
-
-	// SEQ-16-P172~P175 contract surfaces.
-	sessionMemoryBoundary := buildSessionMemoryBoundary(sid, activeStates, pendingThreads, chatLogs, storylines, worldRules, charStates)
-	bridgePromotionEntry := buildBridgePromotionEntry(sid, pendingThreads, canonicalLayers)
-	sessionFirstPermanentFallbackReadRule := buildSessionFirstPermanentFallbackReadRule(sid, sessionMemoryBoundary, retrievalRoleBoundary)
-	promotionWaitVisibility := buildPromotionWaitVisibility(sid, pendingThreads, canonicalLayers, chatLogs)
-
-	// SEQ-16-P179~P182 contract surfaces (IR normalized retrieval unit schema).
-	retrievalUnitsIR := buildRetrievalUnitsIR(sid, memories, evidence, kgTriples, chatLogs, resumePack)
-	directEvidenceDualRepresentation := buildDirectEvidenceDualRepresentation(evidence)
-	sourceTaggedRetrievalUnitSurface := buildSourceTaggedRetrievalUnitSurface(memories, evidence, kgTriples, chatLogs, resumePack)
-	rawTurnSpanMetadata := buildRawTurnSpanMetadata(chatLogs, episodeSums, memories, evidence, resumePack)
-
-	// SEQ-16-P186~P189 contract surfaces (MS Multi-Signal Retrieval Contract).
-	signalMixContract := buildSignalMixContract(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
-	queryClassRouting := buildQueryClassRouting(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
-	retrievalResultInspection := buildRetrievalResultInspection(sid, memories, evidence, kgTriples, chatLogs, episodeSums, supportRecallLimit)
-	sparseTailRecall := buildSparseTailRecall(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
-
-	// SEQ-16-P193~P196 contract surfaces (TM Temporal Read Surface).
-	validityWindowReading := buildValidityWindowReading(sid, chatLogs, episodeSums, evidence, memories)
-	truthCoexistenceRules := buildTruthCoexistenceRules(sid, evidence, memories, chatLogs)
-	temporalDisambiguationContract := buildTemporalDisambiguationContract(sid, chatLogs, episodeSums, evidence, memories)
-	promotionLagInvisibilitySplit := buildPromotionLagInvisibilitySplit(sid, pendingThreads, canonicalLayers, chatLogs, evidence)
-
-	// SEQ-16-P200~P205 contract surfaces (VX verify + replay).
-	sessionPermanentAuthorityReplay := buildSessionPermanentAuthorityReplay(sid, retrievalRoleBoundary)
-	normalizedUnitSupportOnlyReplay := buildNormalizedUnitSupportOnlyReplay(sid, retrievalUnitsIR)
-	multiSignalRetrievalInspectionReplay := buildMultiSignalRetrievalInspectionReplay(sid, signalMixContract, retrievalResultInspection)
-	validityWindowTemporalReplay := buildValidityWindowTemporalReplay(sid, temporalReadValidityFirst, validityWindowReading)
-	sourceTaggedAuthorityAwareAssemblyReplay := buildSourceTaggedAuthorityAwareAssemblyReplay(sid, sourceTaggedRetrievalUnitSurface, retrievalRoleBoundary)
-	criticTruncationSpilloverReplay := buildCriticTruncationSpilloverReplay(sid, rawTurnSpanMetadata, sparseTailRecall, retrievalUnitsIR)
-
-	// SEQ-16-P209~P212 contract surfaces (backend test remigration evidence).
-	indexSnapshot := retrievalIndexSnapshotFromDocuments(sid, documents)
-	sessionPartitionedIndex := buildSessionPartitionedIndex(sid, documents, indexSnapshot)
-	indexLifecycle := buildIndexLifecycle(sid, vectorShadow)
-	sourceLookupAudit := buildSourceLookupAudit(sid, evidence, memories, kgTriples, chatLogs)
-	runtimeToggle := buildRuntimeToggle(sid, degraded, injectionEnabled, inputContextEnabled, maxInjectionChars, maxInputContextChars)
+	// Historical migration/debug surfaces are excluded from the production
+	// compact projection. They remain available to explicit legacy callers.
+	var retrievalRoleBoundary, retrievalIndexIR, retrievalExtendAuthority, temporalReadValidityFirst map[string]any
+	var sessionMemoryBoundary, bridgePromotionEntry, sessionFirstPermanentFallbackReadRule, promotionWaitVisibility map[string]any
+	var retrievalUnitsIR, directEvidenceDualRepresentation, sourceTaggedRetrievalUnitSurface, rawTurnSpanMetadata map[string]any
+	var signalMixContract, queryClassRouting, retrievalResultInspection, sparseTailRecall map[string]any
+	var validityWindowReading, truthCoexistenceRules, temporalDisambiguationContract, promotionLagInvisibilitySplit map[string]any
+	var sessionPermanentAuthorityReplay, normalizedUnitSupportOnlyReplay, multiSignalRetrievalInspectionReplay map[string]any
+	var validityWindowTemporalReplay, sourceTaggedAuthorityAwareAssemblyReplay, criticTruncationSpilloverReplay map[string]any
+	var indexSnapshot, sessionPartitionedIndex, indexLifecycle, sourceLookupAudit, runtimeToggle map[string]any
+	if responseProjection != prepareTurnProductionProjectionV1 {
+		retrievalRoleBoundary = buildRetrievalRoleBoundary(sid, storylines, worldRules, charStates, activeStates, pendingThreads, chatLogs)
+		retrievalIndexIR = buildRetrievalIndexIRSupportOnly(recallResult, memories, evidence, kgTriples, chatLogs, resumePack)
+		retrievalExtendAuthority = buildRetrievalExtendAuthority(retrievalRoleBoundary)
+		temporalReadValidityFirst = buildTemporalReadValidityFirst(chatLogs, episodeSums, len(chatLogs))
+		sessionMemoryBoundary = buildSessionMemoryBoundary(sid, activeStates, pendingThreads, chatLogs, storylines, worldRules, charStates)
+		bridgePromotionEntry = buildBridgePromotionEntry(sid, pendingThreads, canonicalLayers)
+		sessionFirstPermanentFallbackReadRule = buildSessionFirstPermanentFallbackReadRule(sid, sessionMemoryBoundary, retrievalRoleBoundary)
+		promotionWaitVisibility = buildPromotionWaitVisibility(sid, pendingThreads, canonicalLayers, chatLogs)
+		retrievalUnitsIR = buildRetrievalUnitsIR(sid, memories, evidence, kgTriples, chatLogs, resumePack)
+		directEvidenceDualRepresentation = buildDirectEvidenceDualRepresentation(evidence)
+		sourceTaggedRetrievalUnitSurface = buildSourceTaggedRetrievalUnitSurface(memories, evidence, kgTriples, chatLogs, resumePack)
+		rawTurnSpanMetadata = buildRawTurnSpanMetadata(chatLogs, episodeSums, memories, evidence, resumePack)
+		signalMixContract = buildSignalMixContract(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
+		queryClassRouting = buildQueryClassRouting(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
+		retrievalResultInspection = buildRetrievalResultInspection(sid, memories, evidence, kgTriples, chatLogs, episodeSums, supportRecallLimit)
+		sparseTailRecall = buildSparseTailRecall(sid, memories, evidence, kgTriples, chatLogs, episodeSums)
+		validityWindowReading = buildValidityWindowReading(sid, chatLogs, episodeSums, evidence, memories)
+		truthCoexistenceRules = buildTruthCoexistenceRules(sid, evidence, memories, chatLogs)
+		temporalDisambiguationContract = buildTemporalDisambiguationContract(sid, chatLogs, episodeSums, evidence, memories)
+		promotionLagInvisibilitySplit = buildPromotionLagInvisibilitySplit(sid, pendingThreads, canonicalLayers, chatLogs, evidence)
+		sessionPermanentAuthorityReplay = buildSessionPermanentAuthorityReplay(sid, retrievalRoleBoundary)
+		normalizedUnitSupportOnlyReplay = buildNormalizedUnitSupportOnlyReplay(sid, retrievalUnitsIR)
+		multiSignalRetrievalInspectionReplay = buildMultiSignalRetrievalInspectionReplay(sid, signalMixContract, retrievalResultInspection)
+		validityWindowTemporalReplay = buildValidityWindowTemporalReplay(sid, temporalReadValidityFirst, validityWindowReading)
+		sourceTaggedAuthorityAwareAssemblyReplay = buildSourceTaggedAuthorityAwareAssemblyReplay(sid, sourceTaggedRetrievalUnitSurface, retrievalRoleBoundary)
+		criticTruncationSpilloverReplay = buildCriticTruncationSpilloverReplay(sid, rawTurnSpanMetadata, sparseTailRecall, retrievalUnitsIR)
+		indexSnapshot = retrievalIndexSnapshotFromDocuments(sid, documents)
+		sessionPartitionedIndex = buildSessionPartitionedIndex(sid, documents, indexSnapshot)
+		indexLifecycle = buildIndexLifecycle(sid, vectorShadow)
+		sourceLookupAudit = buildSourceLookupAudit(sid, evidence, memories, kgTriples, chatLogs)
+		runtimeToggle = buildRuntimeToggle(sid, degraded, injectionEnabled, inputContextEnabled, maxInjectionChars, maxInputContextChars)
+	}
 	inputAnchorGovernor := buildInputAnchorGovernor(rawUserInput, inputContextText, inputContextTruncated, maxInputContextChars, chatLogs, resumePack, activeStates, canonicalLayers, episodeSums, pendingThreads, storylines)
-	weakInputPlanner := buildWeakInputPlannerContract(rawUserInput, inputAnchorGovernor, languageContext, maxInputContextChars)
-	plannerExecutionContract := buildPlannerExecutionContract(rawUserInput, narrativeStance, guideMode, guideStrength, inputAnchorGovernor, weakInputPlanner, selectedStorylines, pendingThreads, activeStates, canonicalLayers, worldRules, injectionAssembly, languageContext)
-	progressionChoiceLedger := buildProgressionChoiceLedger(sid, turnIndex, rawUserInput, chatLogs, selectedStorylines, pendingThreads, episodeSums, inputAnchorGovernor, weakInputPlanner, plannerExecutionContract, progressionLedger)
-	progressionLedger["progression_choice"] = progressionChoiceLedger
-	step25ValidationGate := buildStep25ValidationGate(rawUserInput, weakInputPlanner, plannerExecutionContract, progressionChoiceLedger)
-	supervisorInputPack["step25_validation_gate"] = step25ValidationGate
-	if guidance := formatWeakInputPlannerGuidance(weakInputPlanner); guidance != "" {
-		supervisorInputPack["weak_input_planner"] = weakInputPlanner
-		if existing, _ := supervisorInputPack["persistent_guidance"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["persistent_guidance"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["persistent_guidance"] = guidance
-		}
-		if existing, _ := supervisorInputPack["final_guidance_suffix"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["final_guidance_suffix"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["final_guidance_suffix"] = guidance
-		}
-	}
-	if guidance := formatPlannerExecutionContractGuidance(plannerExecutionContract); guidance != "" {
-		supervisorInputPack["planner_execution_contract"] = plannerExecutionContract
-		if existing, _ := supervisorInputPack["persistent_guidance"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["persistent_guidance"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["persistent_guidance"] = guidance
-		}
-		if existing, _ := supervisorInputPack["final_guidance_suffix"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["final_guidance_suffix"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["final_guidance_suffix"] = guidance
+	boundedMemoryDeliveryLineage := boundedPrepareTurnMemoryDeliveryLineage(sid, injectionAssembly.MemoryDeliveryLineage, chatLogs)
+	responseExecutionContract := buildResponseExecutionContractWithMemoryLineage(sid, inputAnchorGovernor, selectedStorylines, pendingThreads, activeStates, canonicalLayers, worldRules, injectionAssembly, languageContext, currentInputDecision, hostContextReferenceEvidence)
+	guideEligibility := buildPrepareTurnGuideEligibility(guideMode, guideStrength, injectionEnabled, narrativeSupportMaxChars, responseExecutionContract)
+	responseExecutionContract["guide_eligibility"] = guideEligibility
+	supervisorInputPack["guide_eligibility"] = guideEligibility
+	guideEligible := extractionStringFromAny(guideEligibility["status"]) == "eligible"
+	supervisorInputPack["response_execution_contract"] = responseExecutionContract
+	guidanceItems := []prepareTurnGuidanceItem{}
+	if guideEligible {
+		if guidance := formatResponseExecutionFidelityGuidance(responseExecutionContract); guidance != "" {
+			guidanceItems = append(guidanceItems, prepareTurnGuidanceItem{
+				Key:        "fidelity_preservation",
+				Title:      "Source-backed Fidelity Preservation",
+				Text:       guidance,
+				SourceRefs: responseExecutionRuleSourceRefs(responseExecutionContract, "must_preserve", "must_not_assert"),
+			})
 		}
 	}
-	if guidance := formatProgressionChoiceGuidance(progressionChoiceLedger); guidance != "" {
-		supervisorInputPack["progression_choice_ledger"] = progressionChoiceLedger
-		if existing, _ := supervisorInputPack["persistent_guidance"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["persistent_guidance"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["persistent_guidance"] = guidance
+	supervisorCallStatus := "disabled"
+	var supervisorResult map[string]any
+	supervisorEnabled := req.Settings.SupervisorEnabled == nil || *req.Settings.SupervisorEnabled
+	guideDeliveryReady := guideEligible &&
+		len(guidanceItems) > 0 &&
+		len([]rune(strings.TrimSpace(guidanceItems[0].Text))) <= narrativeSupportMaxChars
+	executionContractReady := extractionStringFromAny(responseExecutionContract["contract_version"]) == "response_execution_contract.v1" &&
+		extractionStringFromAny(responseExecutionContract["status"]) == "ready" &&
+		boolFromAny(responseExecutionContract["active"]) &&
+		guideEligible
+	if s.TurnWorkflows != nil && workflowRequestID != "" {
+		s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStageContext, "succeeded", "")
+	}
+	switch {
+	case guideDisabled || guideMode == "off" || !supervisorEnabled:
+		supervisorCallStatus = "disabled"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
 		}
-		if existing, _ := supervisorInputPack["final_guidance_suffix"].(string); strings.TrimSpace(existing) != "" {
-			supervisorInputPack["final_guidance_suffix"] = existing + "\n" + guidance
-		} else {
-			supervisorInputPack["final_guidance_suffix"] = guidance
+	case extractionStringFromAny(guideEligibility["status"]) == "injection_disabled":
+		supervisorCallStatus = "deferred_injection_disabled"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
 		}
+	case extractionStringFromAny(guideEligibility["status"]) == "budget_disabled":
+		supervisorCallStatus = "deferred_budget_disabled"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
+		}
+	case !guideEligible:
+		supervisorCallStatus = "deferred_no_guide_support"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
+		}
+	case !guideDeliveryReady:
+		supervisorCallStatus = "deferred_insufficient_narrative_budget"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
+		}
+	case !executionContractReady:
+		supervisorCallStatus = "deferred_no_execution_evidence"
+		if s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
+		}
+	default:
+		llmCfg := s.supervisorLLMConfig()
+		if !llmCfg.hasConfig() {
+			supervisorCallStatus = "not_configured"
+			if s.TurnWorkflows != nil && workflowRequestID != "" {
+				s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "skipped", supervisorCallStatus)
+				s.TurnWorkflows.addWarning(workflowRequestID, "PUBLISHER_LLM_NOT_CONFIGURED", "turn_hud.warning.publisher_llm_not_configured", turnWorkflowStagePublisherLLM)
+			}
+		} else {
+			if s.TurnWorkflows != nil && workflowRequestID != "" {
+				s.TurnWorkflows.startStage(workflowRequestID, turnWorkflowStagePublisherLLM)
+			}
+			supervisorStartedAt := time.Now()
+			sidValue := sid
+			guideModeValue := guideMode
+			narrativeStanceValue := narrativeStance
+			continuityTriggerValue := continuityTriggerMode
+			wakeUpContextValue := continuityQuery
+			persistentGuidanceValue := extractionStringFromAny(supervisorInputPack["persistent_guidance"])
+			supervisorReq := dto.SupervisorRequest{
+				ChatSessionID:      &sidValue,
+				ContextMessages:    req.Messages,
+				GuideMode:          &guideModeValue,
+				NarrativeStance:    &narrativeStanceValue,
+				AutoAdvanceTrigger: &continuityTriggerValue,
+				WakeUpContext:      &wakeUpContextValue,
+				PersistentGuidance: &persistentGuidanceValue,
+			}
+			result, llmTrace, err := s.runSupervisorLLM(r.Context(), sid, supervisorInputPack, supervisorReq, llmCfg)
+			timing.addElapsed("supervisor_llm", supervisorStartedAt)
+			supervisorInputPack["llm_trace"] = llmTrace
+			if err != nil {
+				supervisorCallStatus = "failed_open"
+				supervisorInputPack["llm_error"] = scrubProxySecret(err.Error(), llmCfg.APIKey)
+				if s.TurnWorkflows != nil && workflowRequestID != "" {
+					s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "failed", "publisher_llm_failed_open")
+					s.TurnWorkflows.addWarning(workflowRequestID, "PUBLISHER_LLM_FAILED_OPEN", "turn_hud.warning.publisher_llm_failed_open", turnWorkflowStagePublisherLLM)
+				}
+			} else {
+				supervisorCallStatus = "applied"
+				supervisorResult = result
+				if s.TurnWorkflows != nil && workflowRequestID != "" {
+					s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "succeeded", "")
+				}
+				if proposalText, proposalRefs := formatSupervisorSceneProposalGuidance(result); proposalText != "" {
+					guidanceItems = append(guidanceItems, prepareTurnGuidanceItem{
+						Key:        "supervisor_scene_proposal",
+						Title:      "Supervisor Proposal",
+						Text:       proposalText,
+						SourceRefs: proposalRefs,
+					})
+				}
+			}
+		}
+	}
+	if s.TurnWorkflows != nil && workflowRequestID != "" {
+		s.TurnWorkflows.startStage(workflowRequestID, turnWorkflowStagePayload)
+	}
+	if supervisorCallStatus == "failed_open" {
+		guidanceItems = append(guidanceItems, prepareTurnGuidanceItem{
+			Key:        "supervisor_scene_proposal",
+			Title:      "Supervisor Proposal",
+			Status:     "failed",
+			ReasonCode: "supervisor_llm_failed_open",
+		})
+	}
+	effectiveNarrativeSupportMaxChars := 0
+	if guideEligible {
+		effectiveNarrativeSupportMaxChars = narrativeSupportMaxChars
+	}
+	payloadApplicationPlan := buildPrepareTurnPayloadApplicationPlan(
+		rawUserInput,
+		referenceText,
+		memoryDeliveryText,
+		inputContextText,
+		injectionEnabled,
+		inputContextEnabled,
+		maxInjectionChars,
+		referenceBudgetPolicy.TotalCapChars,
+		effectiveNarrativeSupportMaxChars,
+		guidanceItems,
+		supervisorCallStatus,
+	)
+	payloadApplicationPlan["guide_eligibility"] = guideEligibility
+	guidanceApplicationTrace := mapFromAny(payloadApplicationPlan["guidance_application_trace"])
+	guidanceApplicationTrace["eligibility"] = guideEligibility["status"]
+	guidanceApplicationTrace["eligibility_reason"] = guideEligibility["reason_code"]
+	guidanceApplicationTrace["guide_mode"] = guideEligibility["guide_mode"]
+	guidanceApplicationTrace["guide_strength"] = guideEligibility["guide_strength"]
+	guidanceApplicationTrace["requested_budget_chars"] = narrativeSupportMaxChars
+	guidanceApplicationTrace["guide_eligibility"] = guideEligibility
+	payloadApplicationPlan["guidance_application_trace"] = guidanceApplicationTrace
+	requestCorrelationID := stringPtrValue(prepareSourceContract.LaneStatus.RequestCorrelationID, "")
+	if strings.TrimSpace(requestCorrelationID) == "" {
+		requestCorrelationID = extractionStringFromAny(req.ClientMeta["archive_center_request_correlation_id"])
+	}
+	sourceToPayloadLineage := attachPrepareTurnOutputFidelityLineage(
+		requestCorrelationID,
+		payloadApplicationPlan,
+		responseExecutionContract,
+		boundedMemoryDeliveryLineage,
+	)
+	injectionPack["payload_application_plan"] = payloadApplicationPlan
+	injectionPack["memory_delivery_lineage"] = boundedMemoryDeliveryLineage
+	injectionPack["source_to_payload_lineage"] = sourceToPayloadLineage
+	injectionPack["memory_budget_resolution"] = memoryBudgetResolution
+	injectionText = extractionStringFromAny(payloadApplicationPlan["auxiliary_text"])
+	inputContextText = extractionStringFromAny(payloadApplicationPlan["input_context_text"])
+	if injectionText == "" {
+		injectionOut = nil
+	} else {
+		injectionOut = injectionText
+	}
+	if inputContextText == "" {
+		inputContextOut = nil
+	} else {
+		inputContextOut = inputContextText
 	}
 	helperBudgetGovernorTrace := buildHelperBudgetGovernorTrace(injectionAssembly, maxInjectionChars)
 
@@ -528,43 +881,116 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		"supervisor_status":   supervisorInputPack["status"],
 		"critic_status":       criticInputPack["status"],
 		"storyline_selection": supervisorInputPack["storyline_selection"],
+		"materialization":     materializationTrace,
 	}
 	for k, v := range progressionLedgerTracePreviewFields(progressionLedger) {
 		tracePreview[k] = v
 	}
-	autonomyPlan := buildAutonomyPlan(degraded, guideMode, narrativeStance)
-	microBeatProposal := buildMicroBeatProposal(degraded, pendingThreads, storylines, supportRecallLimit)
-	sceneStepProposal := buildSceneStepProposal(degraded, activeStates, canonicalLayers, episodeSums, supportRecallLimit)
-	combinedProposal := buildCombinedProposal(degraded, microBeatProposal, sceneStepProposal)
 	writebackPreview := buildWritebackPreview(degraded)
 	shadowCompareRecord := buildGenerationPacketShadowCompareRecord(injectionAssembly, inputContextText)
 	inputTransparencyModel := buildPrepareTurnInputTransparencyRenderModel(sid, turnIndex, rawUserInput, inputContextText, injectionEnabled, inputContextEnabled, inputContextTruncated, degraded, fallbackReason, injectionAssembly)
-	effectiveInputPreview := buildPrepareTurnEffectiveInputPreview(sid, turnIndex, rawUserInput, requestType, applyMode, inputContextText, injectionEnabled, inputContextEnabled, inputContextTruncated, degraded, fallbackReason, injectionAssembly)
+	inputTransparencyModel["payload_application_plan"] = payloadApplicationPlan
+	if counts := mapFromAny(inputTransparencyModel["counts"]); len(counts) > 0 {
+		counts["auxiliary_context_chars"] = intFromAny(payloadApplicationPlan["auxiliary_chars"], 0)
+		counts["input_context_chars"] = intFromAny(payloadApplicationPlan["input_context_chars"], 0)
+	}
+	effectiveInputPreview := buildPrepareTurnEffectiveInputPreview(sid, turnIndex, rawUserInput, stringPtrValue(currentInputDecision.SelectedObservationRef, "go_current_input_decision"), requestType, applyMode, inputContextText, injectionEnabled, inputContextEnabled, inputContextTruncated, degraded, fallbackReason, injectionAssembly)
+	effectiveInputPreview["capture_stage"] = "prepare_turn_before_request"
+	effectiveInputPreview["post_generation_data_included"] = false
+	effectiveInputPreview["input_context_source"] = inputContextSource
+	effectiveInputPreview["payload_application_plan"] = payloadApplicationPlan
+	effectiveInputPreview["auxiliary_context_chars"] = len([]rune(injectionText))
+	effectiveInputPreview["input_context_chars"] = len([]rune(inputContextText))
 	timing.addElapsed("response_assembly", responseAssemblyStartedAt)
 	backendTiming := timing.snapshot()
+	if s.TurnWorkflows != nil && workflowRequestID != "" {
+		s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePayload, "succeeded", "")
+		s.TurnWorkflows.awaitFinal(workflowRequestID)
+	}
+	turnWorkflowHUD := s.turnWorkflowHUDSnapshot(workflowRequestID)
+
+	if responseProjection == prepareTurnProductionProjectionV1 {
+		tracePreview["response_projection"] = map[string]any{
+			"contract_version": prepareTurnProductionProjectionV1,
+			"status":           "ready",
+			"legacy_surfaces":  "omitted",
+		}
+		compactInjectionPack := map[string]any{
+			"contract_version":          "prepare_turn.compact_injection_pack.v1",
+			"payload_application_plan":  payloadApplicationPlan,
+			"memory_delivery_plan":      injectionPack["memory_delivery_plan"],
+			"memory_delivery_lineage":   boundedMemoryDeliveryLineage,
+			"source_to_payload_lineage": sourceToPayloadLineage,
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":                          "ok",
+			"source":                          "shadow",
+			"response_projection":             prepareTurnProductionProjectionV1,
+			"chat_session_id":                 sid,
+			"generated_at":                    time.Now().UTC().Format(time.RFC3339),
+			"request_type":                    requestType,
+			"fallback_reason":                 fallbackReason,
+			"supervisor_result":               supervisorResult,
+			"injection_pack":                  compactInjectionPack,
+			"payload_application_plan":        payloadApplicationPlan,
+			"source_to_payload_lineage":       sourceToPayloadLineage,
+			"memory_budget_resolution":        memoryBudgetResolution,
+			"language_context":                languageContext,
+			"input_transparency_model":        inputTransparencyModel,
+			"backend_timing":                  backendTiming,
+			"turn_workflow_hud":               turnWorkflowHUD,
+			"source_contract":                 prepareSourceContract,
+			"current_input_decision":          currentInputDecision,
+			"message_source_envelope":         currentInputDecision.Envelope,
+			"session_bootstrap":               sessionBootstrap,
+			"host_context_reference_evidence": hostContextReferenceEvidence,
+			"response_execution_contract":     responseExecutionContract,
+			"trace_preview":                   tracePreview,
+			"reference_injection": map[string]any{
+				"enabled":          referenceInjectionEnabled,
+				"applied":          referenceText != "",
+				"selected_count":   len(referenceRecall.InjectionItems),
+				"injected_count":   referenceInjectedCount,
+				"scene_used_chars": referenceSceneUsedChars,
+				"budget_policy":    referenceBudgetPolicy,
+			},
+		})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":                   "ok",
-		"source":                   "shadow",
-		"chat_session_id":          sid,
-		"generated_at":             time.Now().UTC().Format(time.RFC3339),
-		"request_type":             requestType,
-		"fallback_reason":          fallbackReason,
-		"effective_user_input":     rawUserInput,
-		"injection_text":           injectionOut,
-		"input_context_text":       inputContextOut,
-		"supervisor_input_pack":    supervisorInputPack,
-		"critic_input_pack":        criticInputPack,
-		"injection_pack":           injectionPack,
-		"language_context":         languageContext,
-		"perspective_context":      perspectiveContext,
-		"input_transparency_model": inputTransparencyModel,
-		"effective_input_preview":  effectiveInputPreview,
-		"backend_timing":           backendTiming,
-		"trace_preview":            tracePreview,
-		"recall_result":            recallResult,
-		"reference_recall":         referenceRecall,
-		"primary_canon_base":       primaryCanonBase,
+		"status":                          "ok",
+		"source":                          "shadow",
+		"chat_session_id":                 sid,
+		"generated_at":                    time.Now().UTC().Format(time.RFC3339),
+		"request_type":                    requestType,
+		"fallback_reason":                 fallbackReason,
+		"effective_user_input":            rawUserInput,
+		"injection_text":                  injectionOut,
+		"input_context_text":              inputContextOut,
+		"supervisor_input_pack":           supervisorInputPack,
+		"critic_input_pack":               criticInputPack,
+		"injection_pack":                  injectionPack,
+		"payload_application_plan":        payloadApplicationPlan,
+		"source_to_payload_lineage":       sourceToPayloadLineage,
+		"supervisor_result":               supervisorResult,
+		"memory_budget_resolution":        memoryBudgetResolution,
+		"language_context":                languageContext,
+		"perspective_context":             perspectiveContext,
+		"input_transparency_model":        inputTransparencyModel,
+		"effective_input_preview":         effectiveInputPreview,
+		"backend_timing":                  backendTiming,
+		"turn_workflow_hud":               turnWorkflowHUD,
+		"source_contract":                 prepareSourceContract,
+		"current_input_decision":          currentInputDecision,
+		"message_source_envelope":         currentInputDecision.Envelope,
+		"session_bootstrap":               sessionBootstrap,
+		"risu_host_context_snapshot":      hostContextSnapshot,
+		"host_context_reference_evidence": hostContextReferenceEvidence,
+		"trace_preview":                   tracePreview,
+		"recall_result":                   recallResult,
+		"reference_recall":                referenceRecall,
+		"primary_canon_base":              primaryCanonBase,
 		"reference_injection": map[string]any{
 			"enabled":          referenceInjectionEnabled,
 			"applied":          referenceText != "",
@@ -610,10 +1036,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		"source_lookup_audit":                           sourceLookupAudit,
 		"runtime_toggle":                                runtimeToggle,
 		"input_anchor_governor":                         inputAnchorGovernor,
-		"weak_input_planner":                            weakInputPlanner,
-		"planner_execution_contract":                    plannerExecutionContract,
-		"progression_choice_ledger":                     progressionChoiceLedger,
-		"step25_validation_gate":                        step25ValidationGate,
+		"response_execution_contract":                   responseExecutionContract,
 		"helper_budget_governor_trace":                  helperBudgetGovernorTrace,
 		"helper_injection_budget_manager":               buildStep165HelperInjectionBudgetManager(maxInjectionChars, injectionAssembly),
 		"input_context_slot_governor":                   buildStep165InputContextSlotGovernor(maxInputContextChars, inputContextTruncated),
@@ -1275,10 +1698,6 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		"seq215_js_backend_offload_plugin_only":           buildSeq215P881JSBackendOffloadPluginOnly(),
 		"seq215_master_checklist_open_zero":               buildSeq215P882MasterChecklistOpenZero(),
 		"seq215_step_complete_p883":                       buildSeq215P883StepComplete(),
-		"autonomy_plan":                                   autonomyPlan,
-		"micro_beat_proposal":                             microBeatProposal,
-		"scene_step_proposal":                             sceneStepProposal,
-		"combined_proposal":                               combinedProposal,
 		"writeback_preview":                               writebackPreview,
 		"continuity_pack":                                 continuityPack,
 		"persona_recollection":                            personaRecollection,
@@ -1348,6 +1767,17 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		},
 		"note": "prepare-turn is a store-backed shadow assembly; no writes performed",
 	})
+}
+
+func prepareTurnHistoryBounds(latestTurn int) (int, int) {
+	if latestTurn <= 0 {
+		return 0, 0
+	}
+	fromTurn := latestTurn - prepareTurnHistoryWindowTurns + 1
+	if fromTurn < 1 {
+		fromTurn = 1
+	}
+	return fromTurn, latestTurn
 }
 
 func (s *Server) handleEffectiveInputs(w http.ResponseWriter, r *http.Request) {

@@ -1,7 +1,7 @@
 param(
     [string]$OutputRoot,
     [string[]]$TargetFilter = @(),
-    [string]$PackageVersion = "3.0.0",
+    [string]$PackageVersion = "3.5.0",
     [switch]$Zip,
     [switch]$ForceRefresh
 )
@@ -46,7 +46,7 @@ function Write-TextFile([string]$Path, [string]$Value) {
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.0.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
     $suffix = "archivecenter" + (($version -replace '\s+', '').ToLowerInvariant())
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     foreach ($pattern in @("*.md", "*.txt", "*.sh", "*.command")) {
@@ -195,7 +195,7 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 $outputRootFull = Resolve-FullPath $OutputRoot
 if (-not (Test-PathInside $outputRootFull $repoRoot)) {
-    throw "Refusing to write outside Archive Center 2.0: $outputRootFull"
+    throw "Refusing to write outside the Archive Center workspace: $outputRootFull"
 }
 
 $goServiceRoot = Join-Path $repoRoot "go-service"
@@ -277,7 +277,7 @@ $targets = @(
     }
 )
 
-$packageVersionLabel = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.0.0" } else { $PackageVersion.Trim() }
+$packageVersionLabel = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
 foreach ($target in $targets) {
     $target.PackageName = ([string]$target.PackageName).Replace("Archive Center 2.1", "Archive Center $packageVersionLabel")
 }
@@ -323,19 +323,11 @@ foreach ($target in $targets) {
     Build-GoBinary $goServiceRoot $target.Goos $target.Goarch "./cmd/archive-center-go" (Join-Path $targetRoot "bin\archive-center-go")
     Build-GoBinary $goServiceRoot $target.Goos $target.Goarch "./cmd/archive-center-updater" (Join-Path $targetRoot "bin\archive-center-updater")
     Build-GoBinary $goServiceRoot $target.Goos $target.Goarch "./cmd/mariadb-schema" (Join-Path $targetRoot "bin\mariadb-schema")
-    $migrationTools = @(
-        "sqlite-export",
-        "dry-run-validator",
-        "compare-dry-run",
-        "mariadb-dry-run-import",
-        "mariadb-import",
-        "legacy10-migrate"
-    )
-    foreach ($tool in $migrationTools) {
-        Build-GoBinary $goServiceRoot $target.Goos $target.Goarch "./cmd/$tool" (Join-Path $targetRoot "bin\$tool")
-    }
-
     Copy-File (Join-Path $repoRoot "Archive Center.js") (Join-Path $targetRoot "Archive Center.js")
+    Copy-File (Join-Path $repoRoot "LICENSE") (Join-Path $targetRoot "LICENSE")
+    Copy-File (Join-Path $repoRoot "NOTICE") (Join-Path $targetRoot "NOTICE")
+    Copy-File (Join-Path $repoRoot "THIRD_PARTY_NOTICES.md") (Join-Path $targetRoot "THIRD_PARTY_NOTICES.md")
+    Copy-DirectoryContents (Join-Path $repoRoot "licenses") (Join-Path $targetRoot "licenses")
     $readmeSource = "ops\full-package-posix\README_POSIX_FULL_PACKAGE.md"
     $readFirstSource = "ops\full-package-posix\00_README_FIRST_POSIX_FULL.md"
     Copy-File (Join-Path $repoRoot $readmeSource) (Join-Path $targetRoot "README.md")
@@ -343,7 +335,8 @@ foreach ($target in $targets) {
     Copy-File (Join-Path $repoRoot "ops\full-package\.env.full.example") (Join-Path $targetRoot ".env.full.example")
     Set-RuntimeDefaultsInEnvExample (Join-Path $targetRoot ".env.full.example") $target.RuntimeProfileDefault $target.VectorModeDefault
     Copy-DirectoryContents (Join-Path $repoRoot "migrations") (Join-Path $targetRoot "migrations")
-    Copy-DirectoryContents (Join-Path $repoRoot "prompts") (Join-Path $targetRoot "prompts")
+    Copy-File (Join-Path $repoRoot "prompts\critic_system.txt") (Join-Path $targetRoot "prompts\critic_system.txt")
+    Copy-File (Join-Path $repoRoot "prompts\supervisor_system.txt") (Join-Path $targetRoot "prompts\supervisor_system.txt")
     Copy-DirectoryContents (Join-Path $repoRoot "ops\full-package-posix") (Join-Path $targetRoot "scripts")
     Get-ChildItem -LiteralPath (Join-Path $targetRoot "scripts") -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like "README_POSIX_*PACKAGE.md" -or $_.Name -like "00_README_FIRST_POSIX*.md" } |
@@ -376,8 +369,8 @@ foreach ($target in $targets) {
         status = $target.Status
         release_ready = $false
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
-        source_root = $repoRoot
-        target_root = $targetRoot
+        source_root = "release-source"
+        target_root = "."
         size_bytes = [int64]$sizeBytes
         canonical_store = "mariadb"
         vector_engine = "optional_chromadb"
@@ -401,13 +394,11 @@ foreach ($target in $targets) {
             "bin/archive-center-go",
             "bin/archive-center-updater",
             "bin/mariadb-schema",
-            "bin/legacy10-migrate",
-            "bin/sqlite-export",
-            "bin/dry-run-validator",
-            "bin/compare-dry-run",
-            "bin/mariadb-dry-run-import",
-            "bin/mariadb-import",
             "Archive Center.js",
+            "LICENSE",
+            "NOTICE",
+            "THIRD_PARTY_NOTICES.md",
+            "licenses",
             "migrations",
             "prompts",
             "scripts",
