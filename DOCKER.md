@@ -61,11 +61,12 @@ docker tag archive-center-kotono:local archive-center-kotono:<이전버전>-roll
 # 2) 이미지 빌드만 (아직 기동 안 함)
 docker compose build ac-go
 
-# 3) 스키마 델타 적용 → 4) 검증 → 5) 기동
-docker exec -i ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" archive_center' \
-  < migrations/00N_....sql
-docker exec pocketrisu-ts wget -qO- http://127.0.0.1:28080/ready
+# 3) 기동. ac-schema가 마이그레이션을 적용하고 종료해야 ac-go가 떠요.
 docker compose up -d --no-build
+
+# 4) 검증
+docker compose logs ac-schema | tail -20        # status ok / statements_applied 확인
+docker exec pocketrisu-ts wget -qO- http://127.0.0.1:28080/ready
 ```
 
 `AC_BUILD_VERSION` 도 새 버전으로 맞춰요 (표기용이라 기능에 영향은 없지만 `/version` 이 이 값을 그대로 내보내요).
@@ -77,19 +78,33 @@ docker compose up -d --no-build
 RisuAI 플러그인 창의 "업데이트"는 **JS 어댑터**용이라 이 백엔드 컨테이너와 별개예요.
 `Archive Center.js` 가 바뀌면 리수 쪽 플러그인도 따로 갱신해야 해요.
 
-### 스키마 마이그레이션 (initdb.d 우회)
+### 스키마 마이그레이션 (ac-schema 서비스)
 
-`001_schema.sql` 은 MariaDB 볼륨이 빈 최초 1회만 적용돼요. 이미 돌던 DB엔 델타 SQL을 직접 먹여요.
-upstream은 새 스키마를 `migrations/00N_*.sql` 로 따로 내면서 `001_schema.sql` 에도 같은 문장을
-등록해요 (그래서 새로 만드는 DB는 `001` 만으로 완전해요). 델타 파일은 `CREATE TABLE IF NOT EXISTS`
-라 재실행해도 안전하지만, DDL은 원자적이지 않으니 적용 후 테이블 수를 꼭 확인하세요.
+`001_schema.sql` 은 MariaDB 볼륨이 빈 최초 1회만 적용돼서, 이미 돌던 DB는 별도 경로가 필요해요.
+upstream 3.6부터 이 역할을 `mariadb-schema` 도구가 맡아요. 이 포크는 그 도구를 같은 이미지에
+넣고 compose의 `ac-schema` 서비스로 기동 전에 자동 실행해요.
+
+- `--schema /app/migrations` 로 디렉터리를 주면 `.sql` 을 파일명 순서대로 전부 적용해요.
+- 신규 마이그레이션은 `ADD COLUMN IF NOT EXISTS` 류 rerunnable 구문이라 매 기동마다 돌아도 안전해요.
+- `ac-go` 는 `service_completed_successfully` 로 물려 있어서, 스키마 적용이 실패하면 백엔드가 아예 안 떠요.
+
+수동으로 한 번 더 돌리거나 적용 전 계획만 보고 싶으면 (`--execute` 를 빼면 dry-run 리포트):
+
+```bash
+docker compose run --rm --entrypoint /app/mariadb-schema ac-go --schema /app/migrations
+```
+
+적용 후 테이블 수 확인 (DDL은 원자적이지 않아서 중간 실패를 눈으로 봐야 해요):
 
 ```bash
 docker exec ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N \
   -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"archive_center\""'
 ```
 
-적용 이력: 3.0.1 → 3.5.0 에서 `002_canon_pack_storage.sql` 적용 (테이블 52 → 62).
+적용 이력:
+
+- 3.0.1 → 3.5.0: `002_canon_pack_storage.sql` 수동 적용 (테이블 52 → 62)
+- 3.5.0 → 3.9.9: `003`~`009` 를 `ac-schema` 자동 적용으로 전환
 
 ## 데이터 / 백업
 
@@ -107,7 +122,7 @@ docker exec ac-mariadb sh -c 'mariadb-dump --single-transaction -uroot -p"$MARIA
 
 ## 운영 주의 (이중 리뷰 반영)
 
-- **스키마 마이그레이션**: `001_schema.sql`은 MariaDB 볼륨이 빈 최초 1회만 적용돼요. 이미 돌던 DB에 upstream 스키마 변경을 넣는 절차는 위 "스키마 마이그레이션" 항목 참고.
+- **스키마 마이그레이션**: `ac-schema` 서비스가 기동 때마다 자동 적용해요. 실패하면 `ac-go` 가 뜨지 않으니, 백엔드가 안 올라오면 `docker compose logs ac-schema` 부터 보세요.
 - **외장 SSD**: `/Volumes/Nagase_K/...` 바인드라, SSD 미마운트 상태로 기동하면 엉뚱한 위치에 빈 DB가 생길 수 있어요. 기동 전 마운트 확인.
 - **namespace 의존**: `pocketrisu-ts` 가 재생성되면 ac 서비스도 network가 끊기니 재기동(`docker compose up -d`)이 필요해요.
 - **비밀번호**: DSN에 들어가므로 `openssl rand -hex 32` 같은 DSN-safe(hex) 값을 쓰세요. `@ : / ?` 특수문자는 DSN 파싱을 깨요.

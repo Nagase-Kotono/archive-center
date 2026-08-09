@@ -59,6 +59,28 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # 스키마 마이그레이션 (일회성 실행 후 종료).
+  # 3.6부터 003~ 마이그레이션은 initdb.d가 아니라 mariadb-schema 도구로만 적용돼요.
+  # initdb.d는 빈 볼륨 최초 1회뿐이라 기존 DB는 여기를 거쳐야 스키마가 올라가요.
+  # 구문이 전부 rerunnable(ADD COLUMN IF NOT EXISTS 류)이라 매 기동마다 돌아도 안전해요.
+  # 이미지는 ac-go가 빌드한 것을 그대로 재사용해요 (build 정의는 ac-go 쪽에만 둠).
+  ac-schema:
+    image: archive-center-kotono:local
+    container_name: ac-schema
+    restart: "no"
+    network_mode: "container:pocketrisu-ts"   # MariaDB가 같은 namespace의 127.0.0.1:3306
+    entrypoint: ["/app/mariadb-schema"]
+    command: ["--schema", "/app/migrations", "--execute"]
+    environment:
+      AC_MARIADB_DSN: "ac_user:${MARIADB_PASSWORD}@tcp(127.0.0.1:3306)/archive_center?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&loc=UTC"
+    depends_on:
+      ac-mariadb:
+        condition: service_healthy
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   # Go 백엔드. 리수 namespace 안에서 127.0.0.1:28080 리슨 → 리수 프록시가 접근.
   ac-go:
     build:
@@ -69,7 +91,7 @@ services:
     restart: unless-stopped
     network_mode: "container:pocketrisu-ts"   # 리수와 같은 namespace → 프록시 127.0.0.1:28080 도달
     environment:
-      AC_BUILD_VERSION: "3.5.0"
+      AC_BUILD_VERSION: "3.9.9"
       # namespace loopback 에만 바인드 (외부 노출 없음, 리수 프록시만 접근).
       AC_BIND_ADDR: "127.0.0.1:28080"
       # live + mariadb_authority = 실제 영속 저장. 같은 namespace라 DB/Chroma도 127.0.0.1.
@@ -93,6 +115,9 @@ services:
         condition: service_healthy
       ac-chroma:
         condition: service_healthy
+      # 스키마가 최신이 아닌 상태로 백엔드가 뜨면 런타임 의존성 preflight에서 죽어요.
+      ac-schema:
+        condition: service_completed_successfully
     mem_limit: 512m
     logging:
       driver: json-file
