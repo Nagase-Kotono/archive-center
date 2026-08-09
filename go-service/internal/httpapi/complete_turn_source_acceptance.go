@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -165,6 +166,16 @@ func rejectedCompleteTurnSourceAcceptance(reason string, retryable bool, observa
 	if retryable {
 		queueAction = "retry_after_new_observation"
 	}
+	// 포크 추가: 거부는 전부 여기를 거치므로 사유와 관측값을 한 줄로 남긴다.
+	slog.Warn("complete-turn source acceptance rejected",
+		"reason", reason,
+		"retryable", retryable,
+		"session_id", observation.SessionID,
+		"host_chat_id", observation.HostChatID,
+		"active_message_count", observation.ActiveMessageCount,
+		"message_index", observation.MessageIndex,
+		"generation_id", observation.GenerationID,
+	)
 	return completeTurnSourceAcceptanceDecision{
 		Enabled: true, Accepted: false, Status: "rejected", Reason: reason,
 		Retryable: retryable, QueueAction: queueAction, Observation: observation,
@@ -275,6 +286,13 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 	// routing mistake and contaminate the wrong session. The host must resolve
 	// the active RisuAI chat identity again before retrying.
 	if latestCanonicalTurn > 0 && turnIndex < latestCanonicalTurn {
+		// 포크 추가: 어긋난 두 숫자를 찍어야 화면/DB 중 어느 쪽이 밀렸는지 판단할 수 있다.
+		slog.Warn("session tail conflict",
+			"session_id", sid,
+			"incoming_turn", turnIndex,
+			"latest_canonical_turn", latestCanonicalTurn,
+			"active_message_count", observation.ActiveMessageCount,
+		)
 		conflict := rejectedCompleteTurnSourceAcceptance("source_acceptance_session_tail_conflict", true, observation)
 		conflict.LogicalTurnID = decision.LogicalTurnID
 		conflict.BoundTurn = turnIndex

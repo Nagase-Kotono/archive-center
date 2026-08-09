@@ -82,6 +82,9 @@ services:
       AC_ENFORCE_AUTH: "false"
       AC_UPDATE_ENABLED: "false"
       AC_ALLOWED_ORIGINS: "*"
+      # 로그 등급: debug | info | warn | error. 포크에서 추가한 옵션이에요.
+      # 모든 HTTP 요청이 한 줄씩 남고, 4xx는 WARN, 5xx는 ERROR로 올라가요.
+      AC_LOG_LEVEL: "debug"
     volumes:
       # 프롬프트 편집 UI용 host 바인드 (편집분 유지). 소유권 65532(nonroot).
       - /Volumes/Nagase_K/archive-center/prompts:/app/prompts
@@ -93,4 +96,7 @@ services:
     mem_limit: 512m
     logging:
       driver: json-file
-      options: { max-size: "10m", max-file: "3" }
+      # 요청 로그를 켜서 로그량이 늘어나므로 보관 용량을 키웠어요 (20m x 10 = 200MB).
+      # json-file 드라이버는 시간 기반 rotation이 없어서 기간이 아니라 크기로 잡아요.
+      # 요청 한 줄이 250바이트 안팎이라 200MB면 일주일치를 크게 웃돌아요.
+      options: { max-size: "20m", max-file: "10" }
