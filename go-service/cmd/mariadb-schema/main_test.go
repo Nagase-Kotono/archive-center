@@ -201,6 +201,60 @@ func TestSplitSQLStatementsStripsUTF8BOMBeforeComment(t *testing.T) {
 	}
 }
 
+func TestLoadMigrationStatementsUsesLexicalOrderAndLoadsEachFileOnce(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "migrations")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"010_last.sql":   "SELECT 'last';",
+		"001_first.sql":  "SELECT 'first';",
+		"002_middle.sql": "SELECT 'middle-one'; SELECT 'middle-two';",
+		"README.txt":     "ignored",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statements, paths, err := loadMigrationStatements(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{
+		filepath.Join(dir, "001_first.sql"),
+		filepath.Join(dir, "002_middle.sql"),
+		filepath.Join(dir, "010_last.sql"),
+	}
+	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
+		t.Fatalf("migration paths = %v, want %v", paths, wantPaths)
+	}
+	wantStatements := []string{"SELECT 'first'", "SELECT 'middle-one'", "SELECT 'middle-two'", "SELECT 'last'"}
+	if strings.Join(statements, "\n") != strings.Join(wantStatements, "\n") {
+		t.Fatalf("statements = %v, want %v", statements, wantStatements)
+	}
+}
+
+func TestLoadMigrationStatementsExpandsLegacy001FileArgumentToDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "migrations")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(dir, "001_schema.sql")
+	if err := os.WriteFile(first, []byte("SELECT 1;"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "002_expand.sql"), []byte("SELECT 2;"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	statements, paths, err := loadMigrationStatements(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 || len(statements) != 2 || statements[0] != "SELECT 1" || statements[1] != "SELECT 2" {
+		t.Fatalf("legacy file expansion paths=%v statements=%v", paths, statements)
+	}
+}
+
 func TestRunGuardedWithoutExecuteDoesNotRequireDSN(t *testing.T) {
 	dir := t.TempDir()
 	schemaPath := filepath.Join(dir, "schema.sql")
@@ -271,6 +325,101 @@ func TestApplyStatementsReportsFailedStatementNumber(t *testing.T) {
 	}
 }
 
+func TestBootstrapManagedDatabaseRejectsDifferentDataDirectoryBeforeDDL(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	expectedDataDir := filepath.Join(t.TempDir(), "expected")
+	actualDataDir := filepath.Join(t.TempDir(), "other")
+	if err := os.MkdirAll(expectedDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(actualDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectPing()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT @@datadir")).
+		WillReturnRows(sqlmock.NewRows([]string{"@@datadir"}).AddRow(actualDataDir))
+
+	_, err = bootstrapManagedDatabase(context.Background(), db, expectedDataDir)
+	if err == nil {
+		t.Fatal("expected data directory mismatch")
+	}
+	if got := managedBootstrapErrorCode(err); got != managedErrDataDirMismatch {
+		t.Fatalf("error code = %q, want %q: %v", got, managedErrDataDirMismatch, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected SQL after ownership mismatch: %v", err)
+	}
+}
+
+func TestBootstrapManagedDatabaseRepairsExistingAccountPasswordAndPrivileges(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	dataDir := t.TempDir()
+	mock.ExpectPing()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT @@datadir")).
+		WillReturnRows(sqlmock.NewRows([]string{"@@datadir"}).AddRow(dataDir + string(os.PathSeparator)))
+
+	statements := []string{
+		"CREATE DATABASE IF NOT EXISTS archive_center CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+		"CREATE USER IF NOT EXISTS 'archive_center'@'127.0.0.1' IDENTIFIED BY 'archive-center-local-pass'",
+		"ALTER USER 'archive_center'@'127.0.0.1' IDENTIFIED BY 'archive-center-local-pass'",
+		"GRANT ALL PRIVILEGES ON archive_center.* TO 'archive_center'@'127.0.0.1'",
+		"CREATE USER IF NOT EXISTS 'archive_center'@'localhost' IDENTIFIED BY 'archive-center-local-pass'",
+		"ALTER USER 'archive_center'@'localhost' IDENTIFIED BY 'archive-center-local-pass'",
+		"GRANT ALL PRIVILEGES ON archive_center.* TO 'archive_center'@'localhost'",
+		"FLUSH PRIVILEGES",
+	}
+	for _, statement := range statements {
+		mock.ExpectExec(regexp.QuoteMeta(statement)).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+
+	verified, err := bootstrapManagedDatabase(context.Background(), db, dataDir)
+	if err != nil {
+		t.Fatalf("bootstrapManagedDatabase failed: %v", err)
+	}
+	want, err := canonicalManagedDataDir(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified != want {
+		t.Fatalf("verified data directory = %q, want %q", verified, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBootstrapManagedDatabaseClassifiesAdminAuthenticationFailure(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectPing().WillReturnError(errors.New("access denied"))
+	_, err = bootstrapManagedDatabase(context.Background(), db, t.TempDir())
+	if err == nil {
+		t.Fatal("expected administrator authentication failure")
+	}
+	if got := managedBootstrapErrorCode(err); got != managedErrAdminAuth {
+		t.Fatalf("error code = %q, want %q: %v", got, managedErrAdminAuth, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestApplyCompatibilityMigrationsAddsStorylineQualityColumns(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -279,6 +428,8 @@ func TestApplyCompatibilityMigrationsAddsStorylineQualityColumns(t *testing.T) {
 	defer db.Close()
 
 	statements := compatibilityMigrationStatements()
+	mock.ExpectQuery(`(?s)SELECT EXISTS\(.*FROM chat_logs a.*INNER JOIN chat_logs b`).
+		WillReturnRows(sqlmock.NewRows([]string{"conflicting"}).AddRow(0))
 	for _, stmt := range statements {
 		mock.ExpectExec(regexp.QuoteMeta(stmt)).
 			WillReturnResult(sqlmock.NewResult(0, 0))
@@ -293,6 +444,64 @@ func TestApplyCompatibilityMigrationsAddsStorylineQualityColumns(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestApplyCompatibilityMigrationsRejectsConflictingChatLogsBeforeMutation(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`(?s)SELECT EXISTS\(.*FROM chat_logs a.*INNER JOIN chat_logs b`).
+		WillReturnRows(sqlmock.NewRows([]string{"conflicting"}).AddRow(1))
+
+	report := newReport("schema.sql", true)
+	err = applyCompatibilityMigrations(context.Background(), db, report)
+	if err == nil || !strings.Contains(err.Error(), "conflicting content") {
+		t.Fatalf("expected chat log conflict preflight error, got %v", err)
+	}
+	if report.CompatibilityStatementsRun != 0 {
+		t.Fatalf("compatibility statements run = %d, want 0", report.CompatibilityStatementsRun)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompatibilityMigrationsIncludeChatLogUniquenessRepair(t *testing.T) {
+	joined := strings.Join(compatibilityMigrationStatements(), "\n")
+	for _, required := range []string{
+		"UPDATE chat_logs SET role = LOWER(TRIM(role))",
+		"DELETE duplicate FROM chat_logs",
+		"ADD UNIQUE INDEX IF NOT EXISTS uq_chat_logs_turn_role",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("compatibility migration statements missing %q", required)
+		}
+	}
+}
+
+func TestChatLogUniquenessMigrationIsRegisteredInCompatibilityPass(t *testing.T) {
+	migrationPath := filepath.Join("..", "..", "..", "migrations", "008_chat_log_turn_role_uniqueness.sql")
+	migrationStatements, err := loadStatements(migrationPath)
+	if err != nil {
+		t.Fatalf("load chat log uniqueness migration: %v", err)
+	}
+	if len(migrationStatements) != 1 {
+		t.Fatalf("migration statements=%d, want 1", len(migrationStatements))
+	}
+	normalizedMigration := strings.Join(strings.Fields(migrationStatements[0]), " ")
+	found := false
+	for _, statement := range compatibilityMigrationStatements() {
+		if strings.Join(strings.Fields(statement), " ") == normalizedMigration {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("migration statement is not registered in compatibility pass: %s", normalizedMigration)
 	}
 }
 

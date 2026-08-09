@@ -32,8 +32,10 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	hostObservedAtMS, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("host_observed_at_ms")), 10, 64)
 	decisionToken := strings.TrimSpace(r.URL.Query().Get("decision_token"))
 	decisionVerified := false
+	lifecycleAction := store.LogicalTurnLifecycleDeleted
 	if decisionToken != "" {
-		if _, ok := s.rollbackDecisionLedger().consume(decisionToken, sid, turnIndex); !ok {
+		record, ok := s.rollbackDecisionLedger().consume(decisionToken, sid, turnIndex)
+		if !ok {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"status": "blocked", "code": "rollback_decision_token_invalid",
 				"chat_session_id": sid, "turn_index": turnIndex,
@@ -41,6 +43,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		decisionVerified = true
+		lifecycleAction = record.LifecycleAction
 	}
 	requestedTurnIndex := turnIndex
 	protectedBeforeTurn := intFromAny(r.URL.Query().Get("protected_before_turn"), 0)
@@ -55,7 +58,8 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rollbackStore, hasRollback := s.Store.(store.RollbackStore)
-	if !hasRollback || !s.usesShadowWriteStore() {
+	canonicalTailStore, hasCanonicalTail := s.Store.(store.LogicalTurnReplacementStore)
+	if (!hasRollback && !hasCanonicalTail) || !s.usesShadowWriteStore() {
 		rollbackPlan := buildRollbackPlan(sid, turnIndex, reqSource)
 		rollbackPlan["requested_turn_index"] = requestedTurnIndex
 		rollbackPlan["protected_before_turn"] = protectedBeforeTurn
@@ -76,7 +80,105 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	deletions := map[string]any{}
 	var delErrs []string
-	vectorIDs, vectorCollectErr := rollbackVectorDocumentIDs(ctx, s.Store, sid, turnIndex)
+	// Stop and drain source-bound foreground/worker writes before invalidating
+	// or deleting any derived rows. This prevents a canceled late Critic result
+	// from recreating secondary artifacts after rollback cleanup has passed.
+	s.cancelCompleteTurnSourceWorkers(sid, turnIndex)
+	lifecycleOutbox := false
+	canonicalRollback := false
+	if hasCanonicalTail {
+		err := canonicalTailStore.RollbackCanonicalTail(ctx, store.LogicalTurnRollback{
+			ChatSessionID:   sid,
+			TurnIndex:       turnIndex,
+			LifecycleAction: lifecycleAction,
+			Reason:          "turn_rollback",
+			CreatedAt:       time.Now().UTC(),
+		})
+		if err != nil && !errors.Is(err, store.ErrNotEnabled) {
+			deletions["canonical_tail_transaction"] = map[string]any{"ok": false, "error": err.Error()}
+			requestID := fmt.Sprintf("rollback:%s:%d:%s", sid, turnIndex, reqSource)
+			rollbackHUDView := s.turnWorkflowHUDOperationNotice(
+				requestID,
+				sid, turnIndex, "failed", "error",
+				"turn_hud.notice.delete_sync_failed",
+				"turn_hud.error.delete_sync_partial",
+				"ASSISTANT_OUTPUT_DELETE_SYNC_PARTIAL",
+			)
+			for _, fact := range rollbackHUDBlockedDeletionFacts() {
+				setTurnWorkflowHUDFactValue(&rollbackHUDView, fact)
+				if s.TurnWorkflows != nil {
+					s.TurnWorkflows.setFact(requestID, fact)
+				}
+			}
+			syncTurnWorkflowHUDPresentation(&rollbackHUDView)
+			var rollbackHUD any = rollbackHUDView
+			if s.TurnWorkflows != nil {
+				rollbackHUD = s.turnWorkflowHUDSnapshot(requestID)
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status": "error", "code": "canonical_tail_rollback_failed",
+				"chat_session_id": sid, "turn_index": turnIndex,
+				"deletions":         deletions,
+				"note":              "rollback transaction failed; MariaDB canonical state was not partially deleted",
+				"turn_workflow_hud": rollbackHUD,
+			})
+			return
+		}
+		if err == nil {
+			canonicalRollback = true
+			lifecycleOutbox = true
+			deletions["canonical_tail_transaction"] = map[string]any{
+				"ok": true, "canonical_committed": true, "vector_cleanup": "durable_outbox",
+			}
+			deletions["source_revisions"] = map[string]any{"ok": true, "vector_cleanup": "durable_outbox"}
+		}
+	}
+	if !canonicalRollback {
+		if lifecycle, ok := s.Store.(store.SourceRevisionStore); ok {
+			if availability, hasAvailability := s.Store.(store.MemoryDerivationLifecycleAvailability); !hasAvailability || availability.MemoryDerivationLifecycleEnabled() {
+				if err := lifecycle.InvalidateSourceRevisions(ctx, sid, turnIndex, lifecycleAction, "turn_rollback", time.Now().UTC()); err != nil {
+					deletions["source_revisions"] = map[string]any{"ok": false, "error": err.Error()}
+					requestID := fmt.Sprintf("rollback:%s:%d:%s", sid, turnIndex, reqSource)
+					rollbackHUDView := s.turnWorkflowHUDOperationNotice(
+						requestID,
+						sid, turnIndex, "failed", "error",
+						"turn_hud.notice.delete_sync_failed",
+						"turn_hud.error.delete_sync_partial",
+						"ASSISTANT_OUTPUT_DELETE_SYNC_PARTIAL",
+					)
+					for _, fact := range rollbackHUDBlockedDeletionFacts() {
+						setTurnWorkflowHUDFactValue(&rollbackHUDView, fact)
+						if s.TurnWorkflows != nil {
+							s.TurnWorkflows.setFact(requestID, fact)
+						}
+					}
+					syncTurnWorkflowHUDPresentation(&rollbackHUDView)
+					var rollbackHUD any = rollbackHUDView
+					if s.TurnWorkflows != nil {
+						rollbackHUD = s.turnWorkflowHUDSnapshot(requestID)
+					}
+					writeJSON(w, http.StatusInternalServerError, map[string]any{
+						"status":            "error",
+						"code":              "source_invalidation_failed",
+						"chat_session_id":   sid,
+						"turn_index":        turnIndex,
+						"deletions":         deletions,
+						"note":              "rollback stopped before canonical deletion",
+						"turn_workflow_hud": rollbackHUD,
+					})
+					return
+				} else {
+					lifecycleOutbox = true
+					deletions["source_revisions"] = map[string]any{"ok": true, "vector_cleanup": "durable_outbox"}
+				}
+			}
+		}
+	}
+	var vectorIDs []string
+	var vectorCollectErr error
+	if !lifecycleOutbox {
+		vectorIDs, vectorCollectErr = rollbackVectorDocumentIDs(ctx, s.Store, sid, turnIndex)
+	}
 	vectorCountBefore := -1
 	vectorCountAfter := -1
 	if s.Vector != nil {
@@ -121,6 +223,10 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, t := range tables {
+		if canonicalRollback {
+			deletions[t.name] = map[string]any{"ok": true, "mode": "canonical_tail_transaction"}
+			continue
+		}
 		if err := t.fn(); err != nil {
 			deletions[t.name] = map[string]any{"ok": false, "error": err.Error()}
 			delErrs = append(delErrs, fmt.Sprintf("%s: %v", t.name, err))
@@ -134,13 +240,74 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	} else {
 		deletions["reference_runtime"] = map[string]any{"ok": true, "cleared_candidates": cleared, "bindings_preserved": true}
 	}
-	if restored, err := restoreNarrativeCurrentStatesAfterRollback(ctx, s.Store, sid); err != nil {
+	if restored, err := restoreNarrativeCurrentStatesAfterRollback(ctx, s.Store, sid, turnIndex-1); err != nil {
 		deletions["narrative_current_state_restore"] = map[string]any{"ok": false, "error": err.Error()}
 		delErrs = append(delErrs, fmt.Sprintf("narrative current state restore: %v", err))
 	} else {
 		deletions["narrative_current_state_restore"] = map[string]any{"ok": true, "restored": restored}
 	}
-	if vectorCollectErr != nil {
+	if canonicalRollback {
+		deletions["story_clock_current_restore"] = map[string]any{"ok": true, "mode": "canonical_tail_transaction"}
+	} else if restored, err := restoreStoryClockCurrentAfterRollback(ctx, s.Store, sid); err != nil {
+		deletions["story_clock_current_restore"] = map[string]any{"ok": false, "error": err.Error()}
+		delErrs = append(delErrs, fmt.Sprintf("story clock current restore: %v", err))
+	} else {
+		deletions["story_clock_current_restore"] = map[string]any{"ok": true, "restored": restored}
+	}
+	if canonicalRollback {
+		deletions["reversible_state_current_restore"] = map[string]any{"ok": true, "mode": "canonical_tail_transaction"}
+	} else if restored, err := restoreReversibleStateCurrentAfterRollback(ctx, s.Store, sid); err != nil {
+		deletions["reversible_state_current_restore"] = map[string]any{"ok": false, "error": err.Error()}
+		delErrs = append(delErrs, fmt.Sprintf("reversible state current restore: %v", err))
+	} else {
+		deletions["reversible_state_current_restore"] = map[string]any{"ok": true, "restored": restored}
+	}
+	if lifecycleOutbox {
+		runtimeConfig := s.runtimeConfigSnapshot()
+		results := []memoryVectorProcessResult{}
+		if leaseDuration := memoryWorkerLeaseDuration(runtimeConfig); runtimeConfig.Synced && leaseDuration > 0 {
+			results = s.processMemoryVectorOutboxBatch(
+				ctx,
+				fmt.Sprintf("rollback:%s:%d", sid, turnIndex),
+				time.Now().UTC(),
+				leaseDuration,
+				0,
+			)
+		}
+		s.wakeMemoryWorkers()
+		completed := 0
+		retryable := 0
+		permanent := 0
+		for _, result := range results {
+			switch result.CanonicalState {
+			case "completed", "stale_rejected":
+				completed++
+			case "retryable":
+				retryable++
+			case "permanent":
+				permanent++
+			}
+		}
+		canonicalNote := "MariaDB invalidation and vector cleanup completed"
+		if retryable > 0 {
+			canonicalNote = "MariaDB invalidation is committed; provider failure remains retryable outbox work"
+		}
+		if permanent > 0 {
+			canonicalNote = "MariaDB invalidation is committed; vector cleanup has a permanent provider failure"
+			delErrs = append(delErrs, fmt.Sprintf("vectors: %d permanent outbox failure(s)", permanent))
+		}
+		deletions["vectors"] = map[string]any{
+			"ok":                  permanent == 0,
+			"mode":                "durable_outbox",
+			"canonical_committed": true,
+			"drain_attempted":     true,
+			"processed":           len(results),
+			"completed":           completed,
+			"retryable_queued":    retryable,
+			"permanent":           permanent,
+			"canonical_note":      canonicalNote,
+		}
+	} else if vectorCollectErr != nil {
 		deletions["vectors"] = map[string]any{"ok": false, "attempted": false, "error": vectorCollectErr.Error()}
 		delErrs = append(delErrs, fmt.Sprintf("vectors: collect rollback ids: %v", vectorCollectErr))
 	} else if len(vectorIDs) == 0 {
@@ -174,12 +341,20 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		"session_count_after":    nilIfNegative(vectorCountAfter),
 		"full_listing_available": false,
 	}
+	if lifecycleOutbox {
+		vectorOrphanCheck["policy"] = "durable_outbox_then_session_vector_count_checked"
+		vectorOrphanCheck["known_delete_id_count"] = nil
+	}
 	if s.Vector != nil {
 		fullAudit := s.adminVectorOrphanAudit(ctx, sid, false)
 		if available, _ := fullAudit["full_listing_available"].(bool); available {
 			fullAudit["status"] = "full"
 			fullAudit["policy"] = "post_rollback_full_chromadb_listing_compared_with_mariadb_canonical_rows"
-			fullAudit["known_delete_id_count"] = len(vectorIDs)
+			if lifecycleOutbox {
+				fullAudit["known_delete_id_count"] = nil
+			} else {
+				fullAudit["known_delete_id_count"] = len(vectorIDs)
+			}
 			fullAudit["session_count_before"] = nilIfNegative(vectorCountBefore)
 			fullAudit["session_count_after"] = nilIfNegative(vectorCountAfter)
 			vectorOrphanCheck = fullAudit
@@ -207,9 +382,56 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 	status := "ok"
 	note := "rollback executed"
+	hudStatus := "completed"
+	hudSeverity := "info"
+	hudTitleKey := "turn_hud.notice.delete_confirmed"
+	hudMessageKey := "turn_hud.notice.delete_confirmed_detail"
+	hudNoticeCode := "ASSISTANT_OUTPUT_DELETE_CONFIRMED"
 	if len(delErrs) > 0 {
 		status = "partial_error"
 		note = "rollback executed with partial errors"
+		hudStatus = "failed"
+		hudSeverity = "error"
+		hudTitleKey = "turn_hud.notice.delete_sync_failed"
+		hudMessageKey = "turn_hud.error.delete_sync_partial"
+		hudNoticeCode = "ASSISTANT_OUTPUT_DELETE_SYNC_PARTIAL"
+	}
+	var rollbackHUD any
+	if reqSource == "auto" || reqSource == "auto_rollback" || reqSource == "manual" {
+		requestID := fmt.Sprintf("rollback:%s:%d:%s", sid, turnIndex, reqSource)
+		view := s.turnWorkflowHUDOperationNotice(
+			requestID,
+			sid,
+			turnIndex,
+			hudStatus,
+			hudSeverity,
+			hudTitleKey,
+			hudMessageKey,
+			hudNoticeCode,
+		)
+		derivedKeys := make([]string, 0, len(tables))
+		for _, table := range tables {
+			if table.name != "chat_logs" && table.name != "effective_inputs" {
+				derivedKeys = append(derivedKeys, table.name)
+			}
+		}
+		derivedKeys = append(derivedKeys, "reference_runtime", "narrative_current_state_restore")
+		facts := []turnWorkflowHUDFact{
+			rollbackHUDDeletionFact("raw_persistence", "canonical_store", deletions, []string{"chat_logs", "effective_inputs"}),
+			rollbackHUDDeletionFact("derived_memory", "canonical_store", deletions, derivedKeys),
+			rollbackHUDVectorDeletionFact(deletions),
+		}
+		for _, fact := range facts {
+			setTurnWorkflowHUDFactValue(&view, fact)
+			if s.TurnWorkflows != nil {
+				s.TurnWorkflows.setFact(requestID, fact)
+			}
+		}
+		syncTurnWorkflowHUDPresentation(&view)
+		rollbackHUD = view
+		if s.TurnWorkflows != nil {
+			rollbackHUD = s.turnWorkflowHUDSnapshot(requestID)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -243,10 +465,132 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 			"step23_invalidation":              "delete_turn_scoped_support_records_from_from_turn",
 			"rebuild_owner":                    "chroma_shadow_orchestrator",
 		},
-		"deletions": deletions,
-		"errors":    delErrs,
-		"note":      note,
+		"deletions":         deletions,
+		"errors":            delErrs,
+		"turn_workflow_hud": rollbackHUD,
+		"note":              note,
 	})
+}
+
+func rollbackHUDBlockedDeletionFacts() []turnWorkflowHUDFact {
+	facts := []turnWorkflowHUDFact{{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "blocked", Disposition: "dropped",
+		ReasonCode: "source_invalidation_failed", Severity: turnWorkflowHUDSeverityError,
+	}}
+	for _, item := range []struct {
+		key   string
+		owner string
+	}{
+		{key: "raw_persistence", owner: "canonical_store"},
+		{key: "derived_memory", owner: "canonical_store"},
+		{key: "vector_index", owner: "vector_store"},
+	} {
+		facts = append(facts, turnWorkflowHUDFact{
+			Key: item.key, Owner: item.owner, Scope: "current_turn",
+			Status: "blocked", Disposition: "dropped",
+			ReasonCode: "source_invalidation_failed", Severity: turnWorkflowHUDSeverityError,
+		})
+	}
+	return facts
+}
+
+func rollbackHUDDeletionFact(
+	key string,
+	owner string,
+	deletions map[string]any,
+	deletionKeys []string,
+) turnWorkflowHUDFact {
+	fact := turnWorkflowHUDFact{
+		Key: key, Owner: owner, Scope: "current_turn",
+		Status: "unobserved", Disposition: "deferred",
+		ReasonCode: "rollback_lane_unobserved", Severity: turnWorkflowHUDSeverityNotice,
+	}
+	observed := 0
+	failed := 0
+	for _, deletionKey := range deletionKeys {
+		result := mapFromAny(deletions[deletionKey])
+		if len(result) == 0 {
+			continue
+		}
+		observed++
+		ok, typed := result["ok"].(bool)
+		if !typed || !ok {
+			failed++
+		}
+	}
+	switch {
+	case observed == 0:
+		return fact
+	case failed > 0:
+		fact.Status = "partial_error"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_lane_partial_error"
+		fact.Severity = turnWorkflowHUDSeverityError
+	default:
+		fact.Status = "deleted"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_lane_deleted"
+		fact.Severity = turnWorkflowHUDSeverityNotice
+	}
+	return fact
+}
+
+func rollbackHUDVectorDeletionFact(deletions map[string]any) turnWorkflowHUDFact {
+	fact := turnWorkflowHUDFact{
+		Key: "vector_index", Owner: "vector_store", Scope: "current_turn",
+		Status: "unobserved", Disposition: "deferred",
+		ReasonCode: "rollback_vector_unobserved", Severity: turnWorkflowHUDSeverityNotice,
+	}
+	result := mapFromAny(deletions["vectors"])
+	if len(result) == 0 {
+		return fact
+	}
+	if permanent := intFromAny(result["permanent"], 0); permanent > 0 {
+		fact.Status = "partial_error"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_vector_permanent_failure"
+		fact.Severity = turnWorkflowHUDSeverityError
+		fact.Count = intValuePtr(permanent)
+		return fact
+	}
+	if ok, typed := result["ok"].(bool); !typed || !ok {
+		fact.Status = "failed"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_vector_delete_failed"
+		fact.Severity = turnWorkflowHUDSeverityError
+		return fact
+	}
+	if retryable := intFromAny(result["retryable_queued"], 0); retryable > 0 {
+		fact.Status = "queued"
+		fact.Disposition = "deferred"
+		fact.ReasonCode = "rollback_vector_retry_queued"
+		fact.Severity = turnWorkflowHUDSeverityNotice
+		fact.Count = intValuePtr(retryable)
+		return fact
+	}
+	if warning := strings.TrimSpace(extractionStringFromAny(result["warning"])); warning != "" {
+		fact.Status = "skipped"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_vector_unavailable"
+		fact.Severity = turnWorkflowHUDSeverityWarning
+		fact.Count = intValuePtr(0)
+		return fact
+	}
+	count := intFromAny(result["deleted_ids"], intFromAny(result["completed"], 0))
+	fact.Count = intValuePtr(maxInt(0, count))
+	if count == 0 {
+		fact.Status = "empty"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "rollback_vector_empty"
+		fact.Severity = turnWorkflowHUDSeverityNormal
+		return fact
+	}
+	fact.Status = "deleted"
+	fact.Disposition = "dropped"
+	fact.ReasonCode = "rollback_vector_deleted"
+	fact.Severity = turnWorkflowHUDSeverityNotice
+	return fact
 }
 
 func clearReferenceRuntimeCandidatesAfterRollback(ctx context.Context, base store.Store, sid string, fromTurn int) (int, error) {

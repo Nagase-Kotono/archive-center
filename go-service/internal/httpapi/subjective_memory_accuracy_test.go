@@ -37,11 +37,18 @@ func TestSubjectiveEntityMemoryDuplicateReasonIsConservative(t *testing.T) {
 			want:       "duplicate_owner_memory_text",
 		},
 		{
-			name:       "nearby paraphrase with identical grounded evidence",
+			name:       "same source turn and evidence is a replay",
+			turn:       10,
+			memoryText: "Chloe privately concludes that Siwoo concealed the key near the stairs.",
+			evidence:   evidence,
+			want:       "duplicate_source_turn_owner_evidence",
+		},
+		{
+			name:       "later interpretation of identical grounded evidence is retained",
 			turn:       12,
 			memoryText: "Chloe privately concludes that Siwoo concealed the key near the stairs.",
 			evidence:   evidence,
-			want:       "duplicate_nearby_owner_evidence",
+			want:       "",
 		},
 		{
 			name:       "distant event with reused evidence is retained",
@@ -67,16 +74,32 @@ func TestSubjectiveEntityMemoryDuplicateReasonIsConservative(t *testing.T) {
 	}
 }
 
-func TestPrepareTurnCharacterPrivateRecollectionUsesOneMemoryPerCurrentOwner(t *testing.T) {
+func TestPersonaSecretGuardUsesStructuredTagsAcrossLanguages(t *testing.T) {
+	entry := store.PersonaMemoryEntry{
+		MemoryText: "記憶の内容は任意の言語で書かれている。",
+		TagsJSON:   `["protected_secret_kind:world_transfer","secret_guard"]`,
+	}
+	if !personaRecollectionSecretGuardActive([]store.PersonaMemoryEntry{entry}) {
+		t.Fatal("structured secret tags must activate the guard without prose keyword matching")
+	}
+
+	plain := store.PersonaMemoryEntry{MemoryText: "The word reincarnation appears in an ordinary book title."}
+	if personaRecollectionSecretGuardActive([]store.PersonaMemoryEntry{plain}) {
+		t.Fatal("memory prose alone must not activate a semantic secret classifier")
+	}
+}
+
+func TestPrepareTurnCharacterPrivateRecollectionCoversOwnersBeforeDistinctFill(t *testing.T) {
 	memories := []store.ProtagonistEntityMemory{
-		{ID: 1, OwnerEntityKey: "niv", OwnerEntityName: "Niv", OwnerEntityRole: "npc", MemoryText: "Niv privately remembers the garden promise."},
-		{ID: 4, OwnerEntityKey: "niv", OwnerEntityName: "Niv", OwnerEntityRole: "npc", SourceTurn: 2, MemoryText: "Niv has an older duplicate owner memory."},
+		{ID: 1, OwnerEntityKey: "niv", OwnerEntityName: "Niv", OwnerEntityRole: "npc", Importance10: 9, MemoryText: "Niv privately remembers the garden promise."},
+		{ID: 4, OwnerEntityKey: "niv", OwnerEntityName: "Niv", OwnerEntityRole: "npc", SourceTurn: 2, MemoryText: "Niv remembers the older bridge warning."},
 		{ID: 2, OwnerEntityKey: "ingrid", OwnerEntityName: "Ingrid", OwnerEntityRole: "npc", MemoryText: "Ingrid privately doubts the garden promise."},
 		{ID: 3, OwnerEntityKey: "ashley", OwnerEntityName: "Ashley", OwnerEntityRole: "npc", MemoryText: "Ashley privately fears being overheard."},
+		{ID: 5, OwnerEntityKey: "niv", OwnerEntityName: "Niv", OwnerEntityRole: "npc", MemoryText: "Niv once counted lanterns in the cellar."},
 	}
 
 	trace := filterPrepareTurnEntityRecollections(
-		"Niv and Ingrid discuss Ashley in the garden.",
+		"Niv and Ingrid discuss the garden promise, Ashley fears being overheard, and Niv recalls the older bridge warning.",
 		nil,
 		nil,
 		nil,
@@ -84,21 +107,25 @@ func TestPrepareTurnCharacterPrivateRecollectionUsesOneMemoryPerCurrentOwner(t *
 		nil,
 		&memories,
 	)
-	if len(memories) != 3 {
-		t.Fatalf("selected private recollections = %d, want one for each of three current owners: %#v", len(memories), memories)
+	if len(memories) != 4 {
+		t.Fatalf("selected private recollections = %d, want three-owner coverage before one distinct fill: %#v", len(memories), memories)
 	}
 	if memories[0].OwnerEntityKey != "niv" || memories[1].OwnerEntityKey != "ingrid" || memories[2].OwnerEntityKey != "ashley" {
 		t.Fatalf("private recollection ordering changed unexpectedly: %#v", memories)
+	}
+	if memories[3].OwnerEntityKey != "niv" ||
+		(memories[0].ID != 1 && memories[0].ID != 4) ||
+		(memories[3].ID != 1 && memories[3].ID != 4) ||
+		memories[0].ID == memories[3].ID {
+		t.Fatalf("distinct same-owner fill did not follow owner coverage: %#v", memories)
 	}
 	if trace["character_private_total_cap"] != "final_subjective_relationship_char_budget" {
 		t.Fatalf("character_private_total_cap = %#v, want final char budget ownership", trace["character_private_total_cap"])
 	}
 	dropped, ok := trace["dropped"].([]map[string]any)
-	if !ok || len(dropped) != 1 {
-		t.Fatalf("dropped trace = %#v, want one repeated owner memory", trace["dropped"])
-	}
-	if dropped[0]["owner_entity_key"] != "niv" || dropped[0]["reason"] != "owner_repetition_capped" {
-		t.Fatalf("unexpected owner-cap trace: %#v", dropped[0])
+	if !ok || len(dropped) != 1 || dropped[0]["id"] != int64(5) ||
+		dropped[0]["reason"] != "subjective_memory_irrelevant_to_current_request" {
+		t.Fatalf("unrelated same-owner fill was not rejected: %#v", trace["dropped"])
 	}
 }
 
@@ -183,6 +210,74 @@ func TestRisuPersonaObservationOwnsSubjectiveMemoryRoles(t *testing.T) {
 	if trace["protagonist_count"] != 1 || trace["npc_count"] != 1 {
 		t.Fatalf("role trace = %#v", trace)
 	}
+	if trace["persona_coverage_status"] != "candidate_kept" ||
+		trace["persona_coverage_policy"] != "evidence_eligible_not_unconditional" ||
+		trace["npc_coverage_policy"] != "evidence_eligible_not_required" {
+		t.Fatalf("coverage trace = %#v", trace)
+	}
+}
+
+func TestRisuPersonaSubjectiveCoverageDoesNotInventMissingMemory(t *testing.T) {
+	extraction := map[string]any{"subjective_entity_memories": []any{}}
+	meta := map[string]any{
+		"risu_persona_observation": map[string]any{
+			"contract_version":  "risu_persona_observation.v1",
+			"observation_state": "observed",
+			"source":            "database.selectedPersona",
+			"persona_name":      "Mira",
+		},
+	}
+	resolved, trace := applyRisuPersonaSubjectiveMemoryRoles(extraction, meta)
+	if len(sliceFromAny(resolved["subjective_entity_memories"])) != 0 {
+		t.Fatalf("missing persona perspective was fabricated: %#v", resolved)
+	}
+	if trace["persona_coverage_status"] != "zero_unclassified_no_candidate" {
+		t.Fatalf("zero coverage was not diagnosed conservatively: %#v", trace)
+	}
+}
+
+func TestSubjectiveMemorySaveKeepsExplicitPublicNPCOutOfPrivateSemantics(t *testing.T) {
+	fake := &turnRecordingStore{}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	srv.StoreOpenError = nil
+	extraction := map[string]any{
+		"subjective_entity_memories": []any{
+			map[string]any{
+				"owner_entity_key":  "rowan",
+				"owner_entity_name": "Rowan",
+				"owner_entity_role": "npc",
+				"owner_visibility":  "player_known",
+				"memory_text":       "Rowan openly remembers the meeting.",
+				"evidence_excerpt":  "Rowan openly remembers the meeting",
+			},
+			map[string]any{
+				"owner_entity_key":     "mina",
+				"owner_entity_name":    "Mina",
+				"owner_visibility":     "owner_private",
+				"memory_text":          "Mina remembers the door.",
+				"evidence_excerpt":     "Mina remembers the door",
+				"target_reveal_policy": "unsupported_policy",
+			},
+		},
+	}
+	result := srv.saveCriticExtractionArtifacts(
+		context.Background(), "sess-public-subjective", 5, extraction,
+		"Rowan openly remembers the meeting. Mina remembers the door.", completeTurnEmbeddingConfig{}, time.Unix(1600, 0),
+	)
+	if result.SubjectiveEntityMemories != 2 || len(fake.savedEntityMemories) != 2 {
+		t.Fatalf("subjective collection dropped a structurally complete item: %d/%d %#v", result.SubjectiveEntityMemories, len(fake.savedEntityMemories), result)
+	}
+	stored := fake.savedEntityMemories[0]
+	if stored.OwnerVisibility != "player_known" ||
+		stored.Portability != "portable_subjective_entity_recollection" ||
+		stored.TargetRevealPolicy != "requires_explicit_attachment" {
+		t.Fatalf("explicit public NPC received private semantics: %#v", stored)
+	}
+	private := fake.savedEntityMemories[1]
+	if private.OwnerVisibility != "owner_private" || private.TargetRevealPolicy != "unsupported_policy" {
+		t.Fatalf("story-specific reveal policy was not archived under its owner: %#v", private)
+	}
 }
 
 func TestRisuPersonaObservationRemovesMisclassifiedStoredPersonaFromNPCLane(t *testing.T) {
@@ -211,7 +306,7 @@ func TestRisuPersonaObservationRemovesMisclassifiedStoredPersonaFromNPCLane(t *t
 		t.Fatalf("blocked row ids = %#v, want [17 18]", trace["blocked_row_ids"])
 	}
 	filterPrepareTurnEntityRecollections(
-		"Juno enters the room.",
+		"Juno enters the room and recalls the real NPC memory.",
 		nil,
 		nil,
 		nil,

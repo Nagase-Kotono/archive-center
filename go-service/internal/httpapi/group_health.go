@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -44,6 +43,7 @@ func (s *Server) registerConfigRoutes(mux *http.ServeMux) {
 type healthResponse struct {
 	Status                      string         `json:"status"`
 	Service                     string         `json:"service"`
+	BackendInstanceID           string         `json:"backend_instance_id"`
 	Scope                       string         `json:"scope"`
 	BridgeHealthContractVersion string         `json:"bridge_health_contract_version"`
 	LocalhostDefaultScope       string         `json:"localhost_default_scope"`
@@ -57,6 +57,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Status:                      "ok",
 		Service:                     "archive-center-go",
+		BackendInstanceID:           s.backendInstanceID(),
 		Scope:                       "liveness_only",
 		BridgeHealthContractVersion: "bf13b.v1",
 		LocalhostDefaultScope:       "same_host_local_only",
@@ -82,6 +83,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 type readyResponse struct {
 	Ready                   bool              `json:"ready"`
+	BackendInstanceID       string            `json:"backend_instance_id"`
 	StoreReady              bool              `json:"store_ready"`
 	VectorReady             bool              `json:"vector_ready"`
 	ReferenceVectorReady    bool              `json:"reference_vector_ready"`
@@ -93,8 +95,6 @@ type readyResponse struct {
 	Checks                  map[string]string `json:"checks"`
 	Timestamp               string            `json:"timestamp"`
 }
-
-const referenceReadinessProbeTimeout = 500 * time.Millisecond
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{}
@@ -135,9 +135,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	vectorReady := false
 	vectorDegraded := false
 	if s.Cfg.ChromaEnabled && strings.TrimSpace(s.Cfg.ChromaEndpoint) != "" && s.VectorOpenError == nil {
-		probeCtx, cancelProbe := context.WithTimeout(r.Context(), 5*time.Second)
-		health, healthErr := s.Vector.Health(probeCtx)
-		cancelProbe()
+		health, healthErr := s.Vector.Health(r.Context())
 		if healthErr == nil && strings.TrimSpace(health.Status) == "ok" && health.ModelReady {
 			checks["chromadb_vector"] = "enabled"
 			vectorReady = true
@@ -198,9 +196,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		checks["reference_chromadb_vector_error"] = "reference vector store is not initialized"
 		referenceVectorDegraded = true
 	case s.Cfg.ChromaEnabled && strings.TrimSpace(s.Cfg.ChromaEndpoint) != "":
-		probeCtx, cancelProbe := context.WithTimeout(r.Context(), referenceReadinessProbeTimeout)
-		health, healthErr := s.ReferenceVector.Health(probeCtx)
-		cancelProbe()
+		health, healthErr := s.ReferenceVector.Health(r.Context())
 		if healthErr == nil && strings.TrimSpace(health.Status) == "ok" && health.ModelReady {
 			checks["reference_chromadb_vector"] = "enabled"
 			checks["reference_chromadb_vector_error"] = "none"
@@ -242,8 +238,28 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		checks["ready_blocker"] = "store_open_error"
 		writeJSON(w, http.StatusServiceUnavailable, readyResponse{
 			Ready:                   false,
+			BackendInstanceID:       s.backendInstanceID(),
 			StoreReady:              false,
 			VectorReady:             vectorReady,
+			ReferenceVectorReady:    referenceVectorReady,
+			ReferenceVectorDegraded: referenceVectorDegraded,
+			RuntimeProfile:          string(s.Cfg.RuntimeProfile),
+			VectorMode:              string(s.Cfg.VectorMode),
+			Degraded:                true,
+			Mode:                    string(s.Cfg.Mode),
+			Checks:                  checks,
+			Timestamp:               time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	if s.Cfg.VectorRequiresEndpoint() && !vectorReady {
+		checks["ready_blocker"] = "required_vector_not_ready"
+		writeJSON(w, http.StatusServiceUnavailable, readyResponse{
+			Ready:                   false,
+			BackendInstanceID:       s.backendInstanceID(),
+			StoreReady:              true,
+			VectorReady:             false,
 			ReferenceVectorReady:    referenceVectorReady,
 			ReferenceVectorDegraded: referenceVectorDegraded,
 			RuntimeProfile:          string(s.Cfg.RuntimeProfile),
@@ -261,6 +277,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		checks["mode_guard"] = fmt.Sprintf("mode %q requires MariaDB authority and the selected vector policy to be satisfied", s.Cfg.Mode)
 		writeJSON(w, http.StatusServiceUnavailable, readyResponse{
 			Ready:                   false,
+			BackendInstanceID:       s.backendInstanceID(),
 			StoreReady:              true,
 			VectorReady:             vectorReady,
 			ReferenceVectorReady:    referenceVectorReady,
@@ -284,6 +301,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, readyResponse{
 		Ready:                   true,
+		BackendInstanceID:       s.backendInstanceID(),
 		StoreReady:              true,
 		VectorReady:             vectorReady,
 		ReferenceVectorReady:    referenceVectorReady,
@@ -615,6 +633,7 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	updated := s.updateRuntimeConfig(body)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":               "ok",
+		"backend_instance_id":  s.backendInstanceID(),
 		"updated":              updated,
 		"source":               "runtime_config",
 		"persisted":            false,

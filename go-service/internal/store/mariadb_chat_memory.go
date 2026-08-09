@@ -20,33 +20,32 @@ func (m *mariadbStore) SaveChatLog(ctx context.Context, log *ChatLog) error {
 	if err := m.ensureDB(); err != nil {
 		return err
 	}
-	role := strings.ToLower(strings.TrimSpace(log.Role))
-	if strings.TrimSpace(log.ChatSessionID) != "" && log.TurnIndex >= 0 && role != "" {
-		var existingID int64
-		var existingContent string
-		err := m.db.QueryRowContext(ctx, `
-			SELECT id, content
-			FROM chat_logs
-			WHERE chat_session_id = ? AND turn_index = ? AND LOWER(TRIM(role)) = ?
-			ORDER BY id ASC
-			LIMIT 1
-		`, log.ChatSessionID, log.TurnIndex, role).Scan(&existingID, &existingContent)
-		if err == nil {
-			if strings.TrimSpace(existingContent) == strings.TrimSpace(log.Content) {
-				log.ID = existingID
-				return nil
-			}
-			return fmt.Errorf("chat log role conflict for session %s turn %d role %s", log.ChatSessionID, log.TurnIndex, role)
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
+	if log == nil {
+		return errors.New("chat log is required")
 	}
-	_, err := m.db.ExecContext(ctx, `
+	role := strings.ToLower(strings.TrimSpace(log.Role))
+	log.Role = role
+	if _, err := m.db.ExecContext(ctx, `
 		INSERT INTO chat_logs (chat_session_id, turn_index, role, content, created_at)
 		VALUES (?, ?, ?, ?, ?)
-	`, log.ChatSessionID, log.TurnIndex, log.Role, log.Content, nonZeroTime(log.CreatedAt))
-	return err
+		ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
+	`, log.ChatSessionID, log.TurnIndex, role, log.Content, nonZeroTime(log.CreatedAt)); err != nil {
+		return err
+	}
+
+	var existingContent string
+	if err := m.db.QueryRowContext(ctx, `
+		SELECT id, content
+		FROM chat_logs
+		WHERE chat_session_id = ? AND turn_index = ? AND role = ?
+		LIMIT 1
+	`, log.ChatSessionID, log.TurnIndex, role).Scan(&log.ID, &existingContent); err != nil {
+		return err
+	}
+	if strings.TrimSpace(existingContent) != strings.TrimSpace(log.Content) {
+		return fmt.Errorf("chat log role conflict for session %s turn %d role %s", log.ChatSessionID, log.TurnIndex, role)
+	}
+	return nil
 }
 
 func (m *mariadbStore) ListChatLogs(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]ChatLog, error) {
@@ -686,16 +685,18 @@ func (m *mariadbStore) ListAuditLogs(ctx context.Context, chatSessionID string, 
 	if err := m.ensureDB(); err != nil {
 		return nil, err
 	}
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := m.db.QueryContext(ctx, `
+	querySQL := `
 		SELECT id, created_at, event_type, chat_session_id, target_type, target_id, summary, details_json, source
 		FROM audit_logs
 		WHERE (? = '' OR chat_session_id = ?) AND (? = '' OR event_type = ?)
 		ORDER BY created_at DESC, id DESC
-		LIMIT ?
-	`, strings.TrimSpace(chatSessionID), chatSessionID, strings.TrimSpace(eventType), eventType, limit)
+	`
+	args := []any{strings.TrimSpace(chatSessionID), chatSessionID, strings.TrimSpace(eventType), eventType}
+	if limit > 0 {
+		querySQL += "\nLIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := m.db.QueryContext(ctx, querySQL, args...)
 	if err != nil {
 		return nil, err
 	}

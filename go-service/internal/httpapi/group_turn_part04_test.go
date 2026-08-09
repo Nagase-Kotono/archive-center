@@ -15,19 +15,20 @@ import (
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
-func TestCompleteTurnCriticProviderFailureRetriesWithRedactedInput(t *testing.T) {
+func TestCompleteTurnCriticProviderFailureRetriesWithUnchangedCurrentTurn(t *testing.T) {
 	fake := &turnRecordingStore{}
 	cfg := config.Default()
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
 	srv := NewServer(cfg)
 	srv.Store = fake
 	srv.StoreOpenError = nil
+	srv.RuntimeConfig.LLMRetryCount = 1
 
 	extractionBytes, _ := json.Marshal(map[string]any{
 		"turn_summary":      "Mina and Rowan crossed an intimate threshold while Rowan stayed reassuring.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"Rowan stayed reassuring."},
-		"kg_triples":        []any{map[string]any{"subject": "Rowan", "predicate": "reassures", "object": "Mina"}},
+		"kg_triples":        []any{testEntityScalarKG("state_fact", "Rowan", "character", "stayed", "reassuring", "state", "Rowan stayed reassuring.")},
 	})
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "critic-model",
@@ -71,10 +72,11 @@ func TestCompleteTurnCriticProviderFailureRetriesWithRedactedInput(t *testing.T)
 		"user_input":        "Mina asks Rowan to be gentle.",
 		"assistant_content": "Rowan stayed reassuring. The intimate scene involved penetration.",
 		"client_meta": map[string]any{"critic": map[string]any{
-			"api_key":  "sk-redacted-retry",
-			"endpoint": "https://api.example.com/v1",
-			"model":    "critic-model",
-			"provider": "openai",
+			"api_key":    "sk-redacted-retry",
+			"endpoint":   "https://api.example.com/v1",
+			"model":      "critic-model",
+			"provider":   "openai",
+			"timeout_ms": 45000,
 		}},
 	}
 	raw, _ := json.Marshal(body)
@@ -92,19 +94,14 @@ func TestCompleteTurnCriticProviderFailureRetriesWithRedactedInput(t *testing.T)
 	if callCount != 2 {
 		t.Fatalf("critic call count = %d, want 2", callCount)
 	}
-	if strings.Contains(strings.ToLower(secondPrompt), "penetration") || !strings.Contains(secondPrompt, "redacted for critic retry") {
-		t.Fatalf("second critic prompt was not redacted as expected: %s", secondPrompt)
+	if !strings.Contains(strings.ToLower(secondPrompt), "penetration") || strings.Contains(secondPrompt, "redacted for critic retry") {
+		t.Fatalf("second critic prompt changed the completed current turn: %s", secondPrompt)
 	}
 	if resp["critic_triggered"] != true {
-		t.Fatalf("critic_triggered = %v, want true after redacted retry: %+v", resp["critic_triggered"], resp)
+		t.Fatalf("critic_triggered = %v, want true after unchanged retry: %+v", resp["critic_triggered"], resp)
 	}
 	if resp["derived_artifacts_saved"].(float64) < 3 {
 		t.Fatalf("derived_artifacts_saved = %v, want memory/evidence/KG after retry: %+v", resp["derived_artifacts_saved"], resp)
-	}
-	trace, _ := resp["trace_handoff"].(map[string]any)
-	criticTrace, _ := trace["critic_trace"].(map[string]any)
-	if _, ok := criticTrace["provider_retry"].(map[string]any); !ok {
-		t.Fatalf("provider_retry trace missing: %+v", criticTrace)
 	}
 }
 
@@ -133,7 +130,7 @@ func TestCompleteTurnEmbeddingProviderFailureReportsWarning(t *testing.T) {
 			Header:     make(http.Header),
 			Body: io.NopCloser(strings.NewReader(`{
 				"model":"critic-model",
-				"choices":[{"message":{"content":"{\"turn_summary\":\"Mina and Rowan commit to the blue key.\",\"importance_score\":7,\"evidence_excerpts\":[\"blue key safe\"],\"kg_triples\":[{\"subject\":\"Rowan\",\"predicate\":\"protects\",\"object\":\"blue key\"}],\"entities\":{\"characters\":[{\"name\":\"Rowan\"}],\"items\":[{\"name\":\"blue key\"}]}}"}}]
+				"choices":[{"message":{"content":"{\"turn_summary\":\"Mina and Rowan commit to the blue key.\",\"importance_score\":7,\"evidence_excerpts\":[\"blue key safe\"],\"kg_triples\":[{\"semantic_class\":\"event_fact\",\"subject\":\"Rowan\",\"predicate\":\"protects\",\"object\":\"blue key\"}],\"entities\":{\"characters\":[{\"name\":\"Rowan\"}],\"items\":[{\"name\":\"blue key\"}]}}"}}]
 			}`)),
 		}, nil
 	})}
@@ -148,16 +145,18 @@ func TestCompleteTurnEmbeddingProviderFailureReportsWarning(t *testing.T) {
 		"assistant_content": "Rowan promises to keep the blue key safe.",
 		"client_meta": map[string]any{
 			"critic": map[string]any{
-				"api_key":  "sk-critic-ok",
-				"endpoint": "https://api.example.com/v1",
-				"model":    "critic-model",
-				"provider": "openai",
+				"api_key":    "sk-critic-ok",
+				"endpoint":   "https://api.example.com/v1",
+				"model":      "critic-model",
+				"provider":   "openai",
+				"timeout_ms": 45000,
 			},
 			"embedding": map[string]any{
-				"api_key":  "sk-embedding-fail",
-				"endpoint": "https://api.example.com/v1/embeddings",
-				"model":    "embedding-model",
-				"provider": "openai",
+				"api_key":    "sk-embedding-fail",
+				"endpoint":   "https://api.example.com/v1/embeddings",
+				"model":      "embedding-model",
+				"provider":   "openai",
+				"timeout_ms": 30000,
 			},
 		},
 	}
@@ -200,11 +199,12 @@ func TestCompleteTurnOOCGuardSkipsWrites(t *testing.T) {
 	srv := NewServer(cfg)
 	srv.Store = fake
 	srv.StoreOpenError = nil
+	srv.TurnWorkflows.begin("request-ooc", "sess-ooc", 1)
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	body := `{"chat_session_id":"sess-ooc","turn_index":1,"user_input":"OOC: please change the plugin setting","assistant_content":"Sure, I will help.","context_messages":[]}`
+	body := `{"chat_session_id":"sess-ooc","turn_index":1,"user_input":"please change the plugin setting","assistant_content":"Sure, I will help.","context_messages":[],"client_meta":{"turn_workflow_request_id":"request-ooc","risu_request_observation":{"contract_version":"risu_request_observation.v1","ooc_class_state":"observed","ooc_class":"ooc"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -220,12 +220,34 @@ func TestCompleteTurnOOCGuardSkipsWrites(t *testing.T) {
 	if resp["save_error"] != "skipped_by_ooc_guard" || resp["critic_triggered"] != false {
 		t.Fatalf("unexpected OOC response: %+v", resp)
 	}
+	hud, _ := resp["turn_workflow_hud"].(map[string]any)
+	if hud["contract_version"] != turnWorkflowHUDContractVersion || hud["notice_kind"] != "ooc" ||
+		hud["severity"] != turnWorkflowHUDSeverityNotice || hud["dismissal_policy"] != turnWorkflowHUDDismissCardOrX {
+		t.Fatalf("unexpected OOC HUD: %+v response=%+v", hud, resp)
+	}
+	facts, _ := hud["facts"].([]any)
+	if len(facts) != len(turnWorkflowHUDFactTemplates) {
+		t.Fatalf("OOC HUD facts=%+v", facts)
+	}
 	if len(fake.savedChatLogs) != 0 || len(fake.savedMemories) != 0 || len(fake.savedEvidence) != 0 || len(fake.savedKGTriples) != 0 {
 		t.Fatalf("OOC guard should skip all writes, logs=%d memories=%d evidence=%d kg=%d", len(fake.savedChatLogs), len(fake.savedMemories), len(fake.savedEvidence), len(fake.savedKGTriples))
 	}
 }
 
-func TestCompleteTurnKoreanOOCGuardSkipsWrites(t *testing.T) {
+func TestCompleteTurnOOCGuardDoesNotInferFromTextOrPriorContext(t *testing.T) {
+	if shouldApplyCompleteTurnOOCGuard(map[string]any{
+		"risu_request_observation": map[string]any{
+			"contract_version":   "risu_request_observation.v1",
+			"ooc_class_state":    "not_exposed",
+			"request_type":       "model",
+			"request_type_state": "observed",
+		},
+	}) {
+		t.Fatal("prior OOC context incorrectly cancelled the current accepted source")
+	}
+}
+
+func TestCompleteTurnOOCTextWithoutHostObservationDoesNotSkipWrites(t *testing.T) {
 	fake := &turnRecordingStore{}
 	cfg := config.Default()
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
@@ -245,8 +267,8 @@ func TestCompleteTurnKoreanOOCGuardSkipsWrites(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if len(fake.savedChatLogs) != 0 || len(fake.savedMemories) != 0 || len(fake.savedEvidence) != 0 || len(fake.savedKGTriples) != 0 {
-		t.Fatalf("Korean OOC guard should skip all writes, logs=%d memories=%d evidence=%d kg=%d", len(fake.savedChatLogs), len(fake.savedMemories), len(fake.savedEvidence), len(fake.savedKGTriples))
+	if len(fake.savedChatLogs) == 0 {
+		t.Fatal("content-only OOC marker incorrectly skipped raw persistence")
 	}
 }
 
@@ -275,7 +297,7 @@ func TestCompleteTurnStructuredCanonicalContentDoesNotSkipDerivedIngest(t *testi
 		"turn_index":        1,
 		"user_input":        "[Narrative Guide]\nScene Mandate: keep the mood stable\nForbidden Moves:\n- sudden battle",
 		"assistant_content": "Response Template\n{{char}} should answer in the requested style.",
-		"client_meta":       map[string]any{"critic": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "critic-model", "provider": "openai"}},
+		"client_meta":       map[string]any{"critic": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "critic-model", "provider": "openai", "timeout_ms": 45000}},
 	}
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader(raw))
@@ -504,8 +526,8 @@ func TestPrepareTurnStoreBackedAssembly(t *testing.T) {
 		t.Fatalf("trace_summary is not an object")
 	}
 
-	if trace["reads_ok"] != float64(14) {
-		t.Errorf("reads_ok = %v, want 14", trace["reads_ok"])
+	if trace["reads_ok"] != float64(15) {
+		t.Errorf("reads_ok = %v, want 15", trace["reads_ok"])
 	}
 	if trace["memory_count"] != float64(2) {
 		t.Errorf("memory_count = %v, want 2", trace["memory_count"])
@@ -596,8 +618,11 @@ func TestPrepareTurnStoreBackedAssembly(t *testing.T) {
 	if supervisorPack["prompt_source"] != "not_configured" {
 		t.Errorf("supervisor_input_pack.prompt_source = %v, want not_configured", supervisorPack["prompt_source"])
 	}
-	if suffix, _ := supervisorPack["final_guidance_suffix"].(string); !strings.Contains(suffix, "Go R1 Supervisor Read Shadow") {
-		t.Errorf("final_guidance_suffix missing read-shadow marker: %q", suffix)
+	promptPlan := strings.Join(stringSliceFromAny(supervisorPack["prompt_plan"]), " ")
+	if !strings.Contains(promptPlan, "supervisor_support_packet") ||
+		strings.Contains(promptPlan, "persistent_guidance") ||
+		strings.Contains(promptPlan, "supervisor_prompt.txt") {
+		t.Errorf("supervisor prompt plan retained read-shadow guidance: %q", promptPlan)
 	}
 
 	criticPack, ok := resp["critic_input_pack"].(map[string]any)
@@ -986,17 +1011,14 @@ func TestPrepareTurnPersonaRecollectionSupportLane(t *testing.T) {
 	if !strings.Contains(injectionText, "[Subjective Memories and Relationships]") {
 		t.Fatalf("injection_text missing persona recollection: %q", injectionText)
 	}
-	if strings.Contains(injectionText, "brass key") {
-		t.Fatalf("injection_text leaked protected persona recollection content: %q", injectionText)
+	if !strings.Contains(injectionText, "Siwoo remembers that Chloe hid the brass key behind the cracked mirror in the previous loop.") {
+		t.Fatalf("injection_text omitted protected persona recollection content: %q", injectionText)
 	}
 	if !strings.Contains(injectionText, "Secret Guard") || !strings.Contains(injectionText, "protagonist-only private intuition") || !strings.Contains(injectionText, "Never reveal its origin") {
 		t.Fatalf("injection_text missing persona secret guard: %q", injectionText)
 	}
-	if strings.Contains(injectionText, "previous loop") || strings.Contains(injectionText, "regressor") || strings.Contains(injectionText, "regression") || strings.Contains(injectionText, "loop") {
-		t.Fatalf("injection_text leaked explicit loop secret instead of masked protagonist-private hint: %q", injectionText)
-	}
 	if !strings.Contains(injectionText, "Protected hint") {
-		t.Fatalf("injection_text missing masked persona secret hint: %q", injectionText)
+		t.Fatalf("injection_text missing protected persona secret hint: %q", injectionText)
 	}
 	inputContextText, _ := resp["input_context_text"].(string)
 	if strings.Contains(inputContextText, "[Subjective Memories and Relationships]") || strings.Contains(inputContextText, "support-only private recollection") {

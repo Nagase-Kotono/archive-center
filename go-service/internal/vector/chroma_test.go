@@ -11,6 +11,51 @@ import (
 	"testing"
 )
 
+func TestChromaExactDocumentReadUsesRequestedIDsOnly(t *testing.T) {
+	var getBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/collections/archive_center_vectors"):
+			_, _ = w.Write([]byte(`{"id":"collection-1","name":"archive_center_vectors"}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/collections/collection-1/get"):
+			if err := json.NewDecoder(r.Body).Decode(&getBody); err != nil {
+				t.Fatalf("decode exact get: %v", err)
+			}
+			_, _ = w.Write([]byte(`{
+				"ids":["memory:session:7"],
+				"documents":["verified memory"],
+				"metadatas":[{"chat_session_id":"session","tier":"memory"}]
+			}`))
+		default:
+			http.Error(w, r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	raw, err := NewChromaStore(ts.URL, "archive_center_vectors", "/api/v2")
+	if err != nil {
+		t.Fatalf("NewChromaStore: %v", err)
+	}
+	reader, ok := raw.(ExactDocumentReader)
+	if !ok {
+		t.Fatal("Chroma store does not implement ExactDocumentReader")
+	}
+	documents, err := reader.GetDocuments(context.Background(), []string{"memory:session:7", "memory:session:7", " "})
+	if err != nil {
+		t.Fatalf("GetDocuments: %v", err)
+	}
+	if len(documents) != 1 || documents[0].ID != "memory:session:7" || documents[0].DocumentText != "verified memory" {
+		t.Fatalf("unexpected exact readback: %+v", documents)
+	}
+	ids, _ := getBody["ids"].([]any)
+	include, _ := getBody["include"].([]any)
+	if len(ids) != 1 || ids[0] != "memory:session:7" ||
+		!reflect.DeepEqual(include, []any{"metadatas", "documents"}) {
+		t.Fatalf("exact get body = %#v", getBody)
+	}
+}
+
 func TestChromaExactQueryPreservesRawRankDistanceAndQuerySensitivity(t *testing.T) {
 	var queryBodies []map[string]any
 	var upsertBody map[string]any
@@ -208,8 +253,8 @@ func TestChromaStoreUpsertSearchCountDelete(t *testing.T) {
 		}
 	}
 	state.mu.Unlock()
-	if queryCandidateLimit != 12 {
-		t.Fatalf("query n_results = %d, want overfetch 12 for reranking", queryCandidateLimit)
+	if queryCandidateLimit != 3 {
+		t.Fatalf("query n_results = %d, want caller-requested limit 3", queryCandidateLimit)
 	}
 
 	total, err := store.Count(ctx, "")
@@ -290,13 +335,19 @@ func TestChromaStoreReranksReturnedCandidatesByActualCosine(t *testing.T) {
 
 func TestChromaStoreResetAllDeletesCollection(t *testing.T) {
 	var got []string
+	deleted := false
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.Method+" "+r.URL.Path)
 		if r.Method == http.MethodGet && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors" {
+			if deleted {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
 			_, _ = w.Write([]byte(`{"id":"collection-1","name":"archive_center_vectors"}`))
 			return
 		}
-		if r.Method == http.MethodDelete && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/collection-1" {
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors" {
+			deleted = true
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -317,7 +368,47 @@ func TestChromaStoreResetAllDeletesCollection(t *testing.T) {
 	}
 	want := []string{
 		"GET /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
+		"DELETE /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
+		"GET /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("requests = %#v, want %#v", got, want)
+	}
+}
+
+func TestChromaStoreResetAllRejectsFallback404WhenCollectionStillExists(t *testing.T) {
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors":
+			_, _ = w.Write([]byte(`{"id":"collection-1","name":"archive_center_vectors"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors":
+			http.Error(w, "name delete failed", http.StatusInternalServerError)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v2/tenants/default_tenant/databases/default_database/collections/collection-1":
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			http.Error(w, r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	raw, err := NewChromaStore(ts.URL, "archive_center_vectors", "/api/v2")
+	if err != nil {
+		t.Fatalf("NewChromaStore: %v", err)
+	}
+	resetter, ok := raw.(CollectionResetter)
+	if !ok {
+		t.Fatal("chroma store should implement CollectionResetter")
+	}
+	if err := resetter.ResetAll(context.Background()); err == nil {
+		t.Fatal("ResetAll succeeded even though fallback DELETE 404 left the named collection")
+	}
+	want := []string{
+		"GET /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
+		"DELETE /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
 		"DELETE /api/v2/tenants/default_tenant/databases/default_database/collections/collection-1",
+		"GET /api/v2/tenants/default_tenant/databases/default_database/collections/archive_center_vectors",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("requests = %#v, want %#v", got, want)

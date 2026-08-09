@@ -35,18 +35,15 @@ func TestSourceDiscoveryRejectsPrivateAndSecretURLs(t *testing.T) {
 }
 
 func TestSourceDiscoveryLLMTimeoutPreservesConfiguredValue(t *testing.T) {
-	if got := sourceDiscoveryLLMTimeout(180000); got != 180*time.Second {
-		t.Fatalf("timeout=%v", got)
+	if got, err := sourceDiscoveryLLMTimeout(180000); err != nil || got != 180*time.Second {
+		t.Fatalf("timeout=%v err=%v", got, err)
 	}
-	if got := sourceDiscoveryLLMTimeout(0); got != 60*time.Second {
-		t.Fatalf("default timeout=%v", got)
+	if got, err := sourceDiscoveryLLMTimeout(0); err != nil || got != 0 {
+		t.Fatalf("caller-owned timeout=%v err=%v", got, err)
 	}
 	failure := sourceCandidateExtractionFailure(fmt.Errorf("Post %q: %w", "https://provider.example/api/chat", context.DeadlineExceeded))
 	if failure["code"] != "candidate_extraction_timeout" {
 		t.Fatalf("failure=%#v", failure)
-	}
-	if sourceDiscoveryOperationTimeout != 9*time.Minute {
-		t.Fatalf("operation timeout=%v", sourceDiscoveryOperationTimeout)
 	}
 }
 
@@ -546,9 +543,30 @@ func TestSourceCandidateExtractionRetriesMalformedJSONOnce(t *testing.T) {
 	}}}
 	candidates, _, trace, err := runSourceCandidateExtraction(context.Background(), completeTurnLLMConfig{
 		Provider: "openai", APIKey: "fixture-key", Endpoint: provider.URL, Model: "fixture", TimeoutMs: 5000,
+		RetryBudget: newLLMRetryBudget(1),
 	}, store.SourceDiscoveryInput{WorkQuery: "Neutral"}, result)
 	if err != nil || calls != 2 || len(candidates) != 1 || trace["format_retry_count"] != 1 {
 		t.Fatalf("calls=%d candidates=%#v trace=%#v err=%v", calls, candidates, trace, err)
+	}
+}
+
+func TestSourceCandidateExtractionMalformedJSONRespectsZeroRetryBudget(t *testing.T) {
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"content": "not json"}}}})
+	}))
+	defer provider.Close()
+	result := map[string]any{"section_candidates": []any{map[string]any{
+		"source_url": "https://reference.example/entities/mina", "locator": map[string]any{"type": "p", "value": "1"}, "excerpt": "Mina is the archivist.",
+	}}}
+	_, _, _, err := runSourceCandidateExtraction(context.Background(), completeTurnLLMConfig{
+		Provider: "openai", APIKey: "fixture-key", Endpoint: provider.URL, Model: "fixture", TimeoutMs: 5000,
+		RetryBudget: newLLMRetryBudget(0),
+	}, store.SourceDiscoveryInput{WorkQuery: "Neutral"}, result)
+	if err == nil || calls != 1 {
+		t.Fatalf("calls=%d err=%v, want one failed attempt without format repair", calls, err)
 	}
 }
 
@@ -970,7 +988,7 @@ func TestOllamaSourceSearchAgentRequiresModelAndToolCall(t *testing.T) {
 	}
 }
 
-func TestOllamaSourceSearchAgentBoundsToolCalls(t *testing.T) {
+func TestOllamaSourceSearchAgentCapsMultipleToolCallsAtAdvertisedBudget(t *testing.T) {
 	searchCalls := 0
 	oldClient := proxyHTTPClient
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -999,7 +1017,7 @@ func TestOllamaSourceSearchAgentBoundsToolCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	if searchCalls != ollamaSourceSearchMaxToolCalls || len(results) != 1 {
-		t.Fatalf("searchCalls=%d results=%#v", searchCalls, results)
+		t.Fatalf("searchCalls=%d want=%d results=%#v", searchCalls, ollamaSourceSearchMaxToolCalls, results)
 	}
 }
 

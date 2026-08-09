@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 const defaultChromaCollection = "archive_center_vectors"
@@ -38,7 +37,7 @@ type chromaCollection struct {
 // ChromaDB is support-only in Archive Center 2.0; MariaDB remains canonical
 // truth authority.
 func NewChromaStore(endpoint, collectionName, apiPath string) (VectorStore, error) {
-	return NewChromaStoreWithHTTPClient(endpoint, collectionName, apiPath, &http.Client{Timeout: 15 * time.Second})
+	return NewChromaStoreWithHTTPClient(endpoint, collectionName, apiPath, &http.Client{})
 }
 
 func NewChromaStoreWithHTTPClient(endpoint, collectionName, apiPath string, client *http.Client) (VectorStore, error) {
@@ -58,7 +57,7 @@ func NewChromaStoreWithHTTPClient(endpoint, collectionName, apiPath string, clie
 		apiPath = "/api/v2"
 	}
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = &http.Client{}
 	}
 	return &chromaStore{
 		endpoint:       endpoint,
@@ -79,13 +78,10 @@ func (s *chromaStore) Search(ctx context.Context, sessionID string, vector []flo
 	if limit <= 0 {
 		limit = 5
 	}
-	candidateLimit := limit * 4
-	if candidateLimit < 12 {
-		candidateLimit = 12
-	}
-	if candidateLimit > 40 {
-		candidateLimit = 40
-	}
+	// The caller owns the requested recall count. An unrelated fixed
+	// overfetch window can both hide requested results at larger TopK values
+	// and make observed behavior depend on an arbitrary wrapper constant.
+	candidateLimit := limit
 	body := map[string]any{
 		"query_embeddings": [][]float32{vector},
 		"n_results":        candidateLimit,
@@ -340,6 +336,54 @@ func (s *chromaStore) DeleteDocuments(ctx context.Context, ids []string) error {
 	return err
 }
 
+func (s *chromaStore) GetDocuments(ctx context.Context, ids []string) ([]VectorDocument, error) {
+	clean := make([]string, 0, len(ids))
+	seen := map[string]bool{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		clean = append(clean, id)
+	}
+	if len(clean) == 0 {
+		return []VectorDocument{}, nil
+	}
+	ref, err := s.ensureCollection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{
+		"ids":     clean,
+		"include": []string{"metadatas", "documents"},
+	}
+	var out struct {
+		IDs       []string         `json:"ids"`
+		Documents []string         `json:"documents"`
+		Metadatas []map[string]any `json:"metadatas"`
+	}
+	if _, err := s.doJSON(ctx, http.MethodPost, s.collectionOperationPath(ref, "get"), body, &out, http.StatusOK); err != nil {
+		return nil, err
+	}
+	docs := make([]VectorDocument, 0, len(out.IDs))
+	for i, id := range out.IDs {
+		if !seen[strings.TrimSpace(id)] {
+			continue
+		}
+		meta := map[string]any{}
+		if i < len(out.Metadatas) && out.Metadatas[i] != nil {
+			meta = out.Metadatas[i]
+		}
+		text := ""
+		if i < len(out.Documents) {
+			text = out.Documents[i]
+		}
+		docs = append(docs, vectorDocumentFromChroma(id, text, meta))
+	}
+	return docs, nil
+}
+
 func (s *chromaStore) ListDocuments(ctx context.Context, sessionID string) ([]VectorDocument, error) {
 	ref, err := s.ensureCollection(ctx)
 	if err != nil {
@@ -396,15 +440,35 @@ func (s *chromaStore) ResetAll(ctx context.Context) error {
 			ref = strings.TrimSpace(s.collectionName)
 		}
 	}
-	status, err := s.doJSON(ctx, http.MethodDelete, s.collectionLookupPath(ref), nil, nil,
-		http.StatusOK, http.StatusAccepted, http.StatusNoContent, http.StatusNotFound)
-	if err == nil || status == http.StatusNotFound {
+	deleteRef := ref
+	if s.usesV2API() {
+		// ChromaDB v2 collection deletion is name-addressed. Some releases
+		// return success for an ID-addressed DELETE without removing anything.
+		deleteRef = strings.TrimSpace(s.collectionName)
+	}
+	deleteAndVerify := func(target string) (int, error) {
+		status, err := s.doJSON(ctx, http.MethodDelete, s.collectionLookupPath(target), nil, nil,
+			http.StatusOK, http.StatusAccepted, http.StatusNoContent, http.StatusNotFound)
+		if err != nil {
+			return status, err
+		}
+		verifyStatus, verifyErr := s.doJSON(ctx, http.MethodGet, s.collectionLookupPath(s.collectionName), nil, nil,
+			http.StatusOK, http.StatusNotFound)
+		if verifyErr != nil {
+			return verifyStatus, verifyErr
+		}
+		if verifyStatus != http.StatusNotFound {
+			return verifyStatus, fmt.Errorf("chroma store: collection %q still exists after delete", s.collectionName)
+		}
+		return status, nil
+	}
+	_, err := deleteAndVerify(deleteRef)
+	if err == nil {
 		return nil
 	}
-	if ref != strings.TrimSpace(s.collectionName) {
-		status, retryErr := s.doJSON(ctx, http.MethodDelete, s.collectionLookupPath(s.collectionName), nil, nil,
-			http.StatusOK, http.StatusAccepted, http.StatusNoContent, http.StatusNotFound)
-		if retryErr == nil || status == http.StatusNotFound {
+	if deleteRef != ref {
+		_, retryErr := deleteAndVerify(ref)
+		if retryErr == nil {
 			return nil
 		}
 	}

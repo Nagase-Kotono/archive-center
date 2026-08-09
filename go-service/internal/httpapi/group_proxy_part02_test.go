@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/risulongmemory/archive-center-go/internal/dto"
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
@@ -38,20 +39,14 @@ func TestSupervisorStorylineFeedbackReplayAssumedRuntimeGate(t *testing.T) {
 		capturedPrompts = append(capturedPrompts, prompt)
 		callCount++
 
-		currentArc := "baseline_continue"
-		narrativeGoal := "Continue from recent chat without storyline feedback."
-		requiredOutcome := "preserve scene continuity"
-		if strings.Contains(prompt, freshContext) {
-			currentArc = "gate_confrontation_push"
-			narrativeGoal = "Advance the fresh gate confrontation without repeating the old corridor rumor."
-			requiredOutcome = "advance fresh confrontation"
-		}
 		response := map[string]any{
 			"choices": []any{map[string]any{"message": map[string]any{"content": `{
 				"supervisor_scene_proposal": {
-					"fidelity_warnings": [{"text":"` + currentArc + `","source_refs":["memory:test:1"]}],
-					"portrayal_notes": [{"text":"` + narrativeGoal + `","source_refs":["memory:test:1"]}],
-					"may_advance": [{"text":"` + requiredOutcome + `","source_refs":["memory:test:1"]}]
+					"fidelity_warnings": [],
+					"expression_hints": [
+						{"kind":"portrayal","text":"baseline_continue","source_refs":["input:test"]},
+						{"kind":"pacing","text":"Continue from recent chat without storyline feedback.","source_refs":["input:test"]}
+					]
 				}
 			}`}}},
 			"model": "supervisor-replay",
@@ -140,21 +135,21 @@ func TestSupervisorStorylineFeedbackReplayAssumedRuntimeGate(t *testing.T) {
 		t.Fatalf("standalone supervisor selected storyline guidance: %+v", selection)
 	}
 
-	offArc := supervisorProposalText(offResp, "fidelity_warnings")
-	onArc := supervisorProposalText(onResp, "fidelity_warnings")
+	offArc := supervisorExpressionText(offResp, "portrayal")
+	onArc := supervisorExpressionText(onResp, "portrayal")
 	if offArc != "baseline_continue" || onArc != "baseline_continue" {
-		t.Fatalf("storyline store changed fidelity result off/on = %q/%q", offArc, onArc)
+		t.Fatalf("storyline store changed current-input expression result off/on = %q/%q", offArc, onArc)
 	}
 	for i, resp := range []map[string]any{onResp2, onResp3} {
-		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != onArc {
+		if arc := supervisorExpressionText(resp, "portrayal"); arc != onArc {
 			t.Fatalf("feedback-on replay %d current_arc = %q, want stable %q", i+2, arc, onArc)
 		}
 	}
-	if got := supervisorProposalText(onResp, "may_advance"); got != "" {
-		t.Fatalf("story advancement proposal leaked: %q", got)
+	if got := supervisorProposalText(onResp, "fidelity_warnings"); got != "" {
+		t.Fatalf("memory fidelity proposal passed without delivered memory text: %q", got)
 	}
-	if got := supervisorProposalText(onResp, "portrayal_notes"); got != "Continue from recent chat without storyline feedback." {
-		t.Fatalf("portrayal_notes = %q, want context-only result", got)
+	if got := supervisorExpressionText(onResp, "pacing"); got != "Continue from recent chat without storyline feedback." {
+		t.Fatalf("pacing expression = %q, want context-only result", got)
 	}
 }
 
@@ -163,14 +158,13 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		mode             string
 		suffixNeedle     string
 		emphasisNeedle   string
-		expectedArc      string
 		expectedResponse string
 	}
 	cases := []modeCase{
-		{mode: "off", expectedArc: "baseline_arc", expectedResponse: "baseline continuation"},
-		{mode: "romantic", suffixNeedle: "emotional nuance", emphasisNeedle: "relationship-aware subtext", expectedArc: "romantic_arc", expectedResponse: "romantic emotional beat"},
-		{mode: "action", suffixNeedle: "clear cause and effect", emphasisNeedle: "grounded physical consequences", expectedArc: "action_arc", expectedResponse: "action forward motion"},
-		{mode: "mature_soft", suffixNeedle: "sensory atmosphere", emphasisNeedle: "emotional and interpersonal nuance", expectedArc: "mature_soft_arc", expectedResponse: "sensual consent-aware beat"},
+		{mode: "off"},
+		{mode: "romantic", suffixNeedle: "emotional nuance", emphasisNeedle: "relationship-aware subtext", expectedResponse: "romantic emotional beat"},
+		{mode: "action", suffixNeedle: "clear cause and effect", emphasisNeedle: "grounded physical consequences", expectedResponse: "action forward motion"},
+		{mode: "mature_soft", suffixNeedle: "sensory atmosphere", emphasisNeedle: "emotional and interpersonal nuance", expectedResponse: "sensual consent-aware beat"},
 	}
 
 	callByMode := map[string]int{}
@@ -197,19 +191,12 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		}
 		callByMode[mode]++
 		capturedPromptByMode[mode] = body
-		arc := map[string]string{
-			"off":         "baseline_arc",
-			"romantic":    "romantic_arc",
-			"action":      "action_arc",
-			"mature_soft": "mature_soft_arc",
-		}[mode]
 		responseText := map[string]string{
-			"off":         "baseline continuation",
 			"romantic":    "romantic emotional beat",
 			"action":      "action forward motion",
 			"mature_soft": "sensual consent-aware beat",
 		}[mode]
-		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[{"text":"` + arc + `","source_refs":["memory:test:1"]}],"portrayal_notes":[{"text":"` + responseText + `","source_refs":["memory:test:1"]}],"may_advance":[{"text":"` + responseText + `","source_refs":["memory:test:1"]}]}}`
+		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[],"expression_hints":[{"kind":"portrayal","text":"` + responseText + `","source_refs":["input:test"]}]}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -252,7 +239,11 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("%s decode response: %v", tc.mode, err)
 		}
-		if resp["source"] != "runtime_llm" || resp["would_call_llm"] != true {
+		if tc.mode == "off" {
+			if resp["source"] != "guide_eligibility_gate" || resp["would_call_llm"] != false {
+				t.Fatalf("off mode did not preserve no-call parity: %+v", resp)
+			}
+		} else if resp["source"] != "runtime_llm" || resp["would_call_llm"] != true {
 			t.Fatalf("%s did not use runtime supervisor path: %+v", tc.mode, resp)
 		}
 		results[tc.mode] = resp
@@ -279,27 +270,23 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 				t.Fatalf("%s upstream prompt missing optional guide focus: %s", tc.mode, capturedPromptByMode[tc.mode])
 			}
 		}
-		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != tc.expectedArc {
-			t.Fatalf("%s current_arc = %q, want %q", tc.mode, arc, tc.expectedArc)
-		}
-		if got := supervisorProposalText(resp, "may_advance"); got != "" {
-			t.Fatalf("%s story advancement proposal leaked: %q", tc.mode, got)
-		}
-		if got := supervisorProposalText(resp, "portrayal_notes"); !strings.Contains(got, tc.expectedResponse) {
-			t.Fatalf("%s portrayal guidance = %q, want %q", tc.mode, got, tc.expectedResponse)
+		if tc.mode != "off" {
+			if got := supervisorExpressionText(resp, "portrayal"); !strings.Contains(got, tc.expectedResponse) {
+				t.Fatalf("%s portrayal guidance = %q, want %q", tc.mode, got, tc.expectedResponse)
+			}
+		} else if got := supervisorExpressionText(resp, "portrayal"); got != "" {
+			t.Fatalf("off mode exposed expression guidance: %q", got)
 		}
 	}
-	if len(callByMode) != len(cases) {
-		t.Fatalf("runtime calls by mode = %+v, want all modes", callByMode)
+	if len(callByMode) != len(cases)-1 || callByMode["off"] != 0 {
+		t.Fatalf("runtime calls by mode = %+v, want only enabled modes", callByMode)
 	}
-	if supervisorProposalText(results["off"], "fidelity_warnings") == supervisorProposalText(results["romantic"], "fidelity_warnings") ||
-		supervisorProposalText(results["romantic"], "fidelity_warnings") == supervisorProposalText(results["action"], "fidelity_warnings") ||
-		supervisorProposalText(results["action"], "fidelity_warnings") == supervisorProposalText(results["mature_soft"], "fidelity_warnings") {
-		t.Fatalf("guide mode arcs should diverge: off=%s romantic=%s action=%s mature=%s",
-			supervisorProposalText(results["off"], "fidelity_warnings"),
-			supervisorProposalText(results["romantic"], "fidelity_warnings"),
-			supervisorProposalText(results["action"], "fidelity_warnings"),
-			supervisorProposalText(results["mature_soft"], "fidelity_warnings"))
+	if supervisorExpressionText(results["romantic"], "portrayal") == supervisorExpressionText(results["action"], "portrayal") ||
+		supervisorExpressionText(results["action"], "portrayal") == supervisorExpressionText(results["mature_soft"], "portrayal") {
+		t.Fatalf("enabled guide mode expressions should diverge: romantic=%s action=%s mature=%s",
+			supervisorExpressionText(results["romantic"], "portrayal"),
+			supervisorExpressionText(results["action"], "portrayal"),
+			supervisorExpressionText(results["mature_soft"], "portrayal"))
 	}
 }
 
@@ -323,7 +310,7 @@ func TestNarrativeStanceDoesNotControlMemoryFidelityReviewer(t *testing.T) {
 		body := extractionStringFromAny(userMessage["content"])
 		callCount++
 		capturedPrompts = append(capturedPrompts, body)
-		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[{"text":"preserve the supported recollection","source_refs":["memory:test:1"]}],"portrayal_notes":[{"text":"keep the supported relationship perceptible","source_refs":["memory:test:1"]}],"may_advance":[{"text":"must be rejected","source_refs":["memory:test:1"]}]}}`
+		content := `{"supervisor_scene_proposal":{"fidelity_warnings":[],"expression_hints":[{"kind":"portrayal","text":"keep the current request perceptible","source_refs":["input:test"]}]}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -346,7 +333,7 @@ func TestNarrativeStanceDoesNotControlMemoryFidelityReviewer(t *testing.T) {
 		srv.RegisterRoutes(mux)
 		body := `{
 			"chat_session_id":"sess-stance-effect",
-			"guide_mode":"off",
+			"guide_mode":"standard",
 			"guide_strength":"strong",
 			"narrative_stance":"` + mode + `",
 			"response_execution_contract":{"contract_version":"response_execution_contract.v1","status":"ready","active":true,"source_refs":{"all":["input:test","memory:test:1"],"current_input":["input:test"],"native_system":[],"memory":["memory:test:1"]}},
@@ -376,11 +363,8 @@ func TestNarrativeStanceDoesNotControlMemoryFidelityReviewer(t *testing.T) {
 				t.Fatalf("%s pack exposes story initiative field %q: %#v", mode, key, pack[key])
 			}
 		}
-		if arc := supervisorProposalText(resp, "fidelity_warnings"); arc != "preserve the supported recollection" {
-			t.Fatalf("%s fidelity guidance = %q", mode, arc)
-		}
-		if got := supervisorProposalText(resp, "may_advance"); got != "" {
-			t.Fatalf("%s story advancement proposal leaked: %q", mode, got)
+		if got := supervisorExpressionText(resp, "portrayal"); got != "keep the current request perceptible" {
+			t.Fatalf("%s portrayal guidance = %q", mode, got)
 		}
 	}
 	if callCount != len(cases) || len(capturedPrompts) != len(cases) {
@@ -391,9 +375,9 @@ func TestNarrativeStanceDoesNotControlMemoryFidelityReviewer(t *testing.T) {
 			t.Fatalf("prompt %d contains story initiative control: %s", i+1, prompt)
 		}
 	}
-	if supervisorProposalText(results["reactive"], "fidelity_warnings") != supervisorProposalText(results["balanced"], "fidelity_warnings") ||
-		supervisorProposalText(results["balanced"], "fidelity_warnings") != supervisorProposalText(results["proactive"], "fidelity_warnings") {
-		t.Fatalf("narrative stance changed memory fidelity output: %#v", results)
+	if supervisorExpressionText(results["reactive"], "portrayal") != supervisorExpressionText(results["balanced"], "portrayal") ||
+		supervisorExpressionText(results["balanced"], "portrayal") != supervisorExpressionText(results["proactive"], "portrayal") {
+		t.Fatalf("narrative stance changed expression output: %#v", results)
 	}
 }
 
@@ -407,6 +391,18 @@ func supervisorProposalText(resp map[string]any, field string) string {
 	}
 	item, _ := items[0].(map[string]any)
 	return extractionStringFromAny(item["text"])
+}
+
+func supervisorExpressionText(resp map[string]any, kind string) string {
+	result := mapFromAny(resp["supervisor_result"])
+	proposal := mapFromAny(mapFromAny(result["directive"])["supervisor_scene_proposal"])
+	for _, raw := range anySliceFromAny(proposal["expression_hints"]) {
+		item := mapFromAny(raw)
+		if extractionStringFromAny(item["kind"]) == kind {
+			return extractionStringFromAny(item["text"])
+		}
+	}
+	return ""
 }
 
 func anySliceContains(values []any, needle string) bool {
@@ -481,12 +477,18 @@ func TestConfigUpdateProjectGUISettingsTraceMasksSecrets(t *testing.T) {
 	if err := json.Unmarshal(updateRec.Body.Bytes(), &updateResp); err != nil {
 		t.Fatalf("decode config/update response: %v", err)
 	}
+	if updateResp["backend_instance_id"] != srv.BackendInstanceID {
+		t.Fatalf("backend_instance_id = %v, want %q", updateResp["backend_instance_id"], srv.BackendInstanceID)
+	}
 	trace, ok := updateResp["runtime_config_trace"].(map[string]any)
 	if !ok {
 		t.Fatalf("runtime_config_trace missing from config/update response: %+v", updateResp)
 	}
 	if trace["top_k"] != float64(7) {
 		t.Fatalf("runtime_config_trace.top_k = %v, want 7", trace["top_k"])
+	}
+	if trace["synced"] != true {
+		t.Fatalf("runtime_config_trace.synced = %v, want true", trace["synced"])
 	}
 	mainTrace, ok := trace["main"].(map[string]any)
 	if !ok {
@@ -544,6 +546,137 @@ func TestConfigUpdateProjectGUISettingsTraceMasksSecrets(t *testing.T) {
 	}
 	if cfg.ReasoningPreset != "glm" || cfg.ReasoningEffort != "enable" || cfg.ReasoningBudgetTokens != 4096 {
 		t.Fatalf("supervisor reasoning config = preset %q effort %q budget %d, want glm/enable/4096", cfg.ReasoningPreset, cfg.ReasoningEffort, cfg.ReasoningBudgetTokens)
+	}
+}
+
+func TestRuntimeConfigTraceMatchesRoleCompletenessContracts(t *testing.T) {
+	standard := configuredTrace("openai", "key", "https://example.test/v1", "model", 0)
+	missing, _ := standard["missing_fields"].([]string)
+	if standard["configured"] != false || !strings.Contains(strings.Join(missing, ","), "timeout_ms") {
+		t.Fatalf("standard trace accepted zero timeout: %+v", standard)
+	}
+	standard = configuredTrace("openai", "key", "https://example.test/v1", "model", 60)
+	if standard["configured"] != true {
+		t.Fatalf("standard trace rejected complete config: %+v", standard)
+	}
+
+	sourceSearch := sourceSearchConfiguredTrace("gemini", "key", "", "gemini-search", 60)
+	if sourceSearch["configured"] != true {
+		t.Fatalf("source-search trace must allow provider default endpoint: %+v", sourceSearch)
+	}
+}
+
+func TestConfigUpdatePropagatesLLMGatewayServiceTierToAllGenerationRoles(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := setupTestServer()
+	srv.RegisterRoutes(mux)
+
+	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(`{
+		"mainProvider":"llmgateway",
+		"mainApiKey":"main-key",
+		"mainEndpoint":"https://api.llmgateway.io/v1",
+		"mainModel":"openai/gpt-test",
+		"mainLlmGatewayServiceTier":"standard",
+		"supervisorProvider":"llmgateway",
+		"supervisorApiKey":"supervisor-key",
+		"supervisorEndpoint":"https://api.llmgateway.io/v1",
+		"supervisorModel":"google-vertex/gemini-test",
+		"supervisorLlmGatewayServiceTier":"priority",
+		"criticProvider":"llmgateway",
+		"criticApiKey":"critic-key",
+		"criticEndpoint":"https://api.llmgateway.io/v1",
+		"criticModel":"google-ai-studio/gemini-test",
+		"criticLlmGatewayServiceTier":"flex"
+	}`)))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("config/update status = %d, body=%s", updateRec.Code, updateRec.Body.String())
+	}
+
+	mainCfg := srv.chapterLLMConfig()
+	supervisorCfg := srv.supervisorLLMConfig()
+	criticCfg := srv.completeTurnExtractionConfig(map[string]any{}).Critic
+	if mainCfg.Provider != "llmgateway" || mainCfg.LLMGatewayServiceTier != "standard" {
+		t.Fatalf("main LLM Gateway config = %+v", mainCfg)
+	}
+	if supervisorCfg.Provider != "llmgateway" || supervisorCfg.LLMGatewayServiceTier != "priority" {
+		t.Fatalf("supervisor LLM Gateway config = %+v", supervisorCfg)
+	}
+	if criticCfg.Provider != "llmgateway" || criticCfg.LLMGatewayServiceTier != "flex" {
+		t.Fatalf("critic LLM Gateway config = %+v", criticCfg)
+	}
+
+	var updateResp map[string]any
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updateResp); err != nil {
+		t.Fatalf("decode config/update response: %v", err)
+	}
+	trace := mapFromAny(updateResp["runtime_config_trace"])
+	if mapFromAny(trace["main"])["llm_gateway_service_tier"] != "standard" ||
+		mapFromAny(trace["supervisor"])["llm_gateway_service_tier"] != "priority" ||
+		mapFromAny(trace["critic"])["llm_gateway_service_tier"] != "flex" {
+		t.Fatalf("runtime service tier trace missing: %+v", trace)
+	}
+}
+
+func TestConfigUpdatePropagatesClaudePromptCacheModeToAllGenerationRoles(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := setupTestServer()
+	srv.RegisterRoutes(mux)
+
+	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(`{
+		"mainProvider":"claude",
+		"mainApiKey":"main-key",
+		"mainEndpoint":"https://api.anthropic.com",
+		"mainModel":"claude-main",
+		"mainClaudePromptCacheMode":"ephemeral_5m",
+		"supervisorProvider":"claude",
+		"supervisorApiKey":"supervisor-key",
+		"supervisorEndpoint":"https://api.anthropic.com",
+		"supervisorModel":"claude-supervisor",
+		"supervisorClaudePromptCacheMode":"ephemeral_1h",
+		"criticProvider":"claude",
+		"criticApiKey":"critic-key",
+		"criticEndpoint":"https://api.anthropic.com",
+		"criticModel":"claude-critic",
+		"criticClaudePromptCacheMode":"off"
+	}`)))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateRec := httptest.NewRecorder()
+	mux.ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("config/update status = %d, body=%s", updateRec.Code, updateRec.Body.String())
+	}
+
+	mainCfg := srv.chapterLLMConfig()
+	supervisorCfg := srv.supervisorLLMConfig()
+	criticCfg := srv.completeTurnExtractionConfig(map[string]any{}).Critic
+	if mainCfg.Provider != "claude" || mainCfg.ClaudePromptCacheMode != "ephemeral_5m" {
+		t.Fatalf("main Claude cache config = %+v", mainCfg)
+	}
+	if supervisorCfg.Provider != "claude" || supervisorCfg.ClaudePromptCacheMode != "ephemeral_1h" {
+		t.Fatalf("supervisor Claude cache config = %+v", supervisorCfg)
+	}
+	if criticCfg.Provider != "claude" || criticCfg.ClaudePromptCacheMode != "off" {
+		t.Fatalf("critic Claude cache config = %+v", criticCfg)
+	}
+
+	var updateResp map[string]any
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updateResp); err != nil {
+		t.Fatalf("decode config/update response: %v", err)
+	}
+	trace := mapFromAny(updateResp["runtime_config_trace"])
+	if mapFromAny(trace["main"])["claude_prompt_cache_mode"] != "ephemeral_5m" ||
+		mapFromAny(trace["supervisor"])["claude_prompt_cache_mode"] != "ephemeral_1h" ||
+		mapFromAny(trace["critic"])["claude_prompt_cache_mode"] != "off" {
+		t.Fatalf("runtime Claude prompt cache trace missing: %+v", trace)
+	}
+
+	req := dto.ProxyPluginMainRequest{}
+	applyProxyOverridesFromLLMConfig(&req, criticCfg)
+	if req.ClaudePromptCacheMode == nil || *req.ClaudePromptCacheMode != "off" {
+		t.Fatalf("critic proxy request cache mode = %v", req.ClaudePromptCacheMode)
 	}
 }
 
@@ -673,6 +806,16 @@ func TestHandleSupervisorFailOpenOnRuntimeLLMError(t *testing.T) {
 	if trace["llm_call"] != "failed" || trace["fail_open"] != true {
 		t.Fatalf("trace did not expose failed fail-open call: %+v", trace)
 	}
+	if resp["reason_code"] != "publisher_llm_upstream_rejected" {
+		t.Fatalf("reason_code = %v, want publisher_llm_upstream_rejected", resp["reason_code"])
+	}
+	llmTrace := mapFromAny(trace["llm_trace"])
+	if llmTrace["failure_code"] != "publisher_llm_upstream_rejected" || intFromAny(llmTrace["upstream_status"], 0) != http.StatusUnauthorized {
+		t.Fatalf("LLM failure trace did not preserve the rejected status: %+v", llmTrace)
+	}
+	if strings.Contains(extractionStringFromAny(llmTrace["failure_detail"]), apiKey) {
+		t.Fatalf("LLM failure trace leaked API key: %+v", llmTrace)
+	}
 }
 
 func TestHandleSupervisorSkipsRuntimeLLMWithoutExecutionContract(t *testing.T) {
@@ -729,9 +872,42 @@ func TestHandleSupervisorSkipsRuntimeLLMWithoutExecutionContract(t *testing.T) {
 		t.Fatalf("missing execution contract did not produce bounded degraded result: %+v", proposal)
 	}
 	if len(anySliceFromAny(proposal["fidelity_warnings"])) != 0 ||
-		len(anySliceFromAny(proposal["portrayal_notes"])) != 0 ||
-		len(anySliceFromAny(proposal["may_advance"])) != 0 {
+		len(anySliceFromAny(proposal["expression_hints"])) != 0 {
 		t.Fatalf("gated proposal delivered unsupported items: %+v", proposal)
+	}
+
+	nativeOnlyBody := `{
+		"chat_session_id":"sess-sv-native-only",
+		"guide_mode":"standard",
+		"guide_strength":"strong",
+		"response_execution_contract":{
+			"contract_version":"response_execution_contract.v1",
+			"status":"ready",
+			"active":true,
+			"source_refs":{
+				"all":["system:active"],
+				"current_input":[],
+				"native_system":["system:active"],
+				"memory":[]
+			}
+		},
+		"context_messages":[{"role":"user","content":"move forward"}]
+	}`
+	nativeOnlyReq := httptest.NewRequest(http.MethodPost, "/supervisor", strings.NewReader(nativeOnlyBody))
+	nativeOnlyReq.Header.Set("Content-Type", "application/json")
+	nativeOnlyRec := httptest.NewRecorder()
+	mux.ServeHTTP(nativeOnlyRec, nativeOnlyReq)
+	if nativeOnlyRec.Code != http.StatusOK || callCount != 0 {
+		t.Fatalf("native-only support called supervisor: status=%d calls=%d body=%s", nativeOnlyRec.Code, callCount, nativeOnlyRec.Body.String())
+	}
+	var nativeOnlyResp map[string]any
+	if err := json.Unmarshal(nativeOnlyRec.Body.Bytes(), &nativeOnlyResp); err != nil {
+		t.Fatalf("decode native-only response: %v", err)
+	}
+	nativeOnlyProposal := mapFromAny(mapFromAny(mapFromAny(nativeOnlyResp["supervisor_result"])["directive"])["supervisor_scene_proposal"])
+	if nativeOnlyResp["source"] != "execution_contract_gate" ||
+		nativeOnlyProposal["reason_code"] != "supervisor_support_packet_has_no_supported_lane" {
+		t.Fatalf("native-only request did not use no-supported-lane gate: response=%+v proposal=%+v", nativeOnlyResp, nativeOnlyProposal)
 	}
 }
 

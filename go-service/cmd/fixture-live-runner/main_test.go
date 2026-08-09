@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -50,6 +54,9 @@ func TestGoBackendEnvCarriesReferenceEmbeddingModel(t *testing.T) {
 }
 
 func TestCopy08ToTemp(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("robocopy fixture copy is Windows-only")
+	}
 	src := t.TempDir()
 	for rel, content := range map[string]string{
 		filepath.Join("backend", "main.py"):              "print('fixture')\n",
@@ -89,6 +96,9 @@ func TestCopy08ToTemp(t *testing.T) {
 }
 
 func TestMakeJunction(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("directory junctions are Windows-only")
+	}
 	src, err := os.MkdirTemp("", "junction-src-*")
 	if err != nil {
 		t.Fatal(err)
@@ -120,5 +130,22 @@ func TestGoBackendEnvCarriesChromaShadowPersistDir(t *testing.T) {
 	want := "AC_CHROMA_SHADOW_PERSIST_DIR=" + filepath.Join(root, ".chroma_shadow")
 	if !strings.Contains(env, want) {
 		t.Fatalf("goBackendEnv missing %q in:\n%s", want, env)
+	}
+}
+
+func TestWaitForHealthyZeroIntervalDoesNotRetry(t *testing.T) {
+	attempts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	err := waitForHealthy(context.Background(), ts.URL, 0, make(chan struct{}))
+	if err == nil || !strings.Contains(err.Error(), "polling is disabled") {
+		t.Fatalf("error = %v, want polling-disabled failure", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want exactly one probe", attempts)
 	}
 }

@@ -85,6 +85,15 @@ function normalizeLanguageContextTrace(value) { return value; }
   if (realAssistant.session_output_language !== "en" || realAssistant.output_language_source !== "recent_assistant") {
     throw new Error("real assistant continuity language was not preserved: "+JSON.stringify(realAssistant));
   }
+  const taggedKorean = await buildLanguageContextTrace({
+    userInput:"한얼이 아영에게 자신의 이름과 직책을 알려준다.",
+    assistantContent:"<Narration><Suit.Natural><Emotion.Calm>아영은 한얼의 설명을 듣고 고개를 끄덕였다. 이제 그의 이름과 맡은 업무를 분명히 알게 되었다.</Emotion.Calm></Suit.Natural></Narration>",
+    messages:[],
+    stage:"completeTurn"
+  });
+  if (taggedKorean.session_output_language !== "ko" || taggedKorean.output_language_source !== "current_assistant" || taggedKorean.assistant_output_language !== "ko") {
+    throw new Error("Risu rendering tags contaminated Korean output language: "+JSON.stringify(taggedKorean));
+  }
 })().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
 `
 	cmd := exec.Command(nodePath, "-")
@@ -156,7 +165,7 @@ func TestSourceDiscoveryUsesSelectedWorkWithoutDuplicateTitleInput(t *testing.T)
 	remember := extractArchiveCenterJSFunction(t, src, "referenceDiscoveryRememberDraft")
 	panel := extractArchiveCenterJSFunction(t, src, "renderReferenceCanonPackPanel")
 	library := extractArchiveCenterJSFunction(t, src, "renderReferenceLibrarySection")
-	timeout := extractArchiveCenterJSFunction(t, src, "getSourceDiscoveryRequestTimeoutMs")
+	run := extractArchiveCenterJSAsyncFunction(t, src, "referenceDiscoveryRunFromUI")
 	if !strings.Contains(remember, `state.works.find`) || strings.Contains(remember, `mo-discovery-work-query`) {
 		t.Fatalf("discovery draft must derive the title from the selected work: %s", remember)
 	}
@@ -166,8 +175,9 @@ func TestSourceDiscoveryUsesSelectedWorkWithoutDuplicateTitleInput(t *testing.T)
 	if !strings.Contains(library, `tabs + selector + renderReferenceCanonPackPanel()`) {
 		t.Fatalf("work selector is missing from the discovery panel")
 	}
-	if !strings.Contains(timeout, `resolveRequestTimeoutMs(600000)`) {
-		t.Fatalf("source discovery transport must outlive the bounded backend pipeline: %s", timeout)
+	if !strings.Contains(run, `const data = await bridgeFetch("/source-discovery/jobs/v1", {`) ||
+		!strings.Contains(run, `timeoutMs: 0`) {
+		t.Fatalf("source discovery transport must not impose the shared Plugin Timeout: %s", run)
 	}
 }
 
@@ -254,6 +264,87 @@ func extractArchiveCenterJSFunction(t *testing.T, src, name string) string {
 	}
 	end := start + len(marker) + next
 	return strings.TrimSpace(src[start:end])
+}
+
+func TestDashboardNoticeTierRendersBelowWarningRuntime(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for dashboard notice runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	for _, marker := range []string{
+		`.mo-dot-notice{background:#8fa7ff}`,
+		`.mo-dash-card.has-notice`,
+		`.mo-dash-chip-notice`,
+		`.mo-hdr-health-badge-notice`,
+	} {
+		if !strings.Contains(src, marker) {
+			t.Fatalf("dashboard notice style missing %q", marker)
+		}
+	}
+	script := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "statusDotClass"),
+		extractArchiveCenterJSFunction(t, src, "runtimeStatusLabel"),
+		extractArchiveCenterJSFunction(t, src, "renderDashboardViewModel"),
+		extractArchiveCenterJSFunction(t, src, "renderDashboardViewModelHeader"),
+	}, "\n") + `
+const labels = {
+  "dash.status.state.ok": "정상",
+  "dash.status.state.notice": "알림",
+  "dash.status.state.warn": "경고",
+  "dash.status.state.fail": "실패",
+  "dash.status.state.skipped": "건너뜀",
+  "dash.status.state.off": "꺼짐",
+  "dash.status.state.running": "실행 중",
+  "dash.status.state.queued": "대기열",
+  "dash.status.state.idle": "유휴",
+  "dash.status.state.unknown": "미확인",
+  "header.health.allOk": "모두 정상",
+};
+function t(key) { return labels[key] || key; }
+function escapeAttr(value) { return String(value == null ? "" : value); }
+function dashboardSimpleText(key) { return key; }
+function dashboardViewModelLabel(key) { return key; }
+function dashboardViewModelText(value) { return String(value == null ? "" : value); }
+function formatAuxiliaryPlacementTrace() { return ""; }
+function formatDashboardTimestampLocal() { return ""; }
+
+const vm = {
+  status: "ok",
+  summary: {ok: 1, notice: 2, warn: 0, fail: 0},
+  cards: [
+    {title: "Advisory", severity: "notice", summary: {notice: 1}, rows: [{label_key: "save", status: "notice", detail: "waiting"}]},
+    {title: "Queued", severity: "notice", summary: {notice: 1}, chips: [{tone: "notice", label: "queued"}], rows: []},
+  ],
+};
+const html = renderDashboardViewModel(vm, {});
+if (!html.includes("has-notice") || !html.includes("mo-dash-chip-notice") || !html.includes("mo-dot-notice")) {
+  throw new Error("notice card did not render with advisory styles: " + html);
+}
+const header = renderDashboardViewModelHeader(vm, {enabled: true});
+if (!header.includes("mo-hdr-health-badge-notice") || !header.includes("알림") || header.includes("모두 정상")) {
+  throw new Error("notice summary was hidden or reported all-ok: " + header);
+}
+const legacyHeader = renderDashboardViewModelHeader({summary: {ok: 2, warn: 0, fail: 0}}, {enabled: true});
+if (!legacyHeader.includes("모두 정상")) {
+  throw new Error("legacy ViewModel without notice count lost all-ok state: " + legacyHeader);
+}
+if (statusDotClass("deferred") !== "mo-dot-notice" || statusDotClass("degraded") !== "mo-dot-warn") {
+  throw new Error("notice/warning dot classification regressed");
+}
+if (runtimeStatusLabel("deferred") !== "알림" || runtimeStatusLabel("degraded") !== "경고") {
+  throw new Error("notice/warning labels regressed");
+}
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dashboard notice JS fixture failed: %v\n%s", err, output)
+	}
 }
 
 func TestPrepareTurnEmptyObservationProductionJSAndGoRoute(t *testing.T) {
@@ -369,6 +460,354 @@ func extractArchiveCenterJSAsyncFunction(t *testing.T, src, name string) string 
 	return strings.TrimSpace(src[start:end])
 }
 
+func TestTurnWorkflowHUDEventStreamUsesOneConnectionAndNoPolling(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for turn workflow HUD watch runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	cancelStream := extractArchiveCenterJSFunction(t, src, "cancelTurnWorkflowHUDStream")
+	streamFailure := extractArchiveCenterJSFunction(t, src, "turnWorkflowHUDStreamFailure")
+	openStream := extractArchiveCenterJSAsyncFunction(t, src, "openTurnWorkflowHUDStream")
+	consumeLine := extractArchiveCenterJSAsyncFunction(t, src, "consumeTurnWorkflowHUDStreamLine")
+	consumeStream := extractArchiveCenterJSAsyncFunction(t, src, "consumeTurnWorkflowHUDStream")
+	primeHUD := extractArchiveCenterJSFunction(t, src, "primeTurnWorkflowHUD")
+	startWatch := extractArchiveCenterJSFunction(t, src, "startTurnWorkflowHUDWatch")
+	streamSource := strings.Join([]string{cancelStream, openStream, consumeStream, primeHUD, startWatch}, "\n")
+	for _, forbidden := range []string{"/turn-workflow/status", "wait_ms", "setInterval(", "setTimeout(", "llmRetryCount"} {
+		if strings.Contains(streamSource, forbidden) {
+			t.Fatalf("turn workflow HUD stream retained forbidden automatic transport %q", forbidden)
+		}
+	}
+	if !strings.Contains(startWatch, "/turn-workflow/events") ||
+		!strings.Contains(openStream, "R.nativeFetch") ||
+		!strings.Contains(openStream, "response.body.getReader") {
+		t.Fatal("turn workflow HUD stream is not using the nativeFetch readable-stream feature probe")
+	}
+	script := `
+const settings = {turnWorkflowHUDEnabled:true,requestTimeoutMs:17000};
+const TURN_WORKFLOW_HUD_CONTRACT = "turn_workflow_hud.v3";
+const encoder = new TextEncoder();
+let _turnWorkflowHUDWatchToken = 0;
+let _turnWorkflowHUDWatchRunning = false;
+let _turnWorkflowHUDActiveRequestId = "";
+let _turnWorkflowHUDLastRevision = 0;
+let _turnWorkflowHUDTerminalRequestId = "";
+let _turnWorkflowHUDStreamAbortController = null;
+let _turnWorkflowHUDStreamReader = null;
+let _turnWorkflowHUDRenderChain = Promise.resolve();
+const _turnWorkflowHUDHostWarningsByRequestId = new Map();
+let streamResponses = [];
+let streamPaths = [];
+let consumedStatuses = [];
+let transportErrors = [];
+let dismissedRequests = [];
+let fallbackFetchCalls = 0;
+const R = {
+  nativeFetch: async function(path) {
+    streamPaths.push(String(path || ""));
+    if (streamResponses.length === 0) throw new Error("unexpected extra stream request");
+    return streamResponses.shift();
+  },
+};
+function turnWorkflowHUDIsEnabled() { return settings.turnWorkflowHUDEnabled !== false; }
+function getRequestTimeoutSettingMs() { return settings.requestTimeoutMs; }
+function dismissTurnWorkflowHUD(requestId) {
+  dismissedRequests.push(String(requestId || ""));
+  _turnWorkflowHUDActiveRequestId = "";
+  _turnWorkflowHUDLastRevision = 0;
+  _turnWorkflowHUDTerminalRequestId = "";
+}
+function clearTurnWorkflowHUDTimer() {}
+function turnWorkflowHUDHasHostWarning(requestId) {
+  const warnings = _turnWorkflowHUDHostWarningsByRequestId.get(String(requestId || "").trim());
+  return Array.isArray(warnings) && warnings.length > 0;
+}
+async function removeTurnWorkflowHUDDismissListeners() {}
+function queueTurnWorkflowHUDOperation(_label, operation) {
+  _turnWorkflowHUDRenderChain = _turnWorkflowHUDRenderChain.then(operation);
+  return _turnWorkflowHUDRenderChain;
+}
+async function ensureTurnWorkflowHUDRoot() { return null; }
+function resolveBridgeRuntimeRoute() { return {url:"http://127.0.0.1:28080"}; }
+function consumeTurnWorkflowHUD(view) {
+  consumedStatuses.push(String(view && view.status || ""));
+  _turnWorkflowHUDLastRevision = Math.max(_turnWorkflowHUDLastRevision, Number(view && view.revision || 0));
+  if (view && (view.status === "completed" || view.status === "failed" || view.status === "invalidated")) {
+    _turnWorkflowHUDTerminalRequestId = String(view.request_id || "");
+  }
+  queueTurnWorkflowHUDOperation("render", async function() {});
+  return true;
+}
+function renderTurnWorkflowHUDTransportError(requestId, reasonCode) {
+  if (!requestId || requestId !== _turnWorkflowHUDActiveRequestId) return;
+  transportErrors.push(String(requestId || "") + ":" + String(reasonCode || ""));
+}
+function debugLog() {}
+function fetch() { fallbackFetchCalls++; throw new Error("unproven fallback fetch used"); }
+function assert(condition, message) { if (!condition) throw new Error(message); }
+async function settleWatch(label) {
+  for (let index = 0; index < 20 && _turnWorkflowHUDWatchRunning; index++) {
+    await new Promise(function(resolve) { setImmediate(resolve); });
+  }
+  assert(!_turnWorkflowHUDWatchRunning, label + " did not settle");
+}
+function responseFromLines(lines) {
+  const chunks = [encoder.encode(lines.join("\n") + "\n")];
+  return {
+    status: 200,
+    ok: true,
+    body: {
+      getReader: function() {
+        return {
+          read: async function() {
+            if (chunks.length > 0) return {value:chunks.shift(),done:false};
+            return {done:true};
+          },
+          cancel: async function() {},
+        };
+      },
+    },
+  };
+}
+` + "\n" + cancelStream + "\n" + streamFailure + "\n" + openStream + "\n" + consumeLine + "\n" + consumeStream + "\n" + primeHUD + "\n" + startWatch + `
+(async function() {
+  streamResponses = [responseFromLines([
+    JSON.stringify({contract_version:"turn_workflow_hud.v3",request_id:"registered-request",status:"running",revision:1}),
+    JSON.stringify({contract_version:"turn_workflow_hud.v3",request_id:"registered-request",status:"running",revision:2}),
+    JSON.stringify({contract_version:"turn_workflow_hud.v3",request_id:"registered-request",status:"completed",revision:3}),
+  ])];
+  startTurnWorkflowHUDWatch("registered-request");
+  await settleWatch("registered stream");
+  assert(streamPaths.length === 1, "workflow used more than one HTTP connection");
+  assert(streamPaths[0].includes("/turn-workflow/events?"), "workflow did not use the event stream endpoint");
+  assert(streamPaths[0].includes("after_revision=0"), "new request did not begin after revision zero");
+  assert(consumedStatuses.join(",") === "running,running,running,completed", "host pending state or stream revisions were not rendered sequentially");
+  assert(transportErrors.length === 0, "valid stream produced a transport error");
+
+  streamPaths = [];
+  consumedStatuses = [];
+  streamResponses = [{status:200,ok:true,body:null}];
+  startTurnWorkflowHUDWatch("unsupported-request");
+  await settleWatch("unsupported stream");
+  assert(streamPaths.length === 1, "unsupported stream retried or polled");
+  assert(fallbackFetchCalls === 0, "unsupported native stream fell back to unproven fetch");
+  assert(transportErrors.length === 0, "HUD-only transport loss was rendered as a turn failure");
+  assert(dismissedRequests.length === 0, "HUD-only transport loss discarded the active workflow identity");
+  assert(_turnWorkflowHUDActiveRequestId === "unsupported-request", "HUD-only transport loss cleared the active workflow identity");
+  renderTurnWorkflowHUDTransportError("unsupported-request", "complete_turn_transport_unavailable");
+  assert(
+    transportErrors.join(",") === "unsupported-request:complete_turn_transport_unavailable",
+    "later complete-turn transport failure was hidden after HUD stream loss"
+  );
+  process.stdout.write("ok");
+})().catch(function(err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`
+	scriptPath := t.TempDir() + "/turn-workflow-hud-watch-runtime.js"
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
+		t.Fatalf("write turn workflow HUD watch runtime fixture: %v", err)
+	}
+	command := exec.Command(nodePath, scriptPath)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("turn workflow HUD watch runtime fixture failed: %v\n%s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "ok" {
+		t.Fatalf("turn workflow HUD watch runtime fixture output=%q, want ok", output)
+	}
+}
+
+func TestTurnWorkflowHUDTransportFailureClassificationAndPersistenceRuntime(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for turn workflow HUD transport runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	bridge := extractArchiveCenterJSAsyncFunction(t, src, "bridgeFetch")
+	classify := extractArchiveCenterJSFunction(t, src, "classifyTurnWorkflowHUDTransportFailure")
+	remember := extractArchiveCenterJSFunction(t, src, "rememberTurnWorkflowHUDHostWarning")
+	hasWarning := extractArchiveCenterJSFunction(t, src, "turnWorkflowHUDHasHostWarning")
+	warningHTML := extractArchiveCenterJSFunction(t, src, "turnWorkflowHUDWarningListHTML")
+	renderTransport := extractArchiveCenterJSFunction(t, src, "renderTurnWorkflowHUDTransportError")
+	presentation := extractArchiveCenterJSFunction(t, src, "buildTurnWorkflowHUDPresentation")
+	watch := extractArchiveCenterJSFunction(t, src, "startTurnWorkflowHUDWatch")
+
+	if strings.Contains(renderTransport, `_turnWorkflowHUDTerminalRequestId = requestId`) {
+		t.Fatal("host transport warning still terminates the workflow HUD before later save stages")
+	}
+	if !strings.Contains(watch, `turnWorkflowHUDHasHostWarning(normalizedRequestId)`) {
+		t.Fatal("HUD stream cleanup can still erase a recorded host transport warning")
+	}
+	if count := strings.Count(presentation, `+ turnWorkflowHUDWarningListHTML(view)`); count != 4 {
+		t.Fatalf("HUD warning list must be rendered in all four presentation modes; count=%d", count)
+	}
+	for _, marker := range []string{
+		`kind: String(kind || "unknown")`,
+		`target_url: targetUrl`,
+		`timeout_ms: timeout`,
+		`elapsed_ms: Math.max(0, recordedAt - requestStartedAt)`,
+		`error_code: String(diagnostics.error_code || "")`,
+		`response_body: String(diagnostics.response_body || "").slice(0, 4000)`,
+	} {
+		if !strings.Contains(bridge, marker) {
+			t.Fatalf("bridge transport diagnostic value is discarded: %s", marker)
+		}
+	}
+
+	script := `
+const _lastBridgeFailureByPath = new Map();
+const _turnWorkflowHUDHostWarningsByRequestId = new Map();
+const TURN_WORKFLOW_HUD_WARNING_ITEM_STYLE = "warning-item";
+const TURN_WORKFLOW_HUD_WARNING_LIST_STYLE = "warning-list";
+const TURN_WORKFLOW_HUD_WARNING_DETAIL_STYLE = "warning-detail";
+const _turnWorkflowHUDUnloaded = false;
+let _turnWorkflowHUDActiveRequestId = "request-timeout";
+function t(key) { return key; }
+function escapeTurnWorkflowHUDHTML(value) { return String(value == null ? "" : value); }
+function turnWorkflowHUDIsEnabled() { return true; }
+function dismissTurnWorkflowHUD() { throw new Error("timeout warning dismissed the active workflow"); }
+function debugLog() {}
+function assert(condition, message) { if (!condition) throw new Error(message); }
+` + "\n" + classify + "\n" + remember + "\n" + hasWarning + "\n" + warningHTML + "\n" + renderTransport + `
+_lastBridgeFailureByPath.set("/prepare-turn", {kind:"timeout",status:0,detail:"timeout"});
+const timeoutRenderResult = renderTurnWorkflowHUDTransportError(
+  "request-timeout",
+  "/prepare-turn",
+  "prepare_turn_transport_unavailable"
+);
+assert(timeoutRenderResult === undefined, "prepare timeout continued into terminal HUD rendering");
+assert(!turnWorkflowHUDHasHostWarning("request-timeout"), "prepare timeout was persisted as a workflow warning");
+
+const cases = [
+  [{kind:"bridge_url_invalid",status:0,detail:"no valid bridgeUrl"}, "prepare_turn_bridge_url_invalid"],
+  [{kind:"timeout",status:0,detail:"timeout"}, "prepare_turn_timeout"],
+  [{kind:"response_decode_failed",status:200,detail:"json parse failed: Unexpected token"}, "prepare_turn_response_decode_failed"],
+  [{kind:"http_error",status:503,detail:"service unavailable"}, "prepare_turn_http_error"],
+  [{kind:"connection_failed",status:0,detail:"Failed to fetch"}, "prepare_turn_connection_failed"],
+];
+for (const entry of cases) {
+  _lastBridgeFailureByPath.set("/prepare-turn", entry[0]);
+  const warning = classifyTurnWorkflowHUDTransportFailure("/prepare-turn", "prepare_turn_transport_unavailable");
+  assert(warning.code === entry[1], "wrong classification for " + JSON.stringify(entry[0]) + ": " + warning.code);
+}
+_lastBridgeFailureByPath.set("/prepare-turn", {
+  kind:"http_error",path:"/prepare-turn",method:"POST",
+  configured_url:"http://100.64.0.10:28080",target_url:"http://100.64.0.10:28080/prepare-turn",
+  route_mode:"configured",page_host:"risu.example",loopback_on_hosted_page:false,mixed_content_risk:true,
+  status:503,timeout_ms:45000,elapsed_ms:45123,error_name:"TypeError",error_code:"ECONNRESET",
+  error_message:"request failed",error_cause:"socket closed",response_read_error:"body already read",
+  response_body:'{"code":"UPSTREAM_UNAVAILABLE"}',detail:"service unavailable",at:1722513600000
+});
+const warning = classifyTurnWorkflowHUDTransportFailure("/prepare-turn", "prepare_turn_transport_unavailable");
+rememberTurnWorkflowHUDHostWarning("request-a", warning);
+assert(turnWorkflowHUDHasHostWarning("request-a"), "host warning was not retained for the workflow request");
+const html = turnWorkflowHUDWarningListHTML({
+  request_id:"request-a",
+  warnings:[{code:"backend_warning",message:"backend warning"}],
+});
+assert(html.includes("backend warning · backend_warning"), "backend warning was lost");
+assert(html.includes("prepare_turn_http_error"), "typed transport code was not shown");
+for (const expected of [
+  "failure_kind=http_error", "request_path=/prepare-turn", "method=POST",
+  "configured_url=http://100.64.0.10:28080", "target_url=http://100.64.0.10:28080/prepare-turn",
+  "route_mode=configured", "page_host=risu.example", "loopback_on_hosted_page=false",
+  "mixed_content_risk=true", "timeout_ms=45000", "elapsed_ms=45123", "http_status=503",
+  "error_name=TypeError", "error_code=ECONNRESET", "error_message=request failed",
+  "error_cause=socket closed", "response_read_error=body already read",
+  'backend_response={"code":"UPSTREAM_UNAVAILABLE"}', "detail=service unavailable",
+  "recorded_at=2024-08-01T12:00:00.000Z",
+]) assert(html.includes(expected), "missing transport diagnostic: " + expected);
+process.stdout.write("ok");
+`
+	scriptPath := t.TempDir() + "/turn-workflow-hud-transport-runtime.js"
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
+		t.Fatalf("write turn workflow HUD transport runtime fixture: %v", err)
+	}
+	command := exec.Command(nodePath, scriptPath)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("turn workflow HUD transport runtime fixture failed: %v\n%s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "ok" {
+		t.Fatalf("turn workflow HUD transport runtime fixture output=%q, want ok", output)
+	}
+}
+
+func TestBridgeFetchRecordsEffectiveTimeoutDiagnosticsRuntime(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for bridge timeout diagnostics runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	resolver := extractArchiveCenterJSFunction(t, src, "resolveRequestTimeoutMs")
+	bridge := extractArchiveCenterJSAsyncFunction(t, src, "bridgeFetch")
+	script := `
+const settings = {bridgeUrl:"http://100.64.0.10:28080",requestTimeoutMs:25};
+const _lastBridgeFailureByPath = new Map();
+let requestMode = "delayed";
+const R = {nativeFetch: async function(){
+  if(requestMode === "delayed") {
+    return await new Promise(function(resolve){
+      setTimeout(function(){ resolve({ok:true,status:200,json:async function(){ return {status:"ok"}; }}); },40);
+    });
+  }
+  return await new Promise(function(){});
+}};
+function getRequestTimeoutSettingMs(){ return 25; }
+function resolveBridgeRuntimeRoute(rawUrl){
+  return {url:rawUrl,configuredUrl:rawUrl,mode:"configured",remoteAuto:false,pageHost:"risu.example",loopbackOnHostedPage:false,mixedContentRisk:true};
+}
+function warnLog(){}
+function debugLog(){}
+function extractBridgeErrorDetail(_payload,fallback){ return fallback; }
+function assert(condition,message){ if(!condition) throw new Error(message); }
+` + "\n" + resolver + "\n" + bridge + `
+(async function(){
+  const longResult = await bridgeFetch("/import/hypamemory", {method:"POST",body:{memories:[]},timeoutMs:0});
+  assert(longResult && longResult.status === "ok", "backend-owned wait was cut off by Plugin Timeout");
+  assert(!_lastBridgeFailureByPath.has("/import/hypamemory"), "backend-owned wait recorded a timeout failure");
+  requestMode = "hang";
+  const result = await bridgeFetch("/short-operation", {method:"POST",body:{input:"test"},timeoutMs:25});
+  assert(result === null, "timed-out request returned a result");
+  const failure = _lastBridgeFailureByPath.get("/short-operation");
+  assert(failure && failure.kind === "timeout", "timeout kind was not recorded");
+  assert(failure.timeout_ms === 25, "effective UI timeout was replaced: " + JSON.stringify(failure));
+  assert(failure.elapsed_ms >= 15 && failure.elapsed_ms < 5000, "elapsed timeout value is implausible: " + failure.elapsed_ms);
+  assert(failure.method === "POST", "request method was not recorded");
+  assert(failure.target_url === "http://100.64.0.10:28080/short-operation", "target URL was not recorded");
+  assert(failure.mixed_content_risk === true, "route diagnostics were not recorded");
+  process.stdout.write("ok");
+})().catch(function(err){ console.error(err && err.stack || err); process.exit(1); });
+`
+	scriptPath := t.TempDir() + "/bridge-effective-timeout-runtime.js"
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
+		t.Fatalf("write bridge timeout diagnostics runtime fixture: %v", err)
+	}
+	command := exec.Command(nodePath, scriptPath)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bridge timeout diagnostics runtime fixture failed: %v\n%s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "ok" {
+		t.Fatalf("bridge timeout diagnostics runtime fixture output=%q, want ok", output)
+	}
+}
+
 func TestTurnWorkflowHUDUsesRisuMainRootDocumentRuntime(t *testing.T) {
 	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
 	if nodePath == "" {
@@ -379,7 +818,7 @@ func TestTurnWorkflowHUDUsesRisuMainRootDocumentRuntime(t *testing.T) {
 		}
 	}
 	src := readArchiveCenterJS(t)
-	start := strings.Index(src, `  const TURN_WORKFLOW_HUD_CONTRACT = "turn_workflow_hud.v1";`)
+	start := strings.Index(src, `  const TURN_WORKFLOW_HUD_CONTRACT = "turn_workflow_hud.v3";`)
 	if start < 0 {
 		t.Fatal("turn workflow HUD contract marker not found")
 	}
@@ -391,12 +830,28 @@ func TestTurnWorkflowHUDUsesRisuMainRootDocumentRuntime(t *testing.T) {
 	hudRuntime := strings.TrimSpace(src[start : start+endOffset])
 	script := `
 const nodesByClass = new Map();
-const intervals = [];
-function setInterval(fn, ms) {
-  intervals.push({fn, ms});
-  return intervals.length;
+let elapsedTimerSequence = 0;
+const elapsedTimers = new Map();
+const clearedElapsedTimers = [];
+let risuEventListenerSequence = 0;
+const risuEventListeners = new Map();
+let mainDomPermissionRequests = 0;
+async function dispatchRisuEvent(type, event) {
+  for (const listener of Array.from(risuEventListeners.values())) {
+    if (listener.type === type) {
+      await listener.handler(Object.assign({type}, event || {}));
+    }
+  }
 }
-function clearInterval() {}
+function setTimeout(fn, delay) {
+  const id = ++elapsedTimerSequence;
+  elapsedTimers.set(id, {fn, delay});
+  return id;
+}
+function clearTimeout(id) {
+  clearedElapsedTimers.push(id);
+  elapsedTimers.delete(id);
+}
 class FakeRemoteNode {
   constructor(tag) {
     this.tag = tag;
@@ -405,9 +860,12 @@ class FakeRemoteNode {
     this.innerHTML = "";
     this.textContent = "";
     this.listeners = {};
+    this.listenerIds = {};
+    this.parent = null;
     this.card = null;
     this.elapsed = null;
     this.button = null;
+    this.recoveryButton = null;
     this.surface = null;
   }
   async setAttribute(name, value) {
@@ -447,22 +905,48 @@ class FakeRemoteNode {
       this.elapsed.attributes.style = sourceHTML.match(/<time[^>]*style="([^"]*)"/)?.[1] || "";
     }
     this.button = sourceHTML.includes("<button") ? new FakeRemoteNode("button") : null;
+    this.recoveryButton = sourceHTML.includes("data-turn-workflow-recovery-action")
+      ? new FakeRemoteNode("recovery-button")
+      : null;
+    if (this.card) {
+      this.card.button = this.button;
+    }
   }
   async setTextContent(value) {
     this.textContent = String(value);
   }
   async appendChild(child) {
+    child.parent = this;
     this.children.push(child);
+  }
+  async remove() {
+    if (this.parent) {
+      this.parent.children = this.parent.children.filter(child => child !== this);
+      this.parent = null;
+    }
+    for (const [className, node] of Array.from(nodesByClass.entries())) {
+      if (node === this) nodesByClass.delete(className);
+    }
   }
   async querySelector(selector) {
     if (selector === "div") return this.card;
     if (selector === "time") return this.elapsed;
     if (selector === "button") return this.button;
+    if (selector === "[data-turn-workflow-recovery-action]") return this.recoveryButton;
     return null;
   }
   async addEventListener(name, handler) {
+    const listenerId = "listener-" + (++risuEventListenerSequence);
     this.listeners[name] = handler;
-    return name + "-listener";
+    this.listenerIds[name] = listenerId;
+    risuEventListeners.set(listenerId, {type:name, handler, node:this});
+    return listenerId;
+  }
+  async getBoundingClientRect() {
+    if (this.tag === "button") {
+      return {left:110, top:10, right:128, bottom:28, width:18, height:18};
+    }
+    return {left:0, top:0, right:140, bottom:200, width:140, height:200};
   }
 }
 const head = new FakeRemoteNode("head");
@@ -488,15 +972,53 @@ const rootDocument = {
     return new FakeRemoteNode(tag);
   }
 };
-const R = {getRootDocument: async () => rootDocument};
+const R = {
+  requestPluginPermission: async function(permission) {
+    if (permission !== "mainDom") throw new Error("unexpected permission " + permission);
+    mainDomPermissionRequests++;
+    return true;
+  },
+  getRootDocument: async () => rootDocument,
+  async removeRisuEventListener(listenerId) {
+    const listener = risuEventListeners.get(listenerId);
+    if (listener && listener.node.listenerIds[listener.type] === listenerId) {
+      delete listener.node.listenerIds[listener.type];
+      delete listener.node.listeners[listener.type];
+    }
+    risuEventListeners.delete(listenerId);
+  }
+};
 const settings = {turnWorkflowHUDEnabled:true};
+const BUILD_ID = "20260802-4";
+let recoveryConfirmCalls = 0;
+const recoveryBridgeCalls = [];
+let recoveryResponseView = null;
+function confirm() {
+  recoveryConfirmCalls++;
+  return true;
+}
+async function bridgeFetch(path, options) {
+  recoveryBridgeCalls.push({path, options});
+  return {turn_workflow_hud: recoveryResponseView};
+}
 const translations = {
+  "turn_hud.recovery.retry_derived_turn": "이 턴 복구 재시도",
+  "turn_hud.recovery.confirm_title": "턴 기억 복구",
+  "turn_hud.recovery.confirm_retry_derived_turn": "{turn}턴 복구",
+  "turn_hud.recovery.requested": "복구 요청을 보냈습니다.",
+  "turn_hud.recovery.request_failed": "복구 요청에 실패했습니다.",
   "turn_hud.completed": "완료",
   "turn_hud.completed_with_warning": "경고와 함께 완료",
   "turn_hud.invalidated": "작업 중단",
   "turn_hud.failed": "실패",
   "turn_hud.tap_to_dismiss": "눌러서 닫기",
   "turn_hud.transport_unavailable": "전송 실패",
+  "turn_hud.notice.ooc_recognized": "OOC 인식",
+  "turn_hud.notice.ooc_recognized_detail": "OOC 판정으로 입력 처리를 취소했습니다.",
+  "turn_hud.notice.delete_confirmed": "삭제 확인 테스트",
+  "turn_hud.notice.delete_confirmed_detail": "삭제 출력 정리 테스트",
+  "turn_hud.notice.reroll_confirmed": "리롤 확인 테스트",
+  "turn_hud.notice.reroll_confirmed_detail": "기존 턴 교체 테스트",
   "turn_hud.not_retryable": "재시도 불가",
   "turn_hud.retryable": "재시도 가능",
   "turn_hud.stage_ledger": "전체 작동 확인",
@@ -530,6 +1052,15 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 (async function() {
+  assert(primeTurnWorkflowHUD("pending-a") === "pending-a", "host pending HUD was not accepted");
+  await _turnWorkflowHUDRenderChain;
+  const primedRoot = nodesByClass.get("mo-turn-workflow-hud-root");
+  const primedSurface = primedRoot && primedRoot.surface;
+  assert(primedSurface && primedSurface.innerHTML.includes("ARCHIVE CENTER"), "host pending HUD did not render immediately");
+  assert(primedSurface.innerHTML.includes(translations["turn_hud.stage.prepare_source"]), "host pending HUD omitted the visible waiting stage");
+  assert(mainDomPermissionRequests === 1, "host pending HUD did not request mainDom permission exactly once");
+  await dismissTurnWorkflowHUD("pending-a");
+  await _turnWorkflowHUDRenderChain;
   const counts = [
     {key:"raw",label_key:"count.raw",value:1},
     {key:"summary",label_key:"count.summary",value:2},
@@ -551,9 +1082,27 @@ function assert(condition, message) {
       llm_call:index === 3 || index === 8
     };
   });
+  const facts = [
+    {key:"host_observation",status:"accepted",disposition:"eligible",reason_code:"source_observation_eligible",severity:"normal"},
+    {key:"context_selection",status:"selected",disposition:"selected",reason_code:"payload_plan_context_selected",severity:"normal",count:240},
+    {key:"payload_delivery",status:"applied",disposition:"delivered",reason_code:"risu_host_payload_application_observed",severity:"normal"},
+    {key:"raw_persistence",status:"ok",disposition:"delivered",reason_code:"ok",severity:"normal",count:2},
+    {key:"derived_memory",status:"ok",disposition:"delivered",reason_code:"ok",severity:"normal",count:10},
+    {key:"vector_index",status:"vector_not_configured",disposition:"dropped",reason_code:"vector_not_configured",severity:"warning",count:0}
+  ];
+  const memorySelection = {
+    vector_candidate_limit:5,
+    core_objective_memory:{requested_max_items:5,eligible_distinct_count:5,delivered_count:5,deferred_by_limit_count:0,deferred_by_budget_count:0,missing_to_limit:0},
+    lanes:[{key:"direct_evidence",selected_count:12,eligible_count:13,deferred_count:0,deduplicated_count:1}],
+    items:[{source_row_id:46,turn_index:22,selection_lane:"vector_relevant",disposition:"delivered",reason_code:"selected_within_final_delivery_plan",preview:"민감한 기억 상세 본문"}],
+    exclusion_reasons:{protected_entity_not_in_current_input:2}
+  };
   assert(consumeTurnWorkflowHUD({
     contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"completed-a",revision:1,
-    logical_turn:55,status:"completed_with_warning",severity:"warning",counts,stages,
+    logical_turn:55,host_turn:56,backend_turn:55,
+    turn_alignment:{host_turn:56,backend_turn:55,state:"host_ahead",reason_code:"host_turn_ahead_of_backend"},
+    status:"completed_with_warning",severity:"warning",dismissal_policy:"x_only",counts,stages,facts,
+    memory_selection:memorySelection,
     warnings:[{code:"PUBLISHER_SKIPPED",message_key:"warn.publisher",stage_key:"stage-4"}]
   }), "completed HUD view was rejected");
   await _turnWorkflowHUDRenderChain;
@@ -577,6 +1126,13 @@ function assert(condition, message) {
   assert(surface.innerHTML.includes("건너뜀 · 0초"), "completed HUD omitted skipped stage status or duration");
   assert(surface.innerHTML.includes("지원 근거 없음"), "completed HUD omitted the visible stage reason");
   assert(surface.innerHTML.includes("감독관 호출을 건너뜀 · PUBLISHER_SKIPPED"), "completed HUD omitted warning details");
+  assert(surface.innerHTML.includes("Host 56 / Backend 55"), "completed HUD omitted host/backend turn mismatch");
+  assert(!surface.innerHTML.includes("WORKFLOW FACTS"), "completed HUD still exposes internal workflow facts");
+  assert(!surface.innerHTML.includes("eligible · accepted"), "completed HUD still exposes internal host disposition");
+  assert(!surface.innerHTML.includes("dropped · vector_not_configured"), "completed HUD still exposes internal vector disposition");
+  assert(!surface.innerHTML.includes("direct_evidence"), "completed HUD still exposes memory delivery lanes");
+  assert(!surface.innerHTML.includes("민감한 기억 상세 본문"), "completed HUD still exposes final memory item previews");
+  assert(!surface.innerHTML.includes("protected_entity_not_in_current_input"), "completed HUD still exposes exclusion reason codes");
   for (let index = 1; index <= 12; index++) {
     assert(surface.innerHTML.includes("stage.label." + index), "completed HUD omitted stage " + index);
   }
@@ -586,32 +1142,115 @@ function assert(condition, message) {
   for (const value of ["1","2","3","4","5","6","21"]) {
     assert(surface.innerHTML.includes(">" + value + "</span>"), "completed HUD omitted count " + value);
   }
-  assert(surface.card && typeof surface.card.listeners.click === "function", "terminal click dismiss listener missing");
-  await surface.card.listeners.click({type:"click"});
+  assert(surface.card && typeof surface.card.listeners.click !== "function", "warning HUD still has a card-wide dismiss listener");
+  assert(surface.button && typeof surface.button.listeners.click === "function", "warning HUD close button listener missing");
+  assert(risuEventListeners.size === 1, "warning HUD registered more than one global listener");
+  assert(surface.innerHTML !== "", "warning HUD disappeared before the close button was used");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
   await _turnWorkflowHUDRenderChain;
-  assert(surface.innerHTML === "", "terminal click did not dismiss HUD");
+  assert(surface.innerHTML !== "", "global click outside the close button dismissed the warning HUD");
+  const warningListenerId = surface.button.listenerIds.click;
+  await renderTurnWorkflowHUD({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"completed-a",revision:2,
+    logical_turn:55,status:"completed_with_warning",severity:"warning",
+    dismissal_policy:"x_only",counts,stages,facts,
+    warnings:[{code:"PUBLISHER_SKIPPED",message_key:"warn.publisher",stage_key:"stage-4"}]
+  });
+  await _turnWorkflowHUDRenderChain;
+  assert(risuEventListeners.size === 1, "HUD rerender leaked a global click listener");
+  assert(!risuEventListeners.has(warningListenerId), "HUD rerender retained its prior global click listener");
+  await dispatchRisuEvent("click", {clientX:120, clientY:20});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "warning HUD close button did not dismiss HUD");
+  assert(risuEventListeners.size === 0, "warning HUD dismissal retained its global listener");
+
+  assert(consumeTurnWorkflowHUD({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"completed-info",revision:1,
+    logical_turn:55,status:"completed",severity:"normal",dismissal_policy:"card_or_x",counts,stages
+  }), "normal completed HUD view was rejected");
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.card && typeof surface.card.listeners.click === "function", "normal completed HUD lost card-wide dismissal");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "normal completed HUD card click did not dismiss HUD");
 
   const startedAt = new Date(Date.now() - 2200).toISOString();
   assert(consumeTurnWorkflowHUD({
     contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"running-b",revision:1,
-    logical_turn:56,status:"running",severity:"info",
+    logical_turn:56,status:"running",severity:"normal",dismissal_policy:"none",
     current_stage:{ordinal:3,total:7,label_key:"turn_hud.stage.prepare_source",llm_call:true,status:"running",started_at:startedAt}
   }), "running HUD view was rejected");
   await _turnWorkflowHUDRenderChain;
   assert(surface.elapsed && /초$/.test(surface.elapsed.textContent), "LLM elapsed seconds were not rendered");
-  assert(intervals.length === 1 && intervals[0].ms === 1000, "LLM elapsed timer is not one second");
+  assert(elapsedTimers.size === 1, "LLM elapsed display did not schedule its fallback-safe timer");
+  const firstElapsedTimer = Array.from(elapsedTimers.entries())[0];
+  elapsedTimers.delete(firstElapsedTimer[0]);
+  assert(firstElapsedTimer[1].delay === 250, "LLM elapsed display used an unexpected refresh cadence");
+  firstElapsedTimer[1].fn();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(elapsedTimers.size === 1, "LLM elapsed display did not continue without requestAnimationFrame");
   assert(surface.innerHTML.includes("height:3px") && surface.innerHTML.includes("width:42.9%"), "running HUD progress bar does not reflect the backend stage ordinal");
   await dismissTurnWorkflowHUD("running-b");
   await _turnWorkflowHUDRenderChain;
+  assert(clearedElapsedTimers.length >= 1, "HUD dismissal did not cancel the elapsed timer");
+
+  assert(consumeTurnWorkflowHUDNotice({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"ooc-backend-notice",revision:1,
+    logical_turn:56,host_turn:56,backend_turn:0,
+    status:"completed",severity:"notice",dismissal_policy:"card_or_x",display_mode:"notice",
+    title_key:"turn_hud.notice.ooc_recognized",message_key:"turn_hud.notice.ooc_recognized_detail",
+    notice_code:"OOC_INPUT_CANCELLED",notice_kind:"ooc",presentation_tone:"attention",
+    stages:[],counts:[],warnings:[],facts:[{key:"host_observation",status:"observed",disposition:"dropped",severity:"notice"}]
+  }), "backend OOC notice was rejected");
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML.includes("OOC 인식"), "OOC decision did not replace the awaiting-response title");
+  assert(surface.innerHTML.includes("OOC 판정으로 입력 처리를 취소했습니다."), "OOC cancellation detail was not rendered");
+  assert(surface.card.attributes.style.includes("rgba(245,196,81,.58)"), "OOC notice did not use the yellow attention accent");
+  assert(surface.innerHTML.includes("color:#F5C451"), "OOC notice title did not use the yellow attention color");
+  assert(_turnWorkflowHUDWatchRunning === false, "OOC notice left the workflow status watcher running");
+  assert(surface.card && typeof surface.card.listeners.click === "function", "OOC informational notice lost normal card dismissal");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "OOC informational notice did not dismiss");
+  assert(consumeTurnWorkflowHUDNotice({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"delete-confirmed",revision:1,
+    logical_turn:56,status:"completed",severity:"notice",dismissal_policy:"card_or_x",display_mode:"notice",
+    title_key:"turn_hud.notice.delete_confirmed",message_key:"turn_hud.notice.delete_confirmed_detail",
+    notice_code:"ASSISTANT_OUTPUT_DELETE_CONFIRMED",counts:[],stages:[],warnings:[]
+  }), "backend deletion notice was rejected");
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML.includes("삭제 확인 테스트"), "backend deletion notice title was not rendered");
+  assert(surface.innerHTML.includes("삭제 출력 정리 테스트"), "backend deletion notice detail was not rendered");
+  assert(surface.card && typeof surface.card.listeners.click === "function", "successful deletion notice lost card dismissal");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "successful deletion notice did not dismiss");
+
+  assert(consumeTurnWorkflowHUD({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"reroll-confirmed",revision:1,
+    logical_turn:56,status:"completed",severity:"notice",dismissal_policy:"card_or_x",display_mode:"notice",
+    title_key:"turn_hud.notice.reroll_confirmed",message_key:"turn_hud.notice.reroll_confirmed_detail",
+    notice_code:"LOGICAL_TURN_REPLACED",counts:[],stages:[],warnings:[]
+  }), "backend reroll notice was rejected");
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML.includes("리롤 확인 테스트"), "backend reroll notice title was not rendered");
+  assert(surface.innerHTML.includes("기존 턴 교체 테스트"), "backend reroll notice detail was not rendered");
+  assert(surface.card && typeof surface.card.listeners.click === "function", "successful reroll notice lost card dismissal");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "successful reroll notice did not dismiss");
 
   assert(consumeTurnWorkflowHUD({
     contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"failed-c",revision:1,
-    logical_turn:57,status:"failed",severity:"error",
+    logical_turn:57,status:"failed",severity:"error",dismissal_policy:"x_only",
     stages:stages.map(function(stage, index) {
       return index === 8
         ? {...stage,status:"failed",duration_ms:800,reason_code:"CRITIC_LLM_FAILED"}
         : stage;
     }),
+    facts,
+    memory_selection:memorySelection,
     error:{code:"BAD_<CODE>",message_key:"turn_hud.transport_unavailable",retryable:false,preserved_counts:counts}
   }), "failed HUD view was rejected");
   await _turnWorkflowHUDRenderChain;
@@ -621,21 +1260,73 @@ function assert(condition, message) {
   assert(surface.innerHTML.includes("실패 · 0.8초"), "failed HUD omitted failed stage status or duration");
   assert(surface.innerHTML.includes("CRITIC_LLM_FAILED"), "failed HUD omitted the failed stage reason code");
   assert(surface.innerHTML.includes(">21</span>"), "failed HUD omitted preserved generated counts");
+  assert(!surface.innerHTML.includes("WORKFLOW FACTS"), "failed HUD still exposes internal workflow facts");
+  assert(!surface.innerHTML.includes("민감한 기억 상세 본문"), "failed HUD still exposes memory item previews");
   for (let index = 1; index <= 12; index++) {
     assert(surface.innerHTML.includes("stage.label." + index), "failed HUD omitted stage " + index);
   }
   assert(surface.button, "failed HUD has no visible close button");
   const failedCard = surface.card;
-  await failedCard.listeners.keydown({type:"keydown",key:"x"});
+  assert(typeof failedCard.listeners.click !== "function", "failed HUD still has a card-wide dismiss listener");
+  assert(typeof failedCard.listeners.keydown !== "function", "failed HUD still has a card-wide keyboard dismiss listener");
+  assert(typeof surface.button.listeners.keydown !== "function", "failed HUD registered an unidentifiable global keydown listener");
+  assert(risuEventListeners.size === 1, "failed HUD registered more than one global listener");
+  await dispatchRisuEvent("click", {clientX:50, clientY:50});
   await _turnWorkflowHUDRenderChain;
-  assert(surface.innerHTML !== "", "unrelated key dismissed terminal HUD");
-  await failedCard.listeners.keydown({type:"keydown",key:"Enter"});
+  assert(surface.innerHTML !== "", "global click outside the failed HUD close button dismissed it");
+  await dispatchRisuEvent("click", {clientX:120, clientY:20});
   await _turnWorkflowHUDRenderChain;
-  assert(surface.innerHTML === "", "Enter did not dismiss terminal HUD");
+  assert(surface.innerHTML === "", "failed HUD close button did not dismiss HUD");
+
+  const recoverableError = {
+    code:"DERIVED_PERSIST_FAILED",
+    message_key:"turn_hud.transport_unavailable",
+    retryable:true,
+    preserved_counts:counts,
+    recovery_actions:[{
+      id:"retry_derived_turn",
+      label_key:"turn_hud.recovery.retry_derived_turn",
+      confirm_title_key:"turn_hud.recovery.confirm_title",
+      confirm_message_key:"turn_hud.recovery.confirm_retry_derived_turn",
+      status:"available"
+    }]
+  };
+  const recoverableView = {
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"recoverable-turn",revision:1,
+    logical_turn:57,status:"failed",severity:"error",dismissal_policy:"x_only",
+    stages,counts,error:recoverableError
+  };
+  recoveryResponseView = {
+    ...recoverableView,
+    revision:2,
+    error:{
+      ...recoverableError,
+      recovery_actions:[{
+        ...recoverableError.recovery_actions[0],
+        status:"requested",
+        status_message_key:"turn_hud.recovery.requested"
+      }]
+    }
+  };
+  assert(consumeTurnWorkflowHUD(recoverableView), "recoverable failed HUD view was rejected");
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML.includes("이 턴 복구 재시도"), "recoverable HUD omitted its backend-supplied action");
+  assert(surface.recoveryButton && typeof surface.recoveryButton.listeners.click === "function", "recoverable HUD action listener missing");
+  await surface.recoveryButton.listeners.click({});
+  await _turnWorkflowHUDRenderChain;
+  assert(recoveryConfirmCalls === 1, "recovery action did not confirm exactly once");
+  assert(recoveryBridgeCalls.length === 1, "recovery action did not call the backend exactly once");
+  assert(recoveryBridgeCalls[0].path === "/turn-workflow/recovery", "recovery action called the wrong backend route");
+  assert(recoveryBridgeCalls[0].options.body.request_id === "recoverable-turn", "recovery action lost its request identity");
+  assert(surface.innerHTML.includes("복구 요청을 보냈습니다."), "recoverable HUD did not render the accepted recovery state");
+  assert(!surface.recoveryButton, "accepted recovery action stayed clickable");
+  await dispatchRisuEvent("click", {clientX:120, clientY:20});
+  await _turnWorkflowHUDRenderChain;
+  assert(surface.innerHTML === "", "recovery status HUD close button did not dismiss HUD");
 
   assert(consumeTurnWorkflowHUD({
     contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"invalidated-d",revision:1,
-    logical_turn:58,status:"invalidated",severity:"warning",counts,
+    logical_turn:58,status:"invalidated",severity:"warning",dismissal_policy:"x_only",counts,
     stages:stages.map(function(stage, index) {
       return index === 5
         ? {...stage,status:"invalidated",duration_ms:640,reason_code:"superseded_by_new_attempt"}
@@ -649,19 +1340,37 @@ function assert(condition, message) {
   assert(surface.card.attributes.style.includes("background:#1C1828"), "invalidated HUD does not use warning styling");
   assert(!surface.card.attributes.style.includes("background:#2A151D"), "invalidated HUD was incorrectly rendered as a red error");
   assert(surface.button, "invalidated HUD has no visible close button");
-  await surface.card.listeners.click({type:"click"});
+  assert(typeof surface.card.listeners.click !== "function", "invalidated HUD still has a card-wide dismiss listener");
+  assert(typeof surface.button.listeners.click === "function", "invalidated HUD close button listener missing");
+  await dispatchRisuEvent("click", {clientX:120, clientY:20});
   await _turnWorkflowHUDRenderChain;
-  assert(surface.innerHTML === "", "invalidated terminal click did not dismiss HUD");
+  assert(surface.innerHTML === "", "invalidated HUD close button did not dismiss HUD");
 
   settings.turnWorkflowHUDEnabled = false;
   assert(!consumeTurnWorkflowHUD({
     contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"disabled-e",revision:1,
-    logical_turn:59,status:"completed",severity:"info",counts
+    logical_turn:59,status:"completed",severity:"normal",dismissal_policy:"card_or_x",counts
   }), "disabled HUD accepted a backend view");
   startTurnWorkflowHUDWatch("disabled-e");
   await _turnWorkflowHUDRenderChain;
   assert(_turnWorkflowHUDActiveRequestId === "", "disabled HUD started a request watch");
   assert(surface.innerHTML === "", "disabled HUD left visible content behind");
+
+  settings.turnWorkflowHUDEnabled = true;
+  await renderTurnWorkflowHUD({
+    contract_version:TURN_WORKFLOW_HUD_CONTRACT,request_id:"unload-final",revision:1,
+    logical_turn:60,status:"completed",severity:"normal",dismissal_policy:"card_or_x",counts,stages
+  });
+  await _turnWorkflowHUDRenderChain;
+  assert(risuEventListeners.size === 1, "unload fixture did not register its global listener");
+  const unloadElapsedTimer = setTimeout(function() {}, 250);
+  _turnWorkflowHUDElapsedTimer = unloadElapsedTimer;
+  await unloadTurnWorkflowHUD();
+  assert(clearedElapsedTimers.includes(unloadElapsedTimer), "HUD unload did not cancel its elapsed timer");
+  assert(risuEventListeners.size === 0, "HUD unload retained a global listener");
+  assert(!body.children.includes(root), "HUD unload left its owned root attached");
+  assert(!nodesByClass.has("mo-turn-workflow-hud-root"), "HUD unload left its owned root queryable");
+  assert(_turnWorkflowHUDMainDocument === null, "HUD unload retained the main RootDocument handle");
   process.stdout.write("ok");
 })().catch(function(err) {
   console.error(err && err.stack || err);
@@ -682,6 +1391,61 @@ function assert(condition, message) {
 	}
 }
 
+func TestTryCompleteTurnRecordsOnlyBackendConfirmedReroll(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for confirmed reroll adapter fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "tryCompleteTurn")
+	script := functionBody + `
+const settings = {enabled:true,dbEnabled:true};
+let nextResult = null;
+const runtimeUpdates = [];
+function buildCompleteTurnRequestBody() { return Promise.resolve({client_meta:{turn_workflow_request_id:"request-reroll"}}); }
+function turnWorkflowHUDRequestIdFromCompleteBody(body) { return body.client_meta.turn_workflow_request_id; }
+function startTurnWorkflowHUDWatch() {}
+function consumeTurnWorkflowHUD() {}
+function renderTurnWorkflowHUDTransportError() {}
+function getCompleteTurnTimeoutMs() { return 1000; }
+function bridgeFetchWithRetry() { return Promise.resolve(nextResult); }
+async function safeCall(call) { return await call(); }
+function debugLog() {}
+function updateRuntimeState(key, status, extra) { runtimeUpdates.push({key,status,extra}); }
+function assert(condition, message) { if (!condition) throw new Error(message); }
+(async function() {
+  nextResult = {
+    status:"ok",turn_index:7,
+    source_acceptance:{accepted:true,replace_existing:true,lifecycle:"active_final"},
+    turn_workflow_hud:{contract_version:"turn_workflow_hud.v3",request_id:"request-reroll",status:"completed"}
+  };
+  await tryCompleteTurn(8, "user", "new answer", [], "session-1", null, null);
+  assert(runtimeUpdates.length === 1, "confirmed reroll was not recorded exactly once");
+  assert(runtimeUpdates[0].key === "lastRerollReplacement", "wrong runtime state key");
+  assert(runtimeUpdates[0].status === "ok", "confirmed reroll status is not ok");
+  assert(runtimeUpdates[0].extra.detail === "logical_turn_replaced", "stable reroll detail code missing");
+  assert(runtimeUpdates[0].extra.turnIndex === 7, "backend-bound logical turn was not retained");
+
+  nextResult = {
+    status:"rejected",turn_index:8,
+    source_acceptance:{accepted:false,replace_existing:true,lifecycle:"candidate_or_inactive"}
+  };
+  await tryCompleteTurn(8, "user", "candidate", [], "session-1", null, null);
+  assert(runtimeUpdates.length === 1, "rejected candidate was misreported as a reroll");
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("confirmed reroll adapter fixture failed: %v\n%s", err, out)
+	}
+}
+
 func TestPrepareTurnSourceCapabilityContractRuntime(t *testing.T) {
 	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
 	if nodePath == "" {
@@ -696,6 +1460,7 @@ func TestPrepareTurnSourceCapabilityContractRuntime(t *testing.T) {
 		extractArchiveCenterJSFunction(t, src, "adaptiveInjectionAutomaticCap") + "\n" +
 		extractArchiveCenterJSFunction(t, src, "estimateContextGrowthInjectionBudget") + "\n" +
 		extractArchiveCenterJSFunction(t, src, "estimateAdaptiveInjectionBudgetParts") + "\n" +
+		extractArchiveCenterJSFunction(t, src, "buildRisuRequestObservation") + "\n" +
 		extractArchiveCenterJSAsyncFunction(t, src, "observeRisuPersona") + "\n" +
 		extractArchiveCenterJSAsyncFunction(t, src, "tryPrepareTurn")
 	script := fn + `
@@ -706,14 +1471,13 @@ const R = {
   getChatFromIndex: async () => ({bindedPersona: "persona-a"})
 };
 const settings = {
-  narrativeGuideMode: "off", narrativeGuideStrength: "weak", storyNarrativeStance: "balanced",
+  narrativeGuideMode: "off", narrativeGuideStrength: "weak",
   pluginMainApplyMode: "shadow", inputContextEnabled: true, maxInjectionChars: 1000, injectionBudgetExtraChars: 0,
   topK: 3, injectionEnabled: true, primaryCanonBaseMaxChars: 1000,
   maxInputContextChars: 800, episodeIntervalTurns: 10,
   embeddingApiKey: "", embeddingEndpoint: "", embeddingModel: "", embeddingProvider: "off", embeddingTimeout: 1
 };
 const DEFAULT_SETTINGS = {maxInjectionChars: 1000, topK: 3, episodeIntervalTurns: 10, embeddingProvider: "off"};
-function resolveNarrativeGuideMode() { return "off"; }
 function normalizeNarrativeGuideStrength(value) { return value === "none" ? "none" : "weak"; }
 function getPayloadMessageRoleAndText(message) { return {role: message.role || "", text: message.content || ""}; }
 function sanitizeTopKSetting(value) { return Number(value || 0); }
@@ -739,6 +1503,7 @@ let expectedLane = {
 };
 async function bridgeFetch(path, options) {
   if (path !== "/prepare-turn") throw new Error("unexpected path " + path);
+  if (options.timeoutMs !== 0) throw new Error("prepare-turn retained the Plugin Timeout: " + options.timeoutMs);
   capturedBody = options.body;
   capturedBodies.push(options.body);
   return {
@@ -788,6 +1553,15 @@ async function bridgeFetch(path, options) {
       throw new Error("Go-owned 3.3-D decisions were not returned to the adapter");
     }
   }
+  R.getChatFromIndex = async () => ({bindedPersona: "persona-missing"});
+  const unresolvedBinding = await observeRisuPersona();
+  if (
+    unresolvedBinding.observation_state !== "unobserved" ||
+    unresolvedBinding.reason !== "chat_bound_persona_not_resolved"
+  ) {
+    throw new Error("unresolved explicit chat persona binding did not fail closed");
+  }
+  R.getChatFromIndex = async () => ({bindedPersona: "persona-a"});
   const hudWatchCountBeforeDecision = hudWatchIds.length;
   const decisionResult = await tryPrepareTurn("session-a", "", [{role: "user", content: "hello"}], null, "model", null, {
     sourceDecisionOnly: true, sourceObservation, capabilityObservation, hostObservations, bootstrapObservation
@@ -821,14 +1595,14 @@ async function bridgeFetch(path, options) {
   if (fullBody.host_observations !== hostObservations || fullBody.bootstrap_observation !== bootstrapObservation) {
     throw new Error("full prepare did not repeat the correlated host observations");
   }
-  if (fullBody.settings.top_k !== 0 || fullBody.settings.max_injection_chars !== 0 || fullBody.settings.max_input_context_chars !== 0 || fullBody.settings.input_context_enabled !== false) {
-    throw new Error("fresh-first-turn memory budgets were not suppressed");
+  if (fullBody.settings.top_k !== 0 || fullBody.settings.max_injection_chars !== 0 || fullBody.settings.max_input_context_chars !== 0 || fullBody.settings.injection_enabled !== true || Object.prototype.hasOwnProperty.call(fullBody.settings, "input_context_enabled")) {
+    throw new Error("fresh-first-turn memory recall was not suppressed independently from guide and Go-default input context");
   }
   await tryPrepareTurn("session-a", "hello", [{role: "user", content: "hello"}], null, "model", null, {
     sourceObservation, capabilityObservation, hostObservations, bootstrapObservation
   });
   const existingSessionBody = capturedBodies[capturedBodies.length - 1];
-  if (existingSessionBody.settings.top_k !== 3 || existingSessionBody.settings.max_injection_chars !== 1000 || existingSessionBody.settings.input_context_enabled !== true) {
+  if (existingSessionBody.settings.top_k !== 3 || existingSessionBody.settings.max_injection_chars !== 1000 || Object.prototype.hasOwnProperty.call(existingSessionBody.settings, "input_context_enabled")) {
     throw new Error("existing-session prepare budget regressed");
   }
   settings.injectionBudgetExtraChars = 2500;
@@ -837,10 +1611,20 @@ async function bridgeFetch(path, options) {
     sourceObservation, capabilityObservation, hostObservations, bootstrapObservation
   });
   const adaptiveBudgetBody = capturedBodies[capturedBodies.length - 1];
-  if (adaptiveBudgetBody.settings.max_injection_chars !== 11500) {
-    throw new Error("adaptive plus extra budget was not forwarded to Go: " + adaptiveBudgetBody.settings.max_injection_chars);
+  if (adaptiveBudgetBody.settings.max_injection_chars !== 1000 ||
+      adaptiveBudgetBody.client_meta.memory_budget_observation.extra_chars !== 2500) {
+    throw new Error("configured budget and dynamic observation were not forwarded separately: " + JSON.stringify(adaptiveBudgetBody));
   }
   settings.narrativeGuideMode = "auto";
+  settings.narrativeGuideStrength = "weak";
+  settings.pluginMainApplyMode = "off";
+  await tryPrepareTurn("session-a", "hello", [{role: "user", content: "hello"}], null, "model", null, {
+    sourceObservation, capabilityObservation, hostObservations, bootstrapObservation
+  });
+  const guideAutoBody = capturedBodies[capturedBodies.length - 1];
+  if (guideAutoBody.settings.apply_mode !== "off" || guideAutoBody.settings.guide_mode !== "auto" || guideAutoBody.settings.guide_strength !== "weak" || guideAutoBody.settings.supervisor_enabled !== true || Object.prototype.hasOwnProperty.call(guideAutoBody.settings, "input_context_enabled")) {
+    throw new Error("optional input improvement was not independent from Go-owned guide and input context: "+JSON.stringify(guideAutoBody.settings));
+  }
   settings.narrativeGuideStrength = "none";
   await tryPrepareTurn("session-a", "hello", [{role: "user", content: "hello"}], null, "model", null, {
     sourceObservation, capabilityObservation, hostObservations, bootstrapObservation
@@ -897,6 +1681,10 @@ func TestBeforeRequestNonModelSkipsPrepareTurnRuntime(t *testing.T) {
 	script := fn + `
 const settings = {enabled: true};
 function debugLog() {}
+function warnLog() {}
+function recordRisuHookLifecycle() {}
+let recomposerClears = 0;
+function clearArchiveCenterRecomposerBridge() { recomposerClears++; }
 function isSaveType(type) { return type === "model"; }
 let prepareCalls = 0;
 async function tryPrepareTurn() { prepareCalls++; throw new Error("prepare-turn must not run"); }
@@ -905,6 +1693,7 @@ async function tryPrepareTurn() { prepareCalls++; throw new Error("prepare-turn 
   const result = await onBeforeRequest(payload, "submodel");
   if (result !== payload) throw new Error("non-model payload identity changed");
   if (prepareCalls !== 0) throw new Error("non-model prepare calls=" + prepareCalls);
+  if (recomposerClears !== 1) throw new Error("non-model request left stale Recomposer context");
 })().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
 `
 	cmd := exec.Command(nodePath, "-")
@@ -925,16 +1714,20 @@ func TestBeforeRequestModelRunsDecisionThenFullWithContextRuntime(t *testing.T) 
 	}
 	src := readArchiveCenterJS(t)
 	fn := extractArchiveCenterJSAsyncFunction(t, src, "onBeforeRequest")
-	script := fn + `
+	classifyFn := extractArchiveCenterJSFunction(t, src, "classifyLlmFailureReason")
+	gateFn := extractArchiveCenterJSFunction(t, src, "buildLlmGateBlock")
+	script := classifyFn + "\n" + gateFn + "\n" + fn + `
 const settings = {enabled: true, debug: false};
-const ACTIVE_CHAT_BACKFILL_MAX_PAIRS = 20;
 let _sessionCache = null;
 let _effectiveInputAwaitingNewTurn = false;
 const _pendingPersistenceSkipBySession = new Map();
+const _pendingOrchBySession = new Map();
 let activePairs = 0;
 let latestBackendTurn = 0;
 let prepareCalls = [];
+let runtimeConfigBindingCalls = 0;
 let preFullSideEffects = 0;
+let boundedHostLifecycleCalls = 0;
 const hostObservationsFixture = {request_id: "request-runtime", payload: [{role: "user", raw_content: "actual input", message_index: 1}]};
 const bootstrapObservationFixture = {request_id: "request-runtime"};
 const languageContextFixture = {session_output_language: "ko", output_language_override: "ko"};
@@ -942,6 +1735,8 @@ const continuityFixture = {triggerMode: "manual_resume", query: "unresolved thre
 let currentContinuity = null;
 function debugLog() {}
 function warnLog() {}
+function clearArchiveCenterRecomposerBridge() {}
+function recordRisuHookLifecycle() {}
 function isSaveType(type) { return type === "model"; }
 function extractMessages(payload) { return {messages: payload.messages, path: ["messages"], hasMessageSlot: true}; }
 function normalizeMessagesForOrchestration(messages) { return messages; }
@@ -949,14 +1744,25 @@ function extractRuntimeCurrentChatTokenInfo() { return {}; }
 async function getCurrentChatSessionId() { return "session-runtime"; }
 async function resolveCanonicalWriteSessionId(value) { return value; }
 async function getCurrentActiveChatSourceObservationMessages() { return [{role: "user", content: "actual input", risuMessageIndex: 1}]; }
-function peekRawInputForSession() { return {text: "actual input", capturedAt: 1}; }
+function bindRawInputObservationToRequest(_sessionId, requestId) {
+  return {text: "actual input", actualEmptyInput: false, observationId: 1, boundRequestId: requestId};
+}
 function makeOrchRequestId() { return "request-runtime"; }
+function primeTurnWorkflowHUD() {}
+function buildPostOutputSecondaryRequestContext() { return null; }
 function buildPrepareTurnHostObservations() { return hostObservationsFixture; }
 async function observePrepareTurnBootstrap() { return bootstrapObservationFixture; }
 function buildPrepareTurnSourceObservations() { return {sourceObservation: {request_id: "request-runtime"}, capabilityObservation: {capabilities: {}}}; }
 function updateRuntimeState() {}
+async function ensureBackendRuntimeConfigBinding(instanceId) {
+  runtimeConfigBindingCalls++;
+  if (instanceId !== "backend-runtime") throw new Error("backend instance id was not forwarded");
+  return {ok:true,bound:true,skipped:true,code:"config_sync_ok",backendInstanceId:instanceId,missingRoles:[]};
+}
 function ensureActiveChatCompletedTurnsBackfilled() { preFullSideEffects++; return Promise.resolve(); }
-async function captureAssistantPrefillSeedForSession() { preFullSideEffects++; }
+async function observePendingFinalConfirmationAtHostSignal() { boundedHostLifecycleCalls++; return {accepted:true}; }
+async function captureAssistantPrefillSeedForSession() { boundedHostLifecycleCalls++; }
+async function captureFinalConfirmationRequestContext() { boundedHostLifecycleCalls++; }
 async function resolveRollbackComparableMessages() { preFullSideEffects++; return {messages: null, source: "fixture"}; }
 function scrubOocDirectivesFromUserInput(text) { return {fullyOoc: false, changed: false, text}; }
 function detectCurrentTurnOocInfo() { return {isOoc: false}; }
@@ -969,7 +1775,7 @@ async function fetchBackendLatestTurnIndexForSession() { return latestBackendTur
 async function tryPrepareTurn(sessionId, userInput, messages, continuityInfo, type, languageContext, options) {
   prepareCalls.push({sessionId, userInput, messages, continuityInfo, type, languageContext, options});
   if (options && options.sourceDecisionOnly === true) {
-    return {source: "backend-source-decision", currentInputDecision: {
+    return {source: "backend-source-decision", backendInstanceId: "backend-runtime", currentInputDecision: {
       status: "eligible", reason_code: "current_user_input_observed", effective_user_input: "actual input",
       selected_observation_ref: "input-hook:request-runtime", context_injection_eligible: true, memory_reads_allowed: true
     }, sessionBootstrap: {status: "preserved"}};
@@ -979,11 +1785,15 @@ async function tryPrepareTurn(sessionId, userInput, messages, continuityInfo, ty
 async function runFixture(expectedFresh, expectedContinuity) {
   prepareCalls = [];
   preFullSideEffects = 0;
+  boundedHostLifecycleCalls = 0;
+  runtimeConfigBindingCalls = 0;
   const payload = {messages: [{role: "system", content: "preset"}, {role: "user", content: "actual input"}, {role: "user", content: "later host prompt"}]};
   const result = await onBeforeRequest(payload, "model");
   if (result !== payload) throw new Error("fixture stop did not preserve original payload");
   if (prepareCalls.length !== 2) throw new Error("model prepare calls=" + prepareCalls.length + ", want 2");
-  if (preFullSideEffects !== 0) throw new Error("full source failure allowed pre-validation side effects=" + preFullSideEffects);
+  if (preFullSideEffects !== 1) throw new Error("rollback comparison did not run before full prepare failure=" + preFullSideEffects);
+  if (boundedHostLifecycleCalls !== 3) throw new Error("official host lifecycle was not observed/captured before fail-open="+boundedHostLifecycleCalls);
+  if (runtimeConfigBindingCalls !== 1) throw new Error("runtime config binding checks="+runtimeConfigBindingCalls+", want 1");
   const decision = prepareCalls[0];
   const full = prepareCalls[1];
   if (!decision.options.sourceDecisionOnly || decision.userInput !== "" || decision.continuityInfo !== null || decision.languageContext !== null) {
@@ -1394,6 +2204,327 @@ function assertEqual(actual, expected, label) {
 	}
 }
 
+func TestRisuRequestObservationDoesNotInferOOCAndSurvivesQueueRuntime(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for Risu request observation runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	for _, forbidden := range []string{
+		"function isOocUserMessage(",
+		"function isOocDirectiveLine(",
+		"function isOocHeaderOnlyLine(",
+		"function scrubOocDirectivesFromUserInput(",
+		"function isFullyOocUserInput(",
+		"function shouldSkipTurnPersistenceForOoc(",
+		"function showTurnWorkflowHUDOOCRecognition(",
+		"_pendingPersistenceSkipBySession",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains JavaScript OOC inference or skip authority %q", forbidden)
+		}
+	}
+	prepareFn := extractArchiveCenterJSAsyncFunction(t, src, "tryPrepareTurn")
+	completeFn := extractArchiveCenterJSAsyncFunction(t, src, "buildCompleteTurnRequestBody")
+	for name, fn := range map[string]string{"prepare": prepareFn, "complete": completeFn} {
+		if !strings.Contains(fn, "risu_request_observation") {
+			t.Fatalf("%s request does not forward risu_request_observation.v1", name)
+		}
+	}
+
+	observationFn := extractArchiveCenterJSFunction(t, src, "buildRisuRequestObservation")
+	skipFn := extractArchiveCenterJSFunction(t, src, "shouldSkipUserInputPersistence")
+	queueFn := extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload")
+	script := observationFn + "\n" + skipFn + "\n" + queueFn + `
+function isBoundaryOnlyUserInput() { return false; }
+function isRisuHistoryTrimCommandText() { return false; }
+function isMetaPromptLikeMessage() { return false; }
+function normalizeLanguageContextTrace(value) { return value; }
+function buildRisuActiveChatContextMessageObservation(msg) { return msg; }
+function assertEqual(actual, expected, label) {
+  if (actual !== expected) throw new Error(label + ": got=" + JSON.stringify(actual) + " want=" + JSON.stringify(expected));
+}
+const quoted = 'A character quoted the literal marker "[OOC]" without making a host request-class claim.';
+if (shouldSkipUserInputPersistence(quoted)) throw new Error("quoted OOC marker was classified as an OOC request");
+const before = buildRisuRequestObservation("model", "beforeRequest", "user");
+assertEqual(before.contract_version, "risu_request_observation.v1", "contract");
+assertEqual(before.observation_state, "observed", "lifecycle observation state");
+assertEqual(before.request_type, "model", "raw replacer type");
+assertEqual(before.request_type_state, "observed", "request type state");
+assertEqual(before.lifecycle_stage, "beforeRequest", "before lifecycle");
+assertEqual(before.message_role, "user", "observed role");
+assertEqual(before.channel, null, "unexposed channel value");
+assertEqual(before.channel_state, "not_exposed", "channel state");
+assertEqual(before.ooc_class, null, "unexposed OOC value");
+assertEqual(before.ooc_class_state, "not_exposed", "OOC state");
+const after = buildRisuRequestObservation("otherAx", "afterRequest", "assistant");
+const queued = buildCompleteTurnQueuePayload({
+  chat_session_id:"session",
+  turn_index:4,
+  user_input:quoted,
+  assistant_content:"assistant response",
+  context_messages:[{role:"user",content:quoted}],
+  request_type:"model",
+  client_meta:{risu_request_observation:after}
+});
+assertEqual(queued.user_input, quoted, "quoted input preserved");
+assertEqual(queued.context_messages[0].content, quoted, "quoted context preserved");
+assertEqual(queued.client_meta.risu_request_observation.request_type, "otherAx", "queued raw type");
+assertEqual(queued.client_meta.risu_request_observation.lifecycle_stage, "afterRequest", "queued lifecycle");
+assertEqual(queued.client_meta.risu_request_observation.message_role, "assistant", "queued role");
+assertEqual(queued.client_meta.risu_request_observation.ooc_class_state, "not_exposed", "queued OOC state");
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Risu request observation runtime fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueueTerminalHistoryExpiresAndDoesNotBlockAdmission(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for failed queue history fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "stableFailedQueuePayloadFingerprint"),
+		extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey"),
+		extractArchiveCenterJSFunction(t, src, "deserializeFailedQueue"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadFailedQueueFromStorage"),
+		extractArchiveCenterJSFunction(t, src, "enqueue"),
+	}, "\n")
+	script := functions + `
+const FAILED_QUEUE_STORAGE_KEY="failed";
+const _failedQueue=[];
+const settings={failedQueueMaxAgeDays:7,failedQueueMaxSize:2};
+const runtimeState={queuePersistence:{}};
+let scheduled=0;
+function computeOrchestrationDirtyHashOr1c(value) { return "h:"+String(value || ""); }
+function debugLog() {}
+function warnLog() {}
+function scheduleQueueSave() { scheduled++; }
+function payload(key,turn) {
+  return {chat_session_id:"session-1",turn_index:turn,user_input:"user",assistant_content:key,
+    context_messages:[],client_meta:{idempotency_key:key}};
+}
+const oldAt=new Date(Date.now()-8*24*60*60*1000).toISOString();
+const recentAt=new Date().toISOString();
+const raw=JSON.stringify({v:1,items:[
+  {id:"complete_turn|idempotency|expired",type:"complete_turn",payload:payload("expired",1),attempts:4,
+    state:"terminal",terminalCode:"retry_limit_reached",terminalAt:oldAt,addedAt:oldAt},
+  {id:"complete_turn|idempotency|active",type:"complete_turn",payload:payload("active",2),attempts:1,
+    state:"retryable",addedAt:recentAt}
+]});
+async function persistentGet(key) {
+  if(key!==FAILED_QUEUE_STORAGE_KEY) throw new Error("wrong storage key");
+  return raw;
+}
+(async function() {
+  await loadFailedQueueFromStorage();
+  if(_failedQueue.length!==1 || _failedQueue[0].payload.client_meta.idempotency_key!=="active") {
+    throw new Error("expired terminal incident was restored or active retry was lost");
+  }
+  if(scheduled!==1) throw new Error("expired durable history was not scheduled for storage cleanup");
+  _failedQueue.push({type:"complete_turn",payload:payload("recent-terminal",3),attempts:4,state:"terminal",
+    terminalCode:"retry_limit_reached",terminalAt:recentAt,addedAt:recentAt,
+    _dedupeKey:"complete_turn|idempotency|recent-terminal"});
+  const admitted=enqueue("complete_turn",payload("new-active",4));
+  if(!admitted || admitted.status!=="accepted" || !admitted.queued || _failedQueue.length!==2) {
+    throw new Error("terminal history still blocked a new retryable admission");
+  }
+  const keys=_failedQueue.map(item=>item.payload.client_meta.idempotency_key).sort().join(",");
+  if(keys!=="active,new-active" || _failedQueue.some(item=>item.state==="terminal")) {
+    throw new Error("capacity reclamation removed active work or retained terminal history");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed queue history fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestPendingRecoveryHistoryCleanupPreservesActiveWorkAndIsReachable(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending recovery history fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "stableFailedQueuePayloadFingerprint"),
+		extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey"),
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeChatLogRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeFailedQueueItem"),
+		extractArchiveCenterJSFunction(t, src, "serializeFailedQueue"),
+		extractArchiveCenterJSAsyncFunction(t, src, "saveFailedQueueToStorage"),
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey"),
+		extractArchiveCenterJSFunction(t, src, "serializePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "savePendingFinalConfirmationRecoveryToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "persistPendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "clearFailedQueue"),
+		extractArchiveCenterJSFunction(t, src, "renderDashboardViewModel"),
+	}, "\n")
+	script := functions + `
+const FAILED_QUEUE_STORAGE_KEY="failed";
+const PENDING_FINAL_CONFIRMATION_STORAGE_KEY="pending";
+const STARTUP_MESSAGE_TURN_INDEX=0;
+const _failedQueue=[];
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const settings={failedQueueMaxSize:2,failedQueueMaxAgeDays:7};
+const runtimeState={queuePersistence:{}};
+const stored={};
+function buildCompleteTurnQueuePayload(value) { return JSON.parse(JSON.stringify(value)); }
+function serializeAcceptedFinalRecoveryPayload(value) { return value; }
+function computeOrchestrationDirtyHashOr1c(value) { return "h:"+String(value || ""); }
+function debugLog() {}
+function warnLog() {}
+function escapeAttr(value) { return String(value || ""); }
+function t(key) { return key==="dash.queue.clearBtn" ? "Clear Past Errors" : key; }
+function dashboardSimpleText(value) { return String(value || ""); }
+function formatAuxiliaryPlacementTrace(value) { return String(value || ""); }
+function formatDashboardTimestampLocal() { return ""; }
+function statusDotClass() { return "mo-dot-notice"; }
+function dashboardViewModelLabel(value) { return String(value || ""); }
+function runtimeStatusLabel(value) { return String(value || ""); }
+async function persistentSet(key,value) { stored[key]=value; }
+function payload(key,turn) {
+  return {chat_session_id:"session-1",turn_index:turn,user_input:"user",assistant_content:key,
+    context_messages:[],client_meta:{idempotency_key:key}};
+}
+const now=new Date().toISOString();
+_failedQueue.push(
+  {type:"complete_turn",payload:payload("failed-terminal",1),attempts:4,state:"terminal",terminalAt:now,addedAt:now,
+    _dedupeKey:"complete_turn|idempotency|failed-terminal"},
+  {type:"complete_turn",payload:payload("failed-active",2),attempts:1,state:"retryable",addedAt:now,
+    _dedupeKey:"complete_turn|idempotency|failed-active"}
+);
+_pendingFinalConfirmationRecoveryEntries.set("complete|pending-terminal",{
+  key:"complete|pending-terminal",payload:payload("pending-terminal",3),state:"terminal",terminalAt:now,addedAt:now
+});
+_pendingFinalConfirmationRecoveryEntries.set("complete|pending-active",{
+  key:"complete|pending-active",payload:payload("pending-active",4),state:"pending",addedAt:now
+});
+(async function() {
+  if(!await persistPendingFinalConfirmationRecovery(payload("pending-new",5),"pending_confirmation","","")) {
+    throw new Error("terminal pending history still blocked a new active recovery");
+  }
+  if(_pendingFinalConfirmationRecoveryEntries.has("complete|pending-terminal") ||
+     !_pendingFinalConfirmationRecoveryEntries.has("complete|pending-active") ||
+     !_pendingFinalConfirmationRecoveryEntries.has("complete|pending-new")) {
+    throw new Error("pending recovery capacity reclamation removed active work");
+  }
+  _pendingFinalConfirmationRecoveryEntries.set("complete|pending-clear",{
+    key:"complete|pending-clear",payload:payload("pending-clear",6),state:"terminal",terminalAt:now,addedAt:now
+  });
+  await clearFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].payload.client_meta.idempotency_key!=="failed-active") {
+    throw new Error("manual history cleanup removed retryable failed-queue work");
+  }
+  if(_pendingFinalConfirmationRecoveryEntries.size!==2 ||
+     !_pendingFinalConfirmationRecoveryEntries.has("complete|pending-active") ||
+     !_pendingFinalConfirmationRecoveryEntries.has("complete|pending-new")) {
+    throw new Error("manual history cleanup removed active pending recoveries");
+  }
+  const failedStored=JSON.parse(stored[FAILED_QUEUE_STORAGE_KEY]);
+  const pendingStored=JSON.parse(stored[PENDING_FINAL_CONFIRMATION_STORAGE_KEY]);
+  if(failedStored.items.length!==1 || pendingStored.items.length!==2) {
+    throw new Error("cleaned history was not persisted to both pluginStorage records");
+  }
+  const html=renderDashboardViewModel({status:"ok",cards:[{id:"historical_queue",title:"Historical Queue",rows:[]}]},{});
+  if(!html.includes('id="mo-queue-clear-btn"') || !html.includes("Clear Past Errors")) {
+    throw new Error("historical queue cleanup control is not rendered on the normal dashboard card");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending recovery history fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestExpiredPendingRecoveryTerminalHistoryIsRemovedDurably(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending recovery expiry fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey"),
+		extractArchiveCenterJSFunction(t, src, "serializePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "savePendingFinalConfirmationRecoveryToStorage"),
+		extractArchiveCenterJSFunction(t, src, "removeFailedCompleteTurnByIdempotencyKey"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadPendingFinalConfirmationRecoveryFromStorage"),
+	}, "\n")
+	script := functions + `
+const PENDING_FINAL_CONFIRMATION_STORAGE_KEY="pending";
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const _failedQueue=[];
+const settings={failedQueueMaxAgeDays:7,failedQueueMaxSize:50};
+let stored="";
+let queued=0;
+function buildCompleteTurnQueuePayload(value) { return JSON.parse(JSON.stringify(value)); }
+function warnLog() {}
+function updateRuntimeState() {}
+async function flushQueueSave() {}
+async function queuePendingCompleteTurnPayload() { queued++; return true; }
+async function persistentGet(key) {
+  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  return stored;
+}
+async function persistentSet(key,value) {
+  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  stored=value;
+}
+const oldAt=new Date(Date.now()-8*24*60*60*1000).toISOString();
+const payload={chat_session_id:"session-1",turn_index:1,user_input:"user",assistant_content:"assistant",
+  context_messages:[],client_meta:{idempotency_key:"expired-pending"}};
+stored=JSON.stringify({v:1,transition_intents:[],items:[{
+  key:"complete|expired-pending",payload,state:"terminal",terminalCode:"retry_limit_reached",
+  terminalAt:oldAt,addedAt:oldAt
+}]});
+(async function() {
+  const restored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(restored!==0 || queued!==0 || _pendingFinalConfirmationRecoveryEntries.size!==0) {
+    throw new Error("expired terminal pending recovery was restored or retried");
+  }
+  const durable=JSON.parse(stored);
+  if(!Array.isArray(durable.items) || durable.items.length!==0) {
+    throw new Error("expired terminal pending recovery remained in pluginStorage");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending recovery expiry fixture failed: %v\n%s", err, out)
+	}
+}
+
 func TestRisuMessageIndexesDriveLogicalTurnPairs(t *testing.T) {
 	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
 	if nodePath == "" {
@@ -1406,7 +2537,6 @@ func TestRisuMessageIndexesDriveLogicalTurnPairs(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	functionBody := extractArchiveCenterJSFunction(t, src, "buildCompletedTurnPairsFromActiveChatMessages")
 	script := functionBody + `
-const ACTIVE_CHAT_BACKFILL_MAX_CONTEXT_MESSAGES = 20;
 const AUTO_CONTINUE_USER_INPUT_MARKER = "[continue]";
 function extractComparableMessageRoleAndContent(msg) { return msg; }
 function selectBestAssistantCandidateRecord(items) { return items[items.length - 1] || null; }
@@ -1433,6 +2563,17 @@ assertEqual(JSON.stringify(pairs.map(p => p.observedPairOrdinal)), JSON.stringif
 assertEqual(pairs.some(p => Object.prototype.hasOwnProperty.call(p, "turnIndex")), false, "adapter must not calculate authoritative turn indexes");
 pairs = buildCompletedTurnPairsFromActiveChatMessages(messages.slice(0, -2));
 assertEqual(pairs[pairs.length - 1].risuUserMessageIndex, 10, "tail deletion exposes the preceding raw Risu index");
+const fullContextMessages = [];
+for (let turn = 1; turn <= 13; turn++) {
+  const longPrefix = turn === 1 ? "x".repeat(2100) : "";
+  fullContextMessages.push(
+    {role:"user",content:"context-user-"+turn+longPrefix,risuMessageIndex:(turn-1)*2},
+    {role:"assistant",content:"context-assistant-"+turn,risuMessageIndex:(turn-1)*2+1}
+  );
+}
+pairs = buildCompletedTurnPairsFromActiveChatMessages(fullContextMessages);
+assertEqual(pairs[12].contextMessages.length, 24, "critic context must include every preceding host message");
+assertEqual(pairs[12].contextMessages[0].content, fullContextMessages[0].content, "critic context must preserve full exact content");
 `
 	cmd := exec.Command(nodePath, "-")
 	cmd.Stdin = strings.NewReader(script)
@@ -1494,7 +2635,6 @@ func TestSessionNormalizeUsesCanonicalRisuChatPairsWithoutLiveFilters(t *testing
 	script := extractArchiveCenterJSFunction(t, src, "computeOrchestrationDirtyHashOr1c") + "\n" +
 		extractArchiveCenterJSFunction(t, src, "buildCompletedTurnPairsFromActiveChatMessages") + "\n" +
 		extractArchiveCenterJSFunction(t, src, "buildSessionNormalizeCompletedTurnPairs") + `
-const ACTIVE_CHAT_BACKFILL_MAX_CONTEXT_MESSAGES = 20;
 const AUTO_CONTINUE_USER_INPUT_MARKER = "[continue]";
 function extractActiveChatComparableMessages(chat) {
   return chat.message.map(function(item, index) {
@@ -1538,6 +2678,8 @@ result = buildSessionNormalizeCompletedTurnPairs({message:longMessages});
 assertEqual(result.pairs.length, 120, "long canonical chat must not collapse to its recent tail");
 assertEqual(result.pairs[0].userContent, "user 1", "long chat first turn");
 assertEqual(result.pairs[119].assistantContent, "assistant 120", "long chat last turn");
+assertEqual(result.pairs[119].contextMessages.length, 238, "long chat critic context must not collapse to a recent fixed window");
+assertEqual(result.pairs[119].contextMessages[0].content, "user 1", "long chat critic context must retain the earliest exact message");
 const indexedGapChat = {message:[
   {role:"user",data:"gap user one"}, {role:"char",data:"gap assistant one"},
   {role:"system",data:"host metadata"}, {role:"system",data:"host metadata 2"},
@@ -1668,8 +2810,9 @@ func TestCompleteTurnObservationUsesRealUserAnchorForAppendStyleReroll(t *testin
 		}
 	}
 	src := readArchiveCenterJS(t)
+	activeWindowBody := extractArchiveCenterJSFunction(t, src, "getRisuActiveMessageWindowStart")
 	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "buildCompleteTurnSourceAcceptanceObservation")
-	script := functionBody + `
+	script := activeWindowBody + functionBody + `
 const _streamingAfterRequestSyntheticCallDepth = 0;
 const chat = {id:"chat-1",isStreaming:false,message:[
   {role:"user",data:"same user",chatId:"user-1",time:100},
@@ -1701,39 +2844,441 @@ function debugLog() {}
 	}
 }
 
-func TestLateNativeAfterRequestRearmsExpiredActiveChatWatcher(t *testing.T) {
+func TestCompleteTurnObservationDoesNotCrossRisuAllBeforeBoundary(t *testing.T) {
 	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
 	if nodePath == "" {
 		var err error
 		nodePath, err = exec.LookPath("node")
 		if err != nil {
-			t.Skip("node is required for streaming watcher fixture")
+			t.Skip("node is required for allBefore source observation fixture")
 		}
 	}
 	src := readArchiveCenterJS(t)
-	functionBody := extractArchiveCenterJSFunction(t, src, "markNativeAfterRequestObserved")
-	script := functionBody + `
-const _streamingAfterRequestWatchers = new Map();
-let armCalls = 0;
-function armStreamingAfterRequestWatch(sessionId, type, requestId) {
-  armCalls++;
-  if (requestId !== "late_native_after_request") throw new Error("unexpected rearm reason");
-  _streamingAfterRequestWatchers.set(sessionId, {nativeAfterRequestObserved:false,nativeAfterRequestObservedAt:0,type});
-}
-function updateRuntimeState() {}
-markNativeAfterRequestObserved("session-1", "model");
-const watcher = _streamingAfterRequestWatchers.get("session-1");
-if (armCalls !== 1 || !watcher || watcher.nativeAfterRequestObserved !== true || watcher.nativeAfterRequestObservedAt <= 0) {
-  throw new Error("late native afterRequest did not rearm active chat confirmation");
-}
-markNativeAfterRequestObserved("session-1", "model");
-if (armCalls !== 1) throw new Error("live watcher was unnecessarily rearmed");
+	activeWindowBody := extractArchiveCenterJSFunction(t, src, "getRisuActiveMessageWindowStart")
+	observationBody := extractArchiveCenterJSAsyncFunction(t, src, "buildCompleteTurnSourceAcceptanceObservation")
+	script := activeWindowBody + observationBody + `
+const _streamingAfterRequestSyntheticCallDepth = 0;
+const chat = {id:"chat-1",isStreaming:false,message:[
+  {role:"user",data:"disabled user",chatId:"user-old",time:100},
+  {role:"char",data:"disabled answer",chatId:"assistant-old",time:200,disabled:"allBefore"},
+  {role:"user",data:"active user",chatId:"user-new",time:300},
+  {role:"char",data:"active answer",chatId:"assistant-new",time:400,generationInfo:{generationId:"generation-new"}},
+]};
+function computeOrchestrationDirtyHashOr1c(value) { return "hash:"+String(value || "").trim(); }
+async function resolveCurrentActiveChatObject() { return {chat}; }
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function isSameAssistantComparableText(a,b) { return a === b; }
+function getSessionSnapshot() { return {msgCount:0}; }
+function debugLog() {}
+(async function() {
+  const disabled = await buildCompleteTurnSourceAcceptanceObservation(
+    "session-1", "disabled answer", {allowExistingActiveMessage:true,userInput:"disabled user"}
+  );
+  if (disabled.message_index !== -1 || disabled.user_message_index !== -1) {
+    throw new Error("allBefore-disabled source was accepted: "+JSON.stringify(disabled));
+  }
+  const active = await buildCompleteTurnSourceAcceptanceObservation(
+    "session-1", "active answer", {allowExistingActiveMessage:true,userInput:"active user"}
+  );
+  if (active.message_index !== 3 || active.user_message_index !== 2 ||
+      active.message_chat_id !== "assistant-new" || active.user_message_chat_id !== "user-new") {
+    throw new Error("active source after allBefore was not preserved: "+JSON.stringify(active));
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
 `
 	cmd := exec.Command(nodePath, "-")
 	cmd.Stdin = strings.NewReader(script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("late native afterRequest watcher fixture failed: %v\n%s", err, out)
+		t.Fatalf("allBefore source observation JS fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRisuAfterRequestAcceptsCorrelatedFinalWithoutActiveChatFabrication(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for afterRequest final fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSFunction(t, src, "acceptRisuAfterRequestFinal")
+	script := functionBody + `
+const lastOrchResult = {id:"orch-1"};
+const pending = {requestId:"archive-request-1",orchResult:lastOrchResult};
+const requestContext = {
+  sessionId:"session-1",requestId:"archive-request-1",requestType:"model",
+  hostChatId:"chat-1",requestMessageCount:2,userMessageIndex:1,
+  userMessageChatId:"user-1",userMessageTimeMs:500,
+  userObservedContentHash:"hash:user",userObservedContent:"user",
+  state:"captured",
+};
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function computeOrchestrationDirtyHashOr1c(value) { return "hash:"+String(value || ""); }
+(async function() {
+  const accepted = acceptRisuAfterRequestFinal("session-1","model",pending,requestContext,"final answer");
+  if (!accepted.observed || !accepted.accepted || requestContext.state !== "accepted" ||
+      requestContext.afterRequestCandidateHash !== "hash:final answer") {
+    throw new Error("official afterRequest final was not accepted");
+  }
+  const observation = accepted.observation;
+  if (!observation || observation.contract_version !== "source_acceptance_observation.v3" ||
+      observation.finality_source !== "risu_afterRequest" ||
+      observation.prompt_memory_availability !== "same_turn" ||
+      observation.archive_center_request_correlation_id !== "archive-request-1" ||
+      observation.message_index !== -1 || observation.message_chat_id ||
+      observation.generation_id || observation.branch_id) {
+    throw new Error("afterRequest observation lost correlation or fabricated active-chat facts");
+  }
+  const duplicate = acceptRisuAfterRequestFinal("session-1","model",pending,requestContext,"final answer");
+  if (duplicate.observed || !duplicate.accepted || !duplicate.duplicate ||
+      duplicate.reason !== "already_accepted_after_request") {
+    throw new Error("duplicate afterRequest final was not ignored");
+  }
+  const superseded = {...requestContext,state:"superseded",requestId:"archive-request-old"};
+  const oldPending = {requestId:"archive-request-old",orchResult:lastOrchResult};
+  if (acceptRisuAfterRequestFinal("session-1","model",oldPending,superseded,"old").observed) {
+    throw new Error("superseded request accepted a final");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("afterRequest final fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRisuAfterRequestReturnsPocketRisuRerollBeforePersistence(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for PocketRisu afterRequest return fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSFunction(t, src, "onAfterRequest")
+	script := `
+const settings = {enabled:true};
+const SESSION_FALLBACK = "session-default";
+const orch = {_chatSessionId:"session-1"};
+let lastOrchResult = orch;
+const _sessionCache = {sessionId:"session-1"};
+const pending = {requestId:"request-reroll",orchResult:orch};
+const requestContext = {requestId:"request-reroll"};
+const _pendingOrchBySession = new Map([["session-1",pending]]);
+const _pendingPersistenceSkipBySession = new Map();
+const _finalConfirmationRequestBySession = new Map([["session-1",requestContext]]);
+const _failedQueue = [];
+let scheduled = 0;
+let accepted = false;
+let resolverCalls = 0;
+function recordRisuHookLifecycle(){}
+function debugLog(){}
+function warnLog(){}
+function updateRuntimeState(){}
+function isNarrativeType(type){ return !type || type === "model"; }
+function isSaveType(type){ return !type || type === "model"; }
+function normalizeSessionId(value){ return String(value || "").trim(); }
+function takeNonMainRequestSkip(){ return null; }
+function schedulePostOutputFinalReplacement(){ throw new Error("unexpected secondary replacement"); }
+function markNonMainRequestHookSkipped(){ throw new Error("unexpected non-main skip"); }
+function normalizeAssistantPersistenceCandidate(value){ return String(value || "").trim(); }
+function takeAssistantPrefillSeedForSession(){ return ""; }
+function sanitizeNarrativeOutputForDisplay(value){ return String(value || ""); }
+function buildSanitizeTrace(){ return null; }
+function stripAssistantPrefillFromResponse(value){ return String(value || ""); }
+function acceptRisuAfterRequestFinal(){
+  if (accepted) {
+    return {accepted:true,duplicate:true,reason:"already_accepted_after_request"};
+  }
+  accepted = true;
+  return {
+    accepted:true,
+    duplicate:false,
+    observation:{accepted:true,finality_source:"risu_afterRequest"},
+    observationKey:"reroll-observation",
+  };
+}
+function resolveAfterRequestWriteSessionId(){
+  resolverCalls++;
+  return new Promise(function(){});
+}
+const originalResolve = Promise.resolve;
+Promise.resolve = function(){
+  return {
+    then(callback){
+      scheduled++;
+      return {catch(){}};
+    },
+  };
+};
+` + functionBody + `
+try {
+  const first = onAfterRequest("new PocketRisu reroll", "model");
+  if (first && typeof first.then === "function") {
+    throw new Error("afterRequest returned a promise and can withhold the reroll output");
+  }
+  if (first !== "new PocketRisu reroll") {
+    throw new Error("reroll output was not returned immediately: "+String(first));
+  }
+  if (resolverCalls !== 0) {
+    throw new Error("afterRequest called the blocking session resolver");
+  }
+  if (scheduled !== 1) {
+    throw new Error("accepted reroll persistence was not scheduled exactly once: "+scheduled);
+  }
+  const duplicate = onAfterRequest("new PocketRisu reroll", "model");
+  if (duplicate !== "new PocketRisu reroll") {
+    throw new Error("duplicate callback changed the visible reroll output");
+  }
+  if (scheduled !== 1) {
+    throw new Error("duplicate afterRequest scheduled persistence twice: "+scheduled);
+  }
+} finally {
+  Promise.resolve = originalResolve;
+}
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PocketRisu afterRequest return fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRisuAfterRequestObservationBypassesActiveChatReread(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for afterRequest observation fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "buildCompleteTurnSourceAcceptanceObservation")
+	script := functionBody + `
+function computeOrchestrationDirtyHashOr1c(value) { return "hash:"+String(value || "").trim(); }
+async function resolveCurrentActiveChatObject() { throw new Error("v3 reread active chat"); }
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function isSameAssistantComparableText(a,b) { return a === b; }
+function getSessionSnapshot() { return null; }
+function debugLog() {}
+(async function() {
+  const finality = {
+    accepted:true,contract_version:"source_acceptance_observation.v3",
+    host_lifecycle_contract_version:"risu_host_lifecycle_observation.v1",
+    observed_at_ms:1000,session_id:"session-1",finality_source:"risu_afterRequest",
+    finality_state:"received_final_response",host_signal_source:"afterRequest",
+    archive_center_request_correlation_id:"archive-request-1",
+    request_id_provenance:"archive_center_correlation",
+    request_correlation_state:"matched_before_request_context",request_type:"model",
+    response_role:"assistant",after_request_content_hash:"hash:persisted answer",
+    host_chat_id:"chat-1",host_chat_id_state:"observed_before_request",
+    chat_streaming_state:"not_exposed_by_risu_afterRequest",
+    active_message_count:0,request_message_count:2,message_index:-1,message_role:"",
+    message_chat_id:"",message_chat_id_state:"not_exposed_by_risu_afterRequest",
+    generation_id:"",generation_id_state:"not_exposed_by_risu_afterRequest",
+    branch_id:"",branch_id_state:"not_exposed_by_risuai",
+    message_swipe_id:-1,message_swipe_id_state:"unobserved",
+    message_time_ms:0,message_time_state:"not_exposed_by_risu_afterRequest",
+    user_message_index:1,user_message_chat_id:"user-1",
+    user_message_chat_id_state:"observed_before_request",
+    user_message_time_ms:500,user_message_time_state:"observed_before_request",
+    user_observed_content_hash:"hash:user",user_persistence_content_hash:"hash:user",
+    observed_content_hash:"hash:persisted answer",persistence_content_hash:"hash:persisted answer",
+    hash_algorithm:"or1c_utf16_djb2.v1",
+    position_observation:"not_exposed_by_risu_afterRequest",
+    later_active_turn_message_count:0,later_disabled_turn_message_count:0,later_non_turn_message_count:0,
+    message_disabled_state:"not_exposed_by_risu_afterRequest",revision_state:"not_exposed_by_risuai",
+    prompt_memory_availability:"same_turn",
+  };
+  const observation = await buildCompleteTurnSourceAcceptanceObservation(
+    "session-1","persisted answer",{sourceAcceptanceFinality:finality,userInput:"user"}
+  );
+  if (observation.contract_version !== "source_acceptance_observation.v3" ||
+      observation.finality_source !== "risu_afterRequest" ||
+      observation.user_persistence_content_hash !== "hash:user" ||
+      observation.persistence_content_hash !== "hash:persisted answer") {
+    throw new Error("official afterRequest observation was not preserved");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("afterRequest observation fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRisuNextHostSignalObservationPreservesCommittedChatFacts(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for next-host-signal observation fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "buildCompleteTurnSourceAcceptanceObservation")
+	script := functionBody + `
+function computeOrchestrationDirtyHashOr1c(value) { return "hash:"+String(value || "").trim(); }
+async function resolveCurrentActiveChatObject() { throw new Error("next-host-signal v2 reread active chat"); }
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function isSameAssistantComparableText(a,b) { return a === b; }
+function getSessionSnapshot() { return null; }
+function debugLog() {}
+(async function() {
+  const finality = {
+    accepted:true,contract_version:"source_acceptance_observation.v2",
+    host_lifecycle_contract_version:"risu_host_lifecycle_observation.v1",
+    observed_at_ms:1000,session_id:"session-1",finality_source:"risu_next_host_signal_active_chat",
+    finality_state:"committed_assistant_observed",host_signal_source:"beforeRequest",
+    archive_center_request_correlation_id:"archive-request-1",
+    request_id_provenance:"archive_center_correlation",
+    request_correlation_state:"matched_before_request_context",request_type:"model",
+    after_request_content_hash:"hash:persisted answer",host_chat_id:"chat-1",
+    host_chat_id_state:"observed",chat_streaming_state:"not_streaming",
+    active_message_count:4,message_index:2,message_role:"char",
+    message_chat_id:"assistant-1",message_chat_id_state:"observed",
+    generation_id:"generation-1",generation_id_state:"observed",
+    message_time_ms:900,message_time_state:"observed",request_message_count:2,
+    user_message_index:1,user_message_chat_id:"user-1",
+    user_message_chat_id_state:"observed_before_request",
+    user_message_time_ms:500,user_message_time_state:"observed_before_request",
+    user_observed_content_hash:"hash:user",
+    observed_content_hash:"hash:persisted answer",
+    position_observation:"committed_before_next_host_signal",
+    later_active_turn_message_count:1,next_signal_active_role:"user",
+    next_signal_user_index:3,next_signal_user_observed_content_hash:"hash:next user",
+    message_disabled_state:"not_disabled",revision_state:"not_exposed_by_risuai",
+  };
+  const observation = await buildCompleteTurnSourceAcceptanceObservation(
+    "session-1","persisted answer",{sourceAcceptanceFinality:finality,userInput:"user"}
+  );
+  if (observation.contract_version !== "source_acceptance_observation.v2" ||
+      observation.finality_source !== "risu_next_host_signal_active_chat" ||
+      observation.generation_id !== "generation-1" ||
+      observation.message_index !== 2 ||
+      observation.next_signal_user_index !== 3 ||
+      observation.position_observation !== "committed_before_next_host_signal") {
+    throw new Error("next-host-signal v2 lost active-chat commit facts");
+  }
+  if (observation.observed_content_hash !== "hash:persisted answer" ||
+      observation.persistence_content_hash !== "hash:persisted answer") {
+    throw new Error("committed and persisted hashes lost provenance");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("next-host-signal observation fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRisuHostFinalConfirmationAcceptsExactSlotAndOneTrailingCurrentUser(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for exact host-final fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSFunction(t, src, "observePendingFinalConfirmationAtHostSignal")
+	script := functionBody + `
+let activeChat = {id:"chat-a",isStreaming:false,message:[
+  {role:"char",data:"greeting"},
+  {role:"user",data:"question",chatId:"user-1",time:100},
+  {role:"char",data:"append final",chatId:"assistant-1",time:200,generationInfo:{generationId:"g-append"}},
+  {role:"user",data:"next question",chatId:"user-2",time:300},
+]};
+const R = {
+  async getCurrentCharacterIndex() { return 7; },
+  async getCurrentChatIndex() { return 3; },
+  async getChatFromIndex() { return activeChat; },
+};
+const _finalConfirmationRequestBySession = new Map();
+let persisted = [];
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function computeOrchestrationDirtyHashOr1c(value) { return "h:" + String(value || "").trim(); }
+function extractActiveChatComparableMessages(chat) {
+  return chat.message.map((item,index)=>({
+    role:item.role==="char"?"assistant":item.role,
+    content:item.data,risuMessageIndex:index,
+  }));
+}
+async function backfillOneActiveChatCompletedTurn(sid,pair,options) {
+  persisted.push({sid,pair,observation:options.sourceAcceptanceFinality});
+  return {status:"saved"};
+}
+function updateRuntimeState() {}
+function warnLog() {}
+function debugLog() {}
+
+(async function() {
+  const appendContext = {
+    state:"candidate_observed",sessionId:"session-1",requestId:"request-1",requestType:"model",
+    characterIndex:7,chatIndex:3,hostChatId:"chat-a",requestMessageCount:2,
+    userMessageIndex:1,userMessageChatId:"user-1",userMessageTimeMs:100,
+    userObservedContentHash:"h:question",userObservedContent:"question",
+    baselineAssistantIndex:-1,afterRequestCandidateHash:"h:append final",
+  };
+  _finalConfirmationRequestBySession.set("session-1",appendContext);
+  const append = await observePendingFinalConfirmationAtHostSignal("session-1","beforeRequest");
+  await Promise.resolve();
+  if (!append.accepted || appendContext.state !== "accepted" || persisted.length !== 1) {
+    throw new Error("exact append slot was not confirmed");
+  }
+  const observed = persisted[0].observation;
+  if (observed.later_active_turn_message_count !== 1 ||
+      observed.next_signal_active_role !== "user" ||
+      observed.next_signal_user_index !== 3 ||
+      observed.next_signal_user_observed_content_hash !== "h:next question" ||
+      observed.prompt_memory_availability !== "one_turn_late") {
+    throw new Error("trailing current-user anchor was not preserved");
+  }
+  const duplicate = await observePendingFinalConfirmationAtHostSignal("session-1","input");
+  if (!duplicate.accepted || !duplicate.duplicate || persisted.length !== 1) {
+    throw new Error("accepted host final persisted more than once");
+  }
+  const replaceContext = {
+    state:"captured",sessionId:"session-2",requestId:"request-2",requestType:"model",
+    characterIndex:7,chatIndex:3,hostChatId:"chat-a",requestMessageCount:2,
+    userMessageIndex:0,userObservedContentHash:"h:question",
+    baselineAssistantIndex:1,baselineAssistantContentHash:"h:old final",
+    baselineGenerationId:"g-old",baselineAssistantTimeMs:150,
+  };
+  activeChat = {id:"chat-a",isStreaming:false,message:[
+    {role:"user",data:"question",chatId:"user-reroll",time:100},
+    {role:"char",data:"rerolled final",chatId:"assistant-reroll",time:250,generationInfo:{generationId:"g-new"}},
+  ]};
+  _finalConfirmationRequestBySession.set("session-2",replaceContext);
+  const reroll = await observePendingFinalConfirmationAtHostSignal("session-2","input");
+  await Promise.resolve();
+  if (!reroll.accepted || persisted.length !== 2 ||
+      persisted[1].observation.message_index !== 1 ||
+      persisted[1].observation.generation_id !== "g-new") {
+    throw new Error("same-length reroll replacement was not confirmed");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("exact host-final fixture failed: %v\n%s", err, out)
 	}
 }
 
@@ -1855,26 +3400,39 @@ func TestPersistedCompleteTurnQueueKeepsSourceFenceWithoutCredentials(t *testing
 		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload")
 	script := functions + `
 function normalizeLanguageContextTrace(value) { return value; }
+function buildRisuActiveChatContextMessageObservation(msg) { return msg; }
 const sourceObservation = {contract_version:"source_acceptance_observation.v1",observed_at_ms:123,message_index:4,active_message_count:5};
 const sourceLineage = {contract_version:"source_to_final_lineage_observation.v1",status:"ready",
   archive_center_request_correlation_id:"correlation-1",prepare_lineage_id:"stl_1",payload_plan_id:"stp_1",
-  generation_id:"generation-1",generation_id_state:"observed",source_refs:["memory:session-1:41"],
+  generation_id:"generation-1",generation_id_state:"observed",source_revision:"source-revision-7",source_refs:["memory:session-1:41"],
   payload_application_status:"applied",payload_observation_stage:"archive_center_before_request_return",
   final_provider_payload_state:"not_exposed",semantic_outcome:"unobserved"};
+const exactContext=Array.from({length:25},(_,index)=>({
+  role:index%2===0?"user":"assistant",
+  content:index===0?"x".repeat(2101):"context-"+index,
+}));
 const saved = serializeCompleteTurnRecoveryPayload({
-  chat_session_id:"session-1",turn_index:3,user_input:"user",assistant_content:"assistant",context_messages:[],
+  chat_session_id:"session-1",turn_index:3,user_input:"user",assistant_content:"assistant",context_messages:exactContext,
   client_meta:{source_acceptance_required:true,source_acceptance_observation:sourceObservation,
-    source_to_final_lineage_observation:sourceLineage,idempotency_key:"key-1",
+    source_to_final_lineage_observation:sourceLineage,idempotency_key:"key-1",source_revision:"source-revision-7",
+    critic_input_budget_observation:{contract_version:"critic_input_budget_observation.v1",max_input_context_chars:975},
     critic:{api_key:"secret"},authorization:"Bearer secret"}
 });
 if (!saved || saved.client_meta.source_acceptance_required !== true) throw new Error("source fence requirement was lost");
 if (!saved.client_meta.source_acceptance_observation || saved.client_meta.source_acceptance_observation.message_index !== 4) throw new Error("source observation was lost");
 if (saved.client_meta.idempotency_key !== "key-1") throw new Error("idempotency key was lost");
+if (saved.client_meta.source_revision !== "source-revision-7") throw new Error("source revision was lost");
+if (!saved.client_meta.critic_input_budget_observation ||
+    saved.client_meta.critic_input_budget_observation.contract_version!=="critic_input_budget_observation.v1" ||
+    saved.client_meta.critic_input_budget_observation.max_input_context_chars!==975) throw new Error("critic input budget observation was lost");
 const savedLineage=saved.client_meta.source_to_final_lineage_observation;
 if (!savedLineage || savedLineage.archive_center_request_correlation_id!=="correlation-1" ||
   savedLineage.prepare_lineage_id!=="stl_1" || savedLineage.payload_plan_id!=="stp_1" ||
+  savedLineage.source_revision!=="source-revision-7" ||
   savedLineage.status!=="ready" || savedLineage.payload_observation_stage!=="archive_center_before_request_return" ||
   savedLineage.final_provider_payload_state!=="not_exposed") throw new Error("source lineage fence was lost");
+if (saved.context_messages.length!==exactContext.length ||
+    saved.context_messages[0].content!==exactContext[0].content) throw new Error("retry queue truncated exact critic context");
 if (saved.client_meta.critic || JSON.stringify(saved).includes("secret") || JSON.stringify(saved).includes("Bearer")) throw new Error("credential-bearing config was persisted");
 `
 	cmd := exec.Command(nodePath, "-")
@@ -1882,6 +3440,1226 @@ if (saved.client_meta.critic || JSON.stringify(saved).includes("secret") || JSON
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("persisted complete-turn source fence fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestPendingFinalConfirmationPersistsSeparatelyAndRestores(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending-final recovery fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey"),
+		extractArchiveCenterJSFunction(t, src, "serializePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "savePendingFinalConfirmationRecoveryToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "commitPendingFinalConfirmationTransitionIntent"),
+		extractArchiveCenterJSAsyncFunction(t, src, "persistPendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSFunction(t, src, "removeFailedCompleteTurnByIdempotencyKey"),
+		extractArchiveCenterJSAsyncFunction(t, src, "markPendingFinalConfirmationRecoveryTerminal"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadPendingFinalConfirmationRecoveryFromStorage"),
+	}, "\n")
+	script := functions + `
+const PENDING_FINAL_CONFIRMATION_STORAGE_KEY="pending-final";
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const _failedQueue=[];
+const settings={failedQueueMaxSize:50};
+	let stored="";
+	let localStored="";
+	let flushed=0;
+let queued=null;
+	function normalizeLanguageContextTrace(value) { return value; }
+	function safeStorageGet(key) {
+	  if (key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong local storage key");
+	  return localStored;
+	}
+	function safeStorageSet(key,value) {
+	  if (key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong local storage key");
+	  localStored=value;
+	}
+	async function persistentSet(key,value) {
+	  if (key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+	  safeStorageSet(key,value);
+	  stored=value;
+}
+async function persistentGet(key) {
+  if (key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  return stored;
+}
+async function flushQueueSave() { flushed++; }
+async function queuePendingCompleteTurnPayload(payload,reason,required,options) {
+  queued={payload,reason,required,options};
+  return true;
+}
+function warnLog() {}
+function updateRuntimeState() {}
+(async function() {
+  const payload={chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:"assistant",context_messages:[],
+    client_meta:{idempotency_key:"key-4",source_acceptance_required:true,
+      source_acceptance_observation:{host_chat_id:"chat-1",message_index:3,active_message_count:4},
+      critic:{api_key:"critic-secret"},embedding:{api_key:"embedding-secret"}}};
+  if(!await persistPendingFinalConfirmationRecovery(payload,"retry_after_new_observation","obs-old","")) {
+    throw new Error("pending final was not persisted");
+  }
+  if(!stored || stored.includes("critic-secret") || stored.includes("embedding-secret")) {
+    throw new Error("pending final storage leaked live credentials");
+  }
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  _failedQueue.push({type:"complete_turn",payload:{chat_session_id:"session-1",turn_index:4,
+    client_meta:{idempotency_key:"key-4"}}});
+  const restored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(restored!==1 || !queued || queued.required!=="obs-old" || queued.options.persist!==false ||
+     queued.options.reconciliationRequired!==true) {
+    throw new Error("pending final recovery was not reconstructed");
+  }
+  if(_failedQueue.length!==0 || flushed!==1) {
+    throw new Error("failed-queue duplicate was not atomically transferred on reload");
+  }
+  if(queued.payload.client_meta.critic || queued.payload.client_meta.embedding) {
+    throw new Error("recovered pending payload unexpectedly contains credentials");
+  }
+	  const terminalTransition=await markPendingFinalConfirmationRecoveryTerminal(payload,"","failed_queue_persistence_failed");
+	  if(!terminalTransition || !terminalTransition.durable || !terminalTransition.plugin_persisted) {
+	    throw new Error("pending terminal incident was not persisted");
+	  }
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  queued=null;
+  const terminalRestored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(terminalRestored!==0 || queued!==null) {
+    throw new Error("terminal pending incident was retried after reload");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending-final recovery fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestPendingCompleteTurnRequiresChangedHostObservation(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending observation fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := extractArchiveCenterJSFunction(t, src, "completeTurnPayloadObservationKey") +
+		extractArchiveCenterJSAsyncFunction(t, src, "observePendingCompleteTurnFinalObservation")
+	script := functions + `
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function computeOrchestrationDirtyHashOr1c(value) { return "h:" + String(value || ""); }
+async function refreshQueuedCompleteTurnSourceObservation() { return true; }
+(async function() {
+  const payload={chat_session_id:"session-1",assistant_content:"same final",client_meta:{source_acceptance_observation:{
+    host_chat_id_state:"observed",host_chat_id:"chat-1",chat_streaming_state:"not_streaming",
+    message_role:"char",message_disabled_state:"not_disabled",position_observation:"current_active_chat_tail",
+    active_message_count:2,message_index:1,generation_id:"g-1",
+    observed_content_hash:"raw-hash",persistence_content_hash:"persist-hash"
+  }}};
+  const sameKey=completeTurnPayloadObservationKey(payload);
+  const pending={payload,requestContext:null,requiredObservationChangeFrom:sameKey};
+  const same=await observePendingCompleteTurnFinalObservation(pending);
+  if(same.confirmed || same.reason!=="new_host_observation_required") {
+    throw new Error("same host observation was reused");
+  }
+  payload.client_meta.source_acceptance_observation.generation_id="g-2";
+  const changed=await observePendingCompleteTurnFinalObservation(pending);
+  if(!changed.confirmed || changed.observationKey===sameKey) {
+    throw new Error("changed host generation was not accepted");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending observation fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestConfirmedPendingFinalQueueFailureBecomesTerminalIncident(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for confirmed pending-final fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := extractArchiveCenterJSFunction(t, src, "completeTurnNeedsFreshReconciliationRetry") +
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey") +
+		extractArchiveCenterJSAsyncFunction(t, src, "queuePendingCompleteTurnPayload")
+	script := functions + `
+const _finalConfirmationRequestBySession=new Map();
+const requestContext={state:"captured"};
+_finalConfirmationRequestBySession.set("session-1",requestContext);
+let queuedCount=0;
+let pending=null;
+let terminalMarked=0;
+let lastComplete=null;
+async function persistPendingFinalConfirmationRecovery() { return true; }
+function queuePendingFinalConfirmation(value) { queuedCount++; pending=value; return true; }
+async function refreshQueuedCompleteTurnSourceObservation() { return true; }
+async function bridgeFetchWithRetry() { return null; }
+function getCompleteTurnTimeoutMs() { return 10; }
+function enqueue() { return {status:"accepted",queued:true,admitted:true,dedupe_key:"key-1"}; }
+async function persistFailedQueueAdmission() {
+  return {status:"rejected",code:"failed_queue_persistence_failed",queued:false,terminal:true};
+}
+async function markPendingFinalConfirmationRecoveryTerminal(payload,recoveryKey,code) {
+  if(code!=="failed_queue_persistence_failed") throw new Error("wrong terminal code");
+  terminalMarked++;
+  return {status:"ok",code:"pending_recovery_persisted",durable:true,plugin_persisted:true};
+}
+function updateRuntimeState(name,status,value) {
+  if(name==="lastCompleteTurnStatus") lastComplete={status,value};
+}
+(async function() {
+  const payload={chat_session_id:"session-1",turn_index:4,assistant_content:"assistant",
+    client_meta:{idempotency_key:"key-1"}};
+  if(!await queuePendingCompleteTurnPayload(payload,"pending_confirmation","old-observation")) {
+    throw new Error("pending payload was not admitted");
+  }
+  if(queuedCount!==1 || !pending) throw new Error("initial pending observation was not queued");
+  await pending.resume({observationKey:"new-observation"});
+  if(queuedCount!==1) throw new Error("confirmed-final transport failure re-entered pending observation");
+  if(pending.state!=="terminal" || requestContext.state!=="terminal" || terminalMarked!==1) {
+    throw new Error("confirmed-final failure was not terminalized");
+  }
+  if(!lastComplete || lastComplete.value.detail!=="failed_queue_persistence_failed") {
+    throw new Error("typed terminal incident was not reported");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("confirmed pending-final terminal fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestBackendPendingSupersessionRemovesRecoveryBeforeReload(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending supersession fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey"),
+		extractArchiveCenterJSFunction(t, src, "serializePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "savePendingFinalConfirmationRecoveryToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "commitPendingFinalConfirmationTransitionIntent"),
+		extractArchiveCenterJSAsyncFunction(t, src, "persistPendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "removePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "supersedePendingFinalConfirmation"),
+		extractArchiveCenterJSAsyncFunction(t, src, "captureFinalConfirmationRequestContext"),
+		extractArchiveCenterJSFunction(t, src, "removeFailedCompleteTurnByIdempotencyKey"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadPendingFinalConfirmationRecoveryFromStorage"),
+	}, "\n")
+	script := functions + `
+const PENDING_FINAL_CONFIRMATION_STORAGE_KEY="pending-final";
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const _pendingFinalConfirmations=new Map();
+const _finalConfirmationRequestBySession=new Map();
+const _failedQueue=[];
+const settings={enabled:true,failedQueueMaxSize:50};
+	let stored="";
+	let localStored="";
+	let restoredCalls=0;
+function normalizeLanguageContextTrace(value) { return value; }
+function normalizeAssistantPersistenceCandidate(value) { return String(value || "").trim(); }
+function isSaveType() { return true; }
+function updateRuntimeState() {}
+function warnLog() {}
+	function debugLog() {}
+	function safeStorageGet(key) {
+	  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong local storage key");
+	  return localStored;
+	}
+	function safeStorageSet(key,value) {
+	  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong local storage key");
+	  localStored=value;
+	}
+	async function persistentSet(key,value) {
+	  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+	  safeStorageSet(key,value);
+	  stored=value;
+}
+async function persistentGet(key) {
+  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  return stored;
+}
+async function flushQueueSave() {}
+async function queuePendingCompleteTurnPayload() { restoredCalls++; return true; }
+const R={
+  async getCurrentCharacterIndex(){return 1;},
+  async getCurrentChatIndex(){return 2;},
+  async getChatFromIndex(){return {id:"host-chat",message:[]};}
+};
+(async function() {
+  const payload={chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:"assistant",
+    context_messages:[],client_meta:{idempotency_key:"key-4"}};
+  if(!await persistPendingFinalConfirmationRecovery(payload,"pending_confirmation","old-observation","")) {
+    throw new Error("pending recovery was not persisted");
+  }
+  const previousContext={state:"captured",requestId:"request-old"};
+  _finalConfirmationRequestBySession.set("session-1",previousContext);
+  const recoveryKey=pendingFinalConfirmationRecoveryKey(payload);
+  const pending={kind:"backend_observation_retry",sessionId:"session-1",payload,
+    requestContext:previousContext,recoveryKey,state:"pending"};
+  _pendingFinalConfirmations.set(recoveryKey,pending);
+  const next=await captureFinalConfirmationRequestContext("session-1","model","request-new");
+  if(!next || previousContext.state!=="superseded" || pending.state!=="superseded") {
+    throw new Error("backend pending was not superseded with request context");
+  }
+  if(_pendingFinalConfirmations.size!==0 || _pendingFinalConfirmationRecoveryEntries.size!==0) {
+    throw new Error("superseded backend pending leaked in memory");
+  }
+  const persisted=JSON.parse(stored);
+  if(!persisted.items || persisted.items.length!==0) throw new Error("superseded recovery remained durable");
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  restoredCalls=0;
+  const restored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(restored!==0 || restoredCalls!==0 || _pendingFinalConfirmations.size!==0) {
+    throw new Error("superseded recovery returned after reload");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending supersession reload fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestPendingFinalTransitionStorageFailureRetainsDurableIntent(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending transition storage-failure fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey"),
+		extractArchiveCenterJSFunction(t, src, "serializePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "savePendingFinalConfirmationRecoveryToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "commitPendingFinalConfirmationTransitionIntent"),
+		extractArchiveCenterJSAsyncFunction(t, src, "persistPendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "removePendingFinalConfirmationRecovery"),
+		extractArchiveCenterJSAsyncFunction(t, src, "markPendingFinalConfirmationRecoveryTerminal"),
+		extractArchiveCenterJSFunction(t, src, "removeFailedCompleteTurnByIdempotencyKey"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadPendingFinalConfirmationRecoveryFromStorage"),
+	}, "\n")
+	script := functions + `
+const PENDING_FINAL_CONFIRMATION_STORAGE_KEY="pending-final";
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const _failedQueue=[];
+const settings={failedQueueMaxSize:50};
+let remoteStored="";
+let writeCount=0;
+let failOnWrite=0;
+let restoredCalls=0;
+let lastRestoreOptions=null;
+let lastRuntimeDetail="";
+function normalizeLanguageContextTrace(value) { return value; }
+async function persistentSet(key,value) {
+  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  writeCount++;
+  if(writeCount===failOnWrite) throw new Error("plugin storage transition failure");
+  remoteStored=value;
+}
+async function persistentGet(key) {
+  if(key!==PENDING_FINAL_CONFIRMATION_STORAGE_KEY) throw new Error("wrong storage key");
+  return remoteStored;
+}
+async function queuePendingCompleteTurnPayload(payload,reason,required,options) {
+  restoredCalls++;
+  lastRestoreOptions=options;
+  return true;
+}
+async function flushQueueSave() {}
+function updateRuntimeState(name,status,value) {
+  if(name==="lastCompleteTurnStatus") lastRuntimeDetail=String(value && value.detail || "");
+}
+function warnLog() {}
+function payload(idempotency) {
+  return {chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:"assistant",
+    context_messages:[],client_meta:{idempotency_key:idempotency}};
+}
+(async function() {
+  const terminalPayload=payload("terminal-storage-failure");
+  if(!await persistPendingFinalConfirmationRecovery(terminalPayload,"pending_confirmation","old-observation","")) {
+    throw new Error("terminal fixture setup was not persisted");
+  }
+  failOnWrite=3;
+  const terminalTransition=await markPendingFinalConfirmationRecoveryTerminal(
+    terminalPayload,
+    "",
+    "failed_queue_persistence_failed"
+  );
+  if(!terminalTransition || !terminalTransition.durable || terminalTransition.plugin_persisted ||
+     !terminalTransition.intent_persisted ||
+     terminalTransition.code!=="pending_terminal_persistence_failed_intent_retained") {
+    throw new Error("terminal transition failure did not retain durable intent");
+  }
+  const terminalIntentSnapshot=JSON.parse(remoteStored);
+  if(terminalIntentSnapshot.items.length!==1 || terminalIntentSnapshot.items[0].state!=="pending" ||
+     terminalIntentSnapshot.transition_intents.length!==1 ||
+     terminalIntentSnapshot.transition_intents[0].target_state!=="terminal") {
+    throw new Error("terminal intent was not committed before final state");
+  }
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  restoredCalls=0;
+  const terminalRestored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  const terminalEntry=_pendingFinalConfirmationRecoveryEntries.get("complete|terminal-storage-failure");
+  if(terminalRestored!==0 || restoredCalls!==0 || !terminalEntry || terminalEntry.state!=="terminal" ||
+     terminalEntry.terminalCode!=="failed_queue_persistence_failed" ||
+     lastRuntimeDetail!=="failed_queue_persistence_failed") {
+    throw new Error("stale durable pending revived after terminal transition storage failure");
+  }
+
+  remoteStored="";
+  writeCount=0;
+  failOnWrite=0;
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  const supersedePayload=payload("supersede-storage-failure");
+  if(!await persistPendingFinalConfirmationRecovery(supersedePayload,"pending_confirmation","old-observation","")) {
+    throw new Error("supersede fixture setup was not persisted");
+  }
+  failOnWrite=3;
+  const supersedeTransition=await removePendingFinalConfirmationRecovery(
+    supersedePayload,
+    "",
+    "new_request_superseded_pending_final"
+  );
+  if(!supersedeTransition || !supersedeTransition.durable || supersedeTransition.plugin_persisted ||
+     !supersedeTransition.intent_persisted ||
+     supersedeTransition.code!=="pending_supersede_persistence_failed_intent_retained") {
+    throw new Error("supersede removal failure did not retain durable intent");
+  }
+  const supersedeIntentSnapshot=JSON.parse(remoteStored);
+  if(supersedeIntentSnapshot.items.length!==1 || supersedeIntentSnapshot.items[0].state!=="pending" ||
+     supersedeIntentSnapshot.transition_intents.length!==1 ||
+     supersedeIntentSnapshot.transition_intents[0].target_state!=="superseded") {
+    throw new Error("supersede intent was not committed before removal");
+  }
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  restoredCalls=0;
+  const supersedeRestored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(supersedeRestored!==0 || restoredCalls!==0 || _pendingFinalConfirmationRecoveryEntries.size!==0) {
+    throw new Error("stale durable pending revived after supersede removal storage failure");
+  }
+
+  remoteStored="";
+  writeCount=0;
+  failOnWrite=0;
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  const intentFailurePayload=payload("intent-commit-failure");
+  if(!await persistPendingFinalConfirmationRecovery(intentFailurePayload,"pending_confirmation","old-observation","")) {
+    throw new Error("intent failure fixture setup was not persisted");
+  }
+  failOnWrite=2;
+  const intentFailure=await markPendingFinalConfirmationRecoveryTerminal(
+    intentFailurePayload,
+    "",
+    "failed_queue_persistence_failed"
+  );
+  const pendingEntry=_pendingFinalConfirmationRecoveryEntries.get("complete|intent-commit-failure");
+  if(!intentFailure || intentFailure.durable || intentFailure.intent_persisted ||
+     intentFailure.code!=="pending_terminal_intent_persistence_failed" ||
+     !pendingEntry || pendingEntry.state!=="pending") {
+    throw new Error("failed transition intent incorrectly claimed terminal durability");
+  }
+  _pendingFinalConfirmationRecoveryEntries.clear();
+  restoredCalls=0;
+  lastRestoreOptions=null;
+  const intentFailureRestored=await loadPendingFinalConfirmationRecoveryFromStorage();
+  if(intentFailureRestored!==1 || restoredCalls!==1 || !lastRestoreOptions ||
+     lastRestoreOptions.reconciliationRequired!==true) {
+    throw new Error("intent commit failure did not restore behind reconciliation gate");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending transition storage-failure fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestRecoveredPendingRequiresIdempotencyReconciliationBeforeRetry(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for pending reconciliation fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := extractArchiveCenterJSFunction(t, src, "pendingFinalConfirmationRecoveryKey") +
+		extractArchiveCenterJSAsyncFunction(t, src, "queuePendingCompleteTurnPayload")
+	script := functions + `
+const _finalConfirmationRequestBySession=new Map();
+let pending=null;
+let queueCalls=0;
+let statusCalls=0;
+let postCalls=0;
+let refreshCalls=0;
+let terminalCode="";
+let lastComplete=null;
+async function persistPendingFinalConfirmationRecovery() { throw new Error("recovered pending must not persist again"); }
+function queuePendingFinalConfirmation(value) { queueCalls++; pending=value; return true; }
+async function bridgeFetch(path) {
+  if(!path.startsWith("/complete-turn/request-status?idempotency_key=")) throw new Error("unexpected reconciliation path");
+  statusCalls++;
+  return null;
+}
+async function bridgeFetchWithRetry() { postCalls++; return null; }
+async function refreshQueuedCompleteTurnSourceObservation() { refreshCalls++; return true; }
+async function markPendingFinalConfirmationRecoveryTerminal(payload,recoveryKey,code) {
+  terminalCode=code;
+  return {status:"ok",code:"pending_recovery_persisted",durable:true,plugin_persisted:true,intent_persisted:true};
+}
+async function removePendingFinalConfirmationRecovery() { throw new Error("unreconciled recovery was removed"); }
+function getRequestTimeoutSettingMs() { return 10; }
+function getCompleteTurnTimeoutMs() { return 10; }
+function completeTurnPayloadObservationKey() { return "observation"; }
+function enqueue() { throw new Error("unreconciled recovery entered transport queue"); }
+async function persistFailedQueueAdmission() { throw new Error("unreconciled recovery entered transport queue"); }
+function updateRuntimeState(name,status,value) {
+  if(name==="lastCompleteTurnStatus") lastComplete={status,value};
+}
+(async function() {
+  const payload={chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:"assistant",
+    client_meta:{idempotency_key:"recovered-idempotency"}};
+  if(!await queuePendingCompleteTurnPayload(
+    payload,
+    "pending_confirmation_recovered",
+    "old-observation",
+    {persist:false,reconciliationRequired:true}
+  )) {
+    throw new Error("recovered pending was not staged");
+  }
+  await pending.resume({observationKey:"new-observation"});
+  if(statusCalls!==1 || postCalls!==0 || refreshCalls!==0 || queueCalls!==1) {
+    throw new Error("recovered pending retried before idempotency reconciliation");
+  }
+  if(pending.state!=="terminal" ||
+     terminalCode!=="pending_recovery_idempotency_reconciliation_unavailable" ||
+     !lastComplete ||
+     lastComplete.value.detail!=="pending_recovery_idempotency_reconciliation_unavailable") {
+    throw new Error("unavailable reconciliation was not fail-closed and typed");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pending reconciliation fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestDashboardQueueObservationsExposeTypedStateWithoutSecrets(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for dashboard queue observation fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSFunction(t, src, "buildDashboardQueueObservations")
+	script := functionBody + `
+const _failedQueue=[
+  {type:"complete_turn",state:"retryable",attempts:1,payload:{chat_session_id:"session-1",turn_index:4,
+    api_key:"transport-secret",client_meta:{idempotency_key:"retry-request",critic:{api_key:"critic-secret"}}}},
+  {type:"complete_turn",state:"terminal",attempts:4,terminalCode:"idempotency_key_conflict",
+    terminalAt:"2026-07-30T10:00:00.000Z",payload:{chat_session_id:"session-1",turn_index:5,
+      token:"backend-token",client_meta:{idempotency_key:"terminal-request"}}}
+];
+const _pendingFinalConfirmations=new Map([["pending",{
+  state:"pending",sessionId:"session-1",payload:{chat_session_id:"session-1",turn_index:6,
+    secret:"pending-secret",client_meta:{idempotency_key:"pending-request"}}
+}]]);
+const _pendingFinalConfirmationRecoveryEntries=new Map([["complete|recovery-request",{
+  state:"terminal",terminalCode:"failed_queue_persistence_failed",terminalAt:"2026-07-30T11:00:00.000Z",
+  payload:{chat_session_id:"session-1",turn_index:7,password:"recovery-secret",
+    client_meta:{idempotency_key:"recovery-request",embedding:{api_key:"embedding-secret"}}}
+}]]);
+function failedQueueMaxAttempts() { return 4; }
+function turnWorkflowHUDRequestIdFromCompleteBody(payload) {
+  return String(payload && payload.client_meta && payload.client_meta.idempotency_key || "");
+}
+const observations=buildDashboardQueueObservations({});
+const serialized=JSON.stringify(observations);
+for(const secret of ["transport-secret","critic-secret","backend-token","pending-secret","recovery-secret","embedding-secret"]) {
+  if(serialized.includes(secret)) throw new Error("queue observation leaked secret: "+secret);
+}
+const retryable=observations.find(row=>row.queue_kind==="transport_retry" && row.request_id==="retry-request");
+const terminal=observations.find(row=>row.queue_kind==="transport_retry" && row.request_id==="terminal-request");
+const recovery=observations.find(row=>row.queue_kind==="pending_confirmation_recovery");
+if(!retryable || retryable.state!=="retryable" || retryable.reason_code!=="" || retryable.terminal_at!=="") {
+  throw new Error("retryable transport observation was not typed");
+}
+if(!terminal || terminal.state!=="terminal" || terminal.reason_code!=="idempotency_key_conflict" ||
+   terminal.terminal_at!=="2026-07-30T10:00:00.000Z") {
+  throw new Error("terminal transport observation lost reason or timestamp");
+}
+if(!recovery || recovery.state!=="terminal" || recovery.reason_code!=="failed_queue_persistence_failed" ||
+   recovery.terminal_at!=="2026-07-30T11:00:00.000Z") {
+  throw new Error("pending recovery terminal incident was not observed");
+}
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dashboard queue observation fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueuePersistenceFailureRollsBackOnlyNewAdmission(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for queue persistence fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "stableFailedQueuePayloadFingerprint"),
+		extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey"),
+		extractArchiveCenterJSFunction(t, src, "enqueue"),
+		extractArchiveCenterJSFunction(t, src, "failedQueuePersistenceFailureResult"),
+		extractArchiveCenterJSFunction(t, src, "removeQueuedItem"),
+		extractArchiveCenterJSAsyncFunction(t, src, "persistFailedQueueAdmission"),
+		extractArchiveCenterJSAsyncFunction(t, src, "saveFailedQueueToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "flushQueueSave"),
+	}, "\n")
+	script := functions + `
+const FAILED_QUEUE_STORAGE_KEY="failed";
+const _failedQueue=[];
+const settings={failedQueueMaxSize:4};
+const runtimeState={queuePersistence:{}};
+let _queueSaveScheduled=false;
+let allowStore=false;
+let scheduled=0;
+function computeOrchestrationDirtyHashOr1c(value) { return "h:"+String(value || ""); }
+function serializeFailedQueue() { return JSON.stringify({v:1,count:_failedQueue.length}); }
+async function persistentSet() { if(!allowStore) throw new Error("storage unavailable"); }
+function scheduleQueueSave() { scheduled++; }
+function debugLog() {}
+function warnLog() {}
+(async function() {
+  const payload={chat_session_id:"session-1",turn_index:4,user_input:"u",assistant_content:"a",
+    context_messages:[],client_meta:{idempotency_key:"idem-persist"}};
+  const admission=enqueue("complete_turn",payload);
+  const failed=await persistFailedQueueAdmission("complete_turn",payload,admission);
+  if(failed.code!=="failed_queue_persistence_failed" || !failed.terminal ||
+     !failed.new_admission_rolled_back || _failedQueue.length!==0 || scheduled!==1) {
+    throw new Error("new admission was not rolled back after durable write failure");
+  }
+  allowStore=true;
+  const durableAdmission=enqueue("complete_turn",payload);
+  const durable=await persistFailedQueueAdmission("complete_turn",payload,durableAdmission);
+  if(!durable.queued || _failedQueue.length!==1) throw new Error("durable admission was not retained");
+  allowStore=false;
+  const reordered={client_meta:payload.client_meta,context_messages:[],assistant_content:"a",
+    user_input:"u",turn_index:4,chat_session_id:"session-1"};
+  const duplicate=enqueue("complete_turn",reordered);
+  const duplicateFailure=await persistFailedQueueAdmission("complete_turn",reordered,duplicate);
+  if(duplicateFailure.code!=="failed_queue_persistence_failed" || !duplicateFailure.duplicate_preserved ||
+     duplicateFailure.new_admission_rolled_back || _failedQueue.length!==1) {
+    throw new Error("pre-existing duplicate was removed after persistence failure");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("queue persistence rollback fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueueProductionAdmissionKeepsDistinctCompleteTurnRequests(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for failed queue admission fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	keyFunction := extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey")
+	if strings.Contains(keyFunction, "Date.now") || strings.Contains(keyFunction, "Math.random") {
+		t.Fatal("failed queue identity still hides failures behind time/random fallback")
+	}
+	functions := extractArchiveCenterJSFunction(t, src, "stableFailedQueuePayloadFingerprint") +
+		keyFunction +
+		extractArchiveCenterJSFunction(t, src, "enqueue")
+	script := functions + `
+const _failedQueue=[];
+const settings={failedQueueMaxSize:4};
+let scheduled=0;
+function computeOrchestrationDirtyHashOr1c(value) {
+  const text=String(value || "");
+  let hash=0;
+  for(let i=0;i<text.length;i++) hash=((hash*33)^text.charCodeAt(i))>>>0;
+  return hash.toString(16);
+}
+function debugLog() {}
+function warnLog() {}
+function scheduleQueueSave() { scheduled++; }
+function payload(idempotency,hostRequest,generation,sourceRevision,assistant) {
+  const clientMeta={
+    source_acceptance_observation:{
+      host_chat_id:"host-chat",message_index:3,message_chat_id:"message-3",
+      message_time_ms:123,observed_content_hash:"content-hash",
+      generation_id:generation,source_revision:sourceRevision
+    },
+    source_to_final_lineage_observation:{
+      archive_center_request_correlation_id:hostRequest,generation_id:generation,source_revision:sourceRevision
+    }
+  };
+  if(idempotency) clientMeta.idempotency_key=idempotency;
+  return {chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:assistant || "assistant",
+    context_messages:[{role:"user",content:"user"}],request_type:"model",client_meta:clientMeta};
+}
+const canonicalA=payload("idem-a","host-a","generation-a",1,"assistant-a");
+const canonicalChanged=payload("idem-a","host-b","generation-b",2,"assistant-b");
+if(makeFailedQueueDedupeKey({type:"complete_turn",payload:canonicalA})!=="complete_turn|idempotency|idem-a") {
+  throw new Error("canonical idempotency key was not preferred");
+}
+if(makeFailedQueueDedupeKey({type:"complete_turn",payload:canonicalA})!==
+   makeFailedQueueDedupeKey({type:"complete_turn",payload:canonicalChanged})) {
+  throw new Error("canonical idempotency did not dominate fallback coordinates");
+}
+const first=enqueue("complete_turn",canonicalA);
+if(!first || first.status!=="accepted" || !first.admitted || !first.queued || first.terminal) {
+  throw new Error("first request was not admitted with typed result");
+}
+const canonicalReordered={
+  client_meta:canonicalA.client_meta,request_type:canonicalA.request_type,context_messages:canonicalA.context_messages,
+  assistant_content:canonicalA.assistant_content,user_input:canonicalA.user_input,turn_index:canonicalA.turn_index,
+  chat_session_id:canonicalA.chat_session_id
+};
+const duplicate=enqueue("complete_turn",canonicalReordered);
+if(!duplicate || duplicate.status!=="duplicate" || duplicate.code!=="failed_queue_duplicate" ||
+   duplicate.admitted || !duplicate.queued || !duplicate.duplicate || duplicate.terminal || _failedQueue.length!==1) {
+  throw new Error("exact duplicate was not typed");
+}
+const conflict=enqueue("complete_turn",canonicalChanged);
+if(!conflict || conflict.status!=="rejected" || conflict.code!=="failed_queue_idempotency_conflict" ||
+   conflict.queued || !conflict.terminal || _failedQueue.length!==1) {
+  throw new Error("same idempotency with different payload was not terminal conflict");
+}
+const second=enqueue("complete_turn",payload("idem-b","host-a","generation-a",1,"assistant-a"));
+if(!second || second.status!=="accepted" || _failedQueue.length!==2) {
+  throw new Error("distinct idempotency request was merged");
+}
+const fallback=payload("","host-fallback","generation-fallback",7,"assistant-fallback");
+const fallbackKey=makeFailedQueueDedupeKey({type:"complete_turn",payload:fallback});
+const fallbackReordered={
+  request_type:fallback.request_type,
+  context_messages:[{content:"user",role:"user"}],
+  assistant_content:fallback.assistant_content,
+  user_input:fallback.user_input,
+  turn_index:fallback.turn_index,
+  chat_session_id:fallback.chat_session_id,
+  client_meta:{
+    source_to_final_lineage_observation:{
+      source_revision:7,
+      generation_id:"generation-fallback",
+      archive_center_request_correlation_id:"host-fallback"
+    },
+    source_acceptance_observation:{
+      source_revision:7,
+      generation_id:"generation-fallback",
+      observed_content_hash:"content-hash",
+      message_time_ms:123,
+      message_chat_id:"message-3",
+      message_index:3,
+      host_chat_id:"host-chat"
+    }
+  }
+};
+if(makeFailedQueueDedupeKey({type:"complete_turn",payload:fallbackReordered})!==fallbackKey) {
+  throw new Error("fallback identity changed with object property order");
+}
+for(const changed of [
+  payload("","host-other","generation-fallback",7,"assistant-fallback"),
+  payload("","host-fallback","generation-other",7,"assistant-fallback"),
+  payload("","host-fallback","generation-fallback",8,"assistant-fallback")
+]) {
+  if(makeFailedQueueDedupeKey({type:"complete_turn",payload:changed})===fallbackKey) {
+    throw new Error("fallback request/generation/source revision coordinate was merged");
+  }
+}
+const fallbackFirst=enqueue("complete_turn",fallback);
+const fallbackSecond=enqueue("complete_turn",payload("","host-other","generation-other",8,"assistant-fallback"));
+if(!fallbackFirst.admitted || !fallbackSecond.admitted || _failedQueue.length!==4) {
+  throw new Error("distinct fallback requests were not admitted");
+}
+const before=_failedQueue.map(item=>item._dedupeKey).join("\n");
+const overflow=enqueue("complete_turn",payload("idem-overflow","host-overflow","generation-overflow",9,"overflow"));
+const after=_failedQueue.map(item=>item._dedupeKey).join("\n");
+if(!overflow || overflow.status!=="rejected" || overflow.code!=="failed_queue_capacity_reached" ||
+   overflow.queued || overflow.retryable || !overflow.terminal || overflow.state!=="terminal") {
+  throw new Error("capacity rejection was not typed terminal");
+}
+if(before!==after || _failedQueue.length!==4) throw new Error("capacity overflow evicted an existing item");
+if(scheduled!==4) throw new Error("duplicate or rejected admission scheduled a queue write");
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed queue production admission fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueueProductionReloadAndPruneDoNotEvictForCapacity(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for failed queue reload fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey"),
+		extractArchiveCenterJSFunction(t, src, "deserializeFailedQueue"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadFailedQueueFromStorage"),
+		extractArchiveCenterJSFunction(t, src, "prunePersistedFailedQueue"),
+	}, "\n")
+	script := functions + `
+const FAILED_QUEUE_STORAGE_KEY="failed";
+const _failedQueue=[];
+const settings={failedQueueMaxAgeDays:7,failedQueueMaxSize:2};
+const runtimeState={queuePersistence:{}};
+let scheduled=0;
+function computeOrchestrationDirtyHashOr1c(value) { return "h:"+String(value || ""); }
+function debugLog() {}
+function warnLog() {}
+function scheduleQueueSave() { scheduled++; }
+const addedAt=new Date().toISOString();
+function stored(id,key) {
+  return {id,type:"complete_turn",attempts:0,state:"retryable",addedAt,payload:{
+    chat_session_id:"session-1",turn_index:4,user_input:"user",assistant_content:key,context_messages:[],
+    client_meta:{idempotency_key:key}
+  }};
+}
+const raw=JSON.stringify({v:1,items:[
+  stored("legacy|session-1|4","idem-1"),
+  stored("legacy|session-1|4","idem-2"),
+  stored("legacy|session-1|4","idem-3"),
+  stored("another-legacy-id","idem-3")
+]});
+async function persistentGet(key) {
+  if(key!==FAILED_QUEUE_STORAGE_KEY) throw new Error("wrong storage key");
+  return raw;
+}
+(async function() {
+  await loadFailedQueueFromStorage();
+  if(_failedQueue.length!==3) throw new Error("reload either merged distinct requests or retained an exact duplicate");
+  if(_failedQueue.some(item=>!String(item._dedupeKey).startsWith("complete_turn|idempotency|idem-"))) {
+    throw new Error("reload trusted a legacy coarse stored id");
+  }
+  prunePersistedFailedQueue();
+  if(_failedQueue.length!==3) throw new Error("capacity pruning evicted restored durable items");
+  if(scheduled!==0) throw new Error("capacity-only reload/prune scheduled destructive persistence");
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed queue production reload fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueueProductionDrainRetainsAndSkipsTerminalIncidents(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for failed queue drain fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "failedQueueMaxAttempts"),
+		extractArchiveCenterJSFunction(t, src, "markFailedQueueItemTerminal"),
+		extractArchiveCenterJSAsyncFunction(t, src, "markFailedQueueItemTerminalDurably"),
+		extractArchiveCenterJSAsyncFunction(t, src, "drainOneFailedQueueItem"),
+		extractArchiveCenterJSAsyncFunction(t, src, "drainFailedQueue"),
+	}, "\n")
+	script := functions + `
+const _failedQueue=[];
+const settings={failedQueueMaxAttempts:1};
+let mode="post_fail";
+let postCalls=0;
+let refreshCalls=0;
+let scheduled=0;
+function prunePersistedFailedQueue() {}
+function debugLog() {}
+function warnLog() {}
+function updateRuntimeState() {}
+function getRequestTimeoutSettingMs() { return 10; }
+function getCompleteTurnTimeoutMs() { return 1; }
+function completeTurnPayloadObservationKey() { return "observation"; }
+function isBridgeShadowGuardFailure() { return false; }
+function serializeChatLogRecoveryPayload(payload) { return payload; }
+function scheduleQueueSave() { scheduled++; }
+async function flushQueueSave() { scheduled++; return true; }
+function makeFailedQueueDedupeKey(value) { return String(value && value._dedupeKey || ""); }
+async function commitFailedQueueTransitionIntent(item,code) {
+  return {status:"ok",code:"failed_queue_terminal_intent_persisted",durable:true,intent_persisted:true,
+    intent:{queue_key:item._dedupeKey,target_state:"terminal",reason_code:code,transition_at:new Date().toISOString()}};
+}
+async function refreshQueuedCompleteTurnSourceObservation() {
+  refreshCalls++;
+  return mode!=="refresh_fail";
+}
+async function queuePendingCompleteTurnPayload() { return false; }
+async function bridgeFetch() {
+  if(mode==="processing") return {status:"processing"};
+  if(mode==="completed_retryable") return {status:"completed",retryable:true,raw_saved:false,save_ok:false};
+  return null;
+}
+async function bridgeFetchWithRetry() {
+  postCalls++;
+  if(mode==="terminal_response") {
+    return {status:"rejected",queue_action:"discard",retryable:false,code:"idempotency_key_conflict"};
+  }
+  return null;
+}
+function item(key,state) {
+  return {type:"complete_turn",payload:{chat_session_id:"session-1",turn_index:4,
+    user_input:"u",assistant_content:"a",client_meta:{idempotency_key:key}},
+    attempts:0,state:state || "retryable",addedAt:new Date(0).toISOString(),lastAttemptAt:null,
+    _dedupeKey:"complete_turn|idempotency|"+key};
+}
+async function reset(nextMode,maxAttempts) {
+  _failedQueue.length=0;
+  mode=nextMode;
+  settings.failedQueueMaxAttempts=maxAttempts;
+  postCalls=0;
+  refreshCalls=0;
+  scheduled=0;
+}
+(async function() {
+  await reset("post_fail",1);
+  _failedQueue.push(item("first"));
+  _failedQueue.push(item("second"));
+  await drainFailedQueue();
+  if(postCalls!==2 || _failedQueue.length!==2 || _failedQueue.some(row=>row.state!=="terminal")) {
+    throw new Error("one host signal did not process every retryable item exactly once");
+  }
+
+  await reset("post_fail",1);
+  _failedQueue.push(Object.assign(item("terminal-existing","terminal"),{terminalCode:"existing_terminal"}));
+  _failedQueue.push(item("retryable"));
+  await drainFailedQueue();
+  if(postCalls!==1 || _failedQueue.length!==2 || _failedQueue.some(row=>row.state!=="terminal") ||
+     !_failedQueue.some(row=>row.terminalCode==="retry_limit_reached")) {
+    throw new Error("new terminal failure was not retained beside existing incident");
+  }
+  const callsAfterTerminal=postCalls;
+  const schedulesAfterTerminal=scheduled;
+  await drainFailedQueue();
+  if(postCalls!==callsAfterTerminal || scheduled!==schedulesAfterTerminal) {
+    throw new Error("terminal incidents were retried");
+  }
+
+  await reset("refresh_fail",2);
+  _failedQueue.push(item("refresh"));
+  await drainFailedQueue();
+  if(_failedQueue[0].attempts!==1 || _failedQueue[0].state!=="retryable") {
+    throw new Error("failed pending persistence did not consume an attempt");
+  }
+  await drainFailedQueue();
+  if(_failedQueue[0].attempts!==2 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="pending_confirmation_persistence_failed") {
+    throw new Error("failed pending persistence bypassed retry limit");
+  }
+
+  await reset("processing",1);
+  _failedQueue.push(item("processing"));
+  await drainFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="idempotent_processing_timeout") {
+    throw new Error("processing timeout terminal incident was dropped");
+  }
+
+  await reset("completed_retryable",1);
+  _failedQueue.push(item("completed"));
+  await drainFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="retry_limit_reached") {
+    throw new Error("completed retry limit incident was dropped");
+  }
+
+  await reset("terminal_response",4);
+  _failedQueue.push(item("terminal-response"));
+  await drainFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="idempotency_key_conflict") {
+    throw new Error("backend terminal result was discarded");
+  }
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed queue production drain fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestFailedQueueTerminalWriteFailureReloadsFromDurableIntent(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for failed queue terminal durability fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload"),
+		extractArchiveCenterJSFunction(t, src, "stableFailedQueuePayloadFingerprint"),
+		extractArchiveCenterJSFunction(t, src, "makeFailedQueueDedupeKey"),
+		extractArchiveCenterJSFunction(t, src, "serializeCompleteTurnRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeChatLogRecoveryPayload"),
+		extractArchiveCenterJSFunction(t, src, "serializeFailedQueueItem"),
+		extractArchiveCenterJSFunction(t, src, "serializeFailedQueue"),
+		extractArchiveCenterJSFunction(t, src, "deserializeFailedQueue"),
+		extractArchiveCenterJSAsyncFunction(t, src, "saveFailedQueueToStorage"),
+		extractArchiveCenterJSAsyncFunction(t, src, "flushQueueSave"),
+		extractArchiveCenterJSAsyncFunction(t, src, "loadFailedQueueFromStorage"),
+		extractArchiveCenterJSFunction(t, src, "failedQueueMaxAttempts"),
+		extractArchiveCenterJSFunction(t, src, "markFailedQueueItemTerminal"),
+		extractArchiveCenterJSAsyncFunction(t, src, "commitFailedQueueTransitionIntent"),
+		extractArchiveCenterJSAsyncFunction(t, src, "markFailedQueueItemTerminalDurably"),
+		extractArchiveCenterJSAsyncFunction(t, src, "drainOneFailedQueueItem"),
+		extractArchiveCenterJSAsyncFunction(t, src, "drainFailedQueue"),
+		extractArchiveCenterJSFunction(t, src, "buildDashboardQueueObservations"),
+	}, "\n")
+	script := functions + `
+const FAILED_QUEUE_STORAGE_KEY="failed";
+const _failedQueue=[];
+const _pendingFinalConfirmations=new Map();
+const _pendingFinalConfirmationRecoveryEntries=new Map();
+const settings={failedQueueMaxAttempts:1,failedQueueMaxAgeDays:7,failedQueueMaxSize:50};
+const runtimeState={queuePersistence:{}};
+let _queueSaveScheduled=false;
+let remoteStored="";
+let writeCount=0;
+let failOnWrite=0;
+let mode="retry_limit";
+let postCalls=0;
+function normalizeLanguageContextTrace(value) { return value; }
+function computeOrchestrationDirtyHashOr1c(value) { return "h:"+String(value || ""); }
+function debugLog() {}
+function warnLog() {}
+function updateRuntimeState() {}
+function scheduleQueueSave() {}
+function prunePersistedFailedQueue() {}
+function getRequestTimeoutSettingMs() { return 10; }
+function getCompleteTurnTimeoutMs() { return 1; }
+function completeTurnPayloadObservationKey() { return "observation"; }
+function turnWorkflowHUDRequestIdFromCompleteBody(payload) {
+  return String(payload && payload.client_meta && payload.client_meta.idempotency_key || "");
+}
+function isBridgeShadowGuardFailure() { return false; }
+async function persistentSet(key,value) {
+  if(key!==FAILED_QUEUE_STORAGE_KEY) throw new Error("wrong storage key");
+  writeCount++;
+  if(writeCount===failOnWrite) throw new Error("terminal final write failed");
+  remoteStored=value;
+}
+async function persistentGet(key) {
+  if(key!==FAILED_QUEUE_STORAGE_KEY) throw new Error("wrong storage key");
+  return remoteStored;
+}
+async function refreshQueuedCompleteTurnSourceObservation() { return true; }
+async function queuePendingCompleteTurnPayload() { return false; }
+async function bridgeFetch() { return null; }
+async function bridgeFetchWithRetry() {
+  postCalls++;
+  if(mode==="terminal_response") {
+    return {status:"rejected",queue_action:"discard",retryable:false,code:"idempotency_key_conflict"};
+  }
+  return null;
+}
+function item(key) {
+  return {type:"complete_turn",payload:{chat_session_id:"session-1",turn_index:4,
+    user_input:"user",assistant_content:"assistant",context_messages:[],
+    client_meta:{idempotency_key:key}},attempts:0,state:"retryable",
+    addedAt:new Date().toISOString(),lastAttemptAt:null,
+    _dedupeKey:"complete_turn|idempotency|"+key};
+}
+async function runScenario(nextMode,key,expectedCode) {
+  _failedQueue.length=0;
+  remoteStored="";
+  writeCount=0;
+  failOnWrite=0;
+  mode=nextMode;
+  postCalls=0;
+  _failedQueue.push(item(key));
+  if(!await flushQueueSave()) throw new Error("initial retryable snapshot was not persisted");
+  failOnWrite=3;
+  await drainFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!==expectedCode) {
+    throw new Error("in-memory terminal transition failed");
+  }
+  const intentSnapshot=JSON.parse(remoteStored);
+  if(intentSnapshot.items.length!==1 || intentSnapshot.items[0].state!=="retryable" ||
+     intentSnapshot.transition_intents.length!==1 ||
+     intentSnapshot.transition_intents[0].reason_code!==expectedCode) {
+    throw new Error("remote terminal intent was not retained after final write failure");
+  }
+  _failedQueue.length=0;
+  await loadFailedQueueFromStorage();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!==expectedCode) {
+    throw new Error("reload revived stale retryable queue state");
+  }
+  const callsBeforeSecondDrain=postCalls;
+  await drainFailedQueue();
+  if(postCalls!==callsBeforeSecondDrain) throw new Error("reloaded terminal incident was retried");
+}
+async function runIntentFailureScenario() {
+  _failedQueue.length=0;
+  remoteStored="";
+  writeCount=0;
+  failOnWrite=0;
+  mode="retry_limit";
+  postCalls=0;
+  _failedQueue.push(item("intent-write-failure"));
+  if(!await flushQueueSave()) throw new Error("intent failure setup was not persisted");
+  failOnWrite=2;
+  await drainFailedQueue();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="failed_queue_terminal_intent_persistence_failed") {
+    throw new Error("successful final flush did not establish terminal authority");
+  }
+  const blockedSnapshot=JSON.parse(remoteStored);
+  if(blockedSnapshot.items.length!==1 || blockedSnapshot.items[0].state!=="terminal" ||
+     blockedSnapshot.items[0].terminalCode!=="failed_queue_terminal_intent_persistence_failed") {
+    throw new Error("normal final flush downgraded failed intent stop");
+  }
+  _failedQueue.length=0;
+  await loadFailedQueueFromStorage();
+  if(_failedQueue.length!==1 || _failedQueue[0].state!=="terminal" ||
+     _failedQueue[0].terminalCode!=="failed_queue_terminal_intent_persistence_failed") {
+    throw new Error("reload lost final-flush terminal authority");
+  }
+  const observation=buildDashboardQueueObservations({}).find(function(row) {
+    return row.queue_kind==="transport_retry" && row.request_id==="intent-write-failure";
+  });
+  if(!observation || observation.state!=="terminal" ||
+     observation.reason_code!=="failed_queue_terminal_intent_persistence_failed" ||
+     !observation.terminal_at) {
+    throw new Error("failed intent terminal authority was not typed for dashboard");
+  }
+  const callsBeforeSecondDrain=postCalls;
+  await drainFailedQueue();
+  if(postCalls!==callsBeforeSecondDrain) throw new Error("failed intent item posted after reload");
+}
+(async function() {
+  await runScenario("retry_limit","retry-limit-intent","retry_limit_reached");
+  await runScenario("terminal_response","terminal-response-intent","idempotency_key_conflict");
+  await runIntentFailureScenario();
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed queue terminal durability fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestPersistentSetPropagatesDurableStorageFailure(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for persistent storage fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := extractArchiveCenterJSFunction(t, src, "normalizePersistentValue") +
+		extractArchiveCenterJSAsyncFunction(t, src, "persistentSet")
+	script := functions + `
+let pluginEnabled=true;
+let _storageOk=true;
+const _persistentKnownValues=new Map();
+const _persistentPendingWrites=new Map();
+const R={pluginStorage:{async setItem(){ throw new Error("plugin write failed"); }}};
+function safeStorageSet() {}
+function safeStorageGet() { return null; }
+function _hasPluginStorage() { return pluginEnabled; }
+function warnLog() {}
+(async function() {
+  let failed=false;
+  try { await persistentSet("key","value"); } catch(err) { failed=String(err.message).includes("plugin write failed"); }
+  if(!failed || _persistentKnownValues.has("key") || _persistentPendingWrites.has("key")) {
+    throw new Error("plugin storage failure was swallowed");
+  }
+  pluginEnabled=false;
+  _storageOk=false;
+  failed=false;
+  try { await persistentSet("memory-only","value"); } catch(err) { failed=String(err.message)==="persistent_storage_unavailable"; }
+  if(!failed) throw new Error("memory-only storage was reported as durable");
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("persistent storage fixture failed: %v\n%s", err, out)
 	}
 }
 
@@ -1918,6 +4696,8 @@ func TestOutputFidelity35BProductionJSLineageBoundaries(t *testing.T) {
 const runtimeUpdates=[];
 function updateRuntimeState(key,status,detail) { runtimeUpdates.push({key,status,detail}); }
 function warnLog() { throw new Error("unexpected production warning"); }
+const RECOMPOSER_BRIDGE_CONTRACT="archive_center_recomposer_bridge.v1";
+function publishArchiveCenterRecomposerBridge() { return false; }
 const exact="[Archive Center — Auxiliary Context]\n\nmemory guidance";
 const plan={auxiliary_text:"memory guidance",input_context_text:"",
   auxiliary_observation_hash:computeOrchestrationDirtyHashOr1c(exact),payload_plan_id:"stp_1",
@@ -2021,8 +4801,10 @@ func TestRestoredCompleteTurnQueueRebuildsLiveConfigAndSourceObservation(t *test
 		}
 	}
 	src := readArchiveCenterJS(t)
-	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "refreshQueuedCompleteTurnSourceObservation")
-	script := functionBody + `
+	functions := extractArchiveCenterJSFunction(t, src, "buildCompleteTurnQueuePayload") +
+		extractArchiveCenterJSAsyncFunction(t, src, "refreshQueuedCompleteTurnSourceObservation")
+	script := functions + `
+function normalizeLanguageContextTrace(value) { return value; }
 async function findActiveChatCompletedTurnPairForContent(session, user, assistant) {
   return {observedPairOrdinal:3,userContent:user,assistantContent:assistant,pairCount:3};
 }
@@ -2033,18 +4815,18 @@ async function buildCompleteTurnRequestBody(turn, user, assistant, context, sess
   return {chat_session_id:session,turn_index:turn,user_input:user,assistant_content:assistant,context_messages:context,request_type:"model",client_meta:{
     source_acceptance_required:true,
     source_acceptance_observation:{observed_content_hash:"hash-final",host_chat_id:"chat-1",generation_id:"generation-final",message_chat_id:"message-final",message_time_state:"observed",message_time_ms:300},
-    critic:{api_key:"current-live-key"},
+    critic:{api_key:"must-not-be-copied"},
+    embedding:{api_key:"must-not-be-copied"},
     idempotency_key:"rebuilt-key",
     request_id:"rebuilt-key"
   }};
 }
-function buildCompleteTurnQueuePayload(body) { return JSON.parse(JSON.stringify(body)); }
 function debugLog() {}
 (async function() {
   const restored = {chat_session_id:"session-1",turn_index:3,user_input:"user",assistant_content:"assistant",context_messages:[],client_meta:{}};
   if (!await refreshQueuedCompleteTurnSourceObservation(restored)) throw new Error("restored queue was not refreshed");
   if (restored.client_meta.source_acceptance_required !== true || restored.client_meta.idempotency_key !== "rebuilt-key") throw new Error("source fence or request key was not rebuilt");
-  if (!restored.client_meta.critic || restored.client_meta.critic.api_key !== "current-live-key") throw new Error("current live critic config was not restored in memory");
+  if (restored.client_meta.critic || restored.client_meta.embedding) throw new Error("queued turn copied credential-bearing runtime config");
 
   const stale = {chat_session_id:"session-1",turn_index:3,user_input:"user",assistant_content:"assistant",context_messages:[],client_meta:{source_acceptance_observation:{observed_content_hash:"old",host_chat_id:"chat-1",generation_id:"generation-old"}}};
   if (await refreshQueuedCompleteTurnSourceObservation(stale)) throw new Error("stale generation was refreshed as current");
@@ -2138,7 +4920,6 @@ func TestRollbackDecisionTransportIncludesNestedLedgerCounts(t *testing.T) {
 	script := functionBody + `
 let sentBody = null;
 function getRequestTimeoutSettingMs() { return 1000; }
-async function fetchBackendLatestTurnIndexForSession() { return 9; }
 async function bridgeFetch(path, options) {
   if (path !== "/rollback/decision") throw new Error("unexpected path " + path);
   sentBody = options.body;
@@ -2147,7 +4928,6 @@ async function bridgeFetch(path, options) {
 function serializeSessionRoutingBaselineForBackend() { return null; }
 (async function() {
   await requestBackendRollbackDecision("s", 9, "delete", {
-    backendLatestTurnIndex:9,
     tailReconcileVerification:{
       status:"incomplete_user_only_tail_candidate",
       removedAssistantCount:0,
@@ -2155,7 +4935,7 @@ function serializeSessionRoutingBaselineForBackend() { return null; }
       removedMessageCount:1
     }
   }, "auto");
-  if (!sentBody || sentBody.removed_user_count !== 1 || sentBody.removed_message_count !== 1 || sentBody.removed_assistant_count !== 0 || sentBody.incomplete_tail_candidate !== true || sentBody.ledger_verified !== false) {
+  if (!sentBody || sentBody.backend_latest_turn !== 0 || sentBody.removed_user_count !== 1 || sentBody.removed_message_count !== 1 || sentBody.removed_assistant_count !== 0 || sentBody.incomplete_tail_candidate !== true || sentBody.ledger_verified !== false) {
     throw new Error("nested rollback verification was not transported: " + JSON.stringify(sentBody));
   }
 })().catch(function(err) {
@@ -2168,6 +4948,55 @@ function serializeSessionRoutingBaselineForBackend() { return null; }
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("rollback decision transport JS runtime fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestExplorerManualDeleteRefreshesSessionAndChatLogsConcurrently(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for Explorer delete refresh fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "explorerDeleteChatLogTurn")
+	script := functionBody + `
+let sessionRefreshCompleted = false;
+let chatRefreshObservedConcurrentStart = false;
+let uiRefreshCount = 0;
+function explorerSessionId() { return "session-1"; }
+async function captureChatLogRestoreSnapshot() { return 2; }
+async function executeAutoRollback() { return true; }
+async function explorerFetchSessions() {
+  await new Promise(function(resolve) { setTimeout(resolve, 25); });
+  sessionRefreshCompleted = true;
+}
+async function explorerFetchChatLogs(reset) {
+  if (reset !== true) throw new Error("chat logs were not reset");
+  chatRefreshObservedConcurrentStart = !sessionRefreshCompleted;
+}
+async function refreshExplorerUI() { uiRefreshCount += 1; }
+function debugLog() {}
+function warnLog() {}
+function t(key) { return key; }
+function alert(message) { throw new Error("unexpected alert: " + message); }
+(async function() {
+  const ok = await explorerDeleteChatLogTurn(2);
+  if (!ok || !chatRefreshObservedConcurrentStart || uiRefreshCount !== 1) {
+    throw new Error("Explorer delete refresh was not concurrent: " + JSON.stringify({ok, chatRefreshObservedConcurrentStart, uiRefreshCount}));
+  }
+})().catch(function(err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Explorer delete refresh fixture failed: %v\n%s", err, out)
 	}
 }
 
@@ -2355,8 +5184,9 @@ const ROLLBACK_TAIL_RECONCILE_MAX_BLIND_GAP_TURNS = 2;
 let _rollbackTailReconcileInFlight = false;
 let _rollbackTailReconcileLastAt = 0;
 let _lastAutoRollbackSignature = null;
+const _pendingFinalConfirmations = new Map();
 let rollbackFrom = 0;
-function hasRecentPromotedAssistantSyncPending() { return false; }
+function hasPendingFinalConfirmationForSession() { return false; }
 function extractActiveChatMessageList(chat) { return chat.message; }
 function extractActiveChatComparableMessages(chat) { return chat.message; }
 function buildCompletedTurnPairsFromActiveChatMessages() { return []; }
@@ -2401,7 +5231,6 @@ func TestPostprocessorReplacementRebuildsDeletionSnapshot(t *testing.T) {
 	functionBody := extractArchiveCenterJSAsyncFunction(t, src, "replacePersistedTurnWithPostOutputFinal")
 	script := functionBody + `
 let snapshotMessages = null;
-async function resolvePostOutputFinalAssistant() { return "final output"; }
 function normalizeMainTurnCompareText(text) { return String(text || "").trim(); }
 function normalizeAssistantPersistenceCandidate(text) { return String(text || "").trim(); }
 function isSameAssistantComparableText(left, right) { return left === right; }
@@ -2439,5 +5268,501 @@ function scheduleTimelinePostCompleteTurnRefresh() {}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("postprocessor snapshot JS runtime fixture failed: %v\n%s", err, out)
+	}
+}
+
+func TestAdapterLifecycleStateRuntimeContracts(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for adapter lifecycle runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "addRawInputSessionKey"),
+		extractArchiveCenterJSFunction(t, src, "buildRawInputSessionKeys"),
+		extractArchiveCenterJSFunction(t, src, "cacheRawInputForSession"),
+		extractArchiveCenterJSFunction(t, src, "peekRawInputForSession"),
+		extractArchiveCenterJSFunction(t, src, "bindRawInputObservationToRequest"),
+		extractArchiveCenterJSFunction(t, src, "isRisuHistoryTrimCommandText"),
+		extractArchiveCenterJSAsyncFunction(t, src, "saveSettings"),
+		extractArchiveCenterJSAsyncFunction(t, src, "refreshArchiveCenterUpdateStatus"),
+		extractArchiveCenterJSFunction(t, src, "stopTurnWorkflowHUDWatch"),
+		extractArchiveCenterJSFunction(t, src, "schedulePostOutputFinalReplacement"),
+	}, "\n")
+	script := `
+const SESSION_FALLBACK = "default";
+const RAW_INPUT_CACHE_MAX = 100;
+const _rawInputBySession = new Map();
+let _rawInputObservationSeq = 0;
+let settings = {enabled:true};
+const SETTINGS_KEY = "settings";
+let persisted = [];
+let syncAck = {ok:false,code:"backend_down"};
+let runtimeStates = [];
+async function persistentSet(key, value) { persisted.push({key,value}); }
+async function syncConfigToBackend() { return syncAck; }
+function markBackendRuntimeConfigDirty() {}
+function updateRuntimeState(key, status, state) { runtimeStates.push({key,status,state}); }
+function debugLog() {}
+function warnLog() {}
+const updateStatusEl = {innerHTML:""};
+const document = {getElementById:function(id) { return id === "mo-update-status" ? updateStatusEl : null; }};
+const archiveUpdateState = {lastStatus:null};
+let updateFetchCalls = 0;
+async function fetchArchiveCenterUpdateStatus() { updateFetchCalls++; return {status:"ok"}; }
+function formatArchiveCenterUpdateStatus(data) { return data ? "ready" : "missing"; }
+let _turnWorkflowHUDActiveRequestId = "active-request";
+let _turnWorkflowHUDWatchToken = 10;
+let _turnWorkflowHUDWatchRunning = true;
+let _turnWorkflowHUDLastRevision = 0;
+let hudCleanupCalls = 0;
+function clearTurnWorkflowHUDTimer() { hudCleanupCalls++; }
+function dismissTurnWorkflowHUD() {}
+let replacementCalls = 0;
+let panelOpen = false;
+async function replacePersistedTurnWithPostOutputFinal(_sid, _skip, response) {
+  replacementCalls++;
+  if (response !== "final output") throw new Error("post-output response was not forwarded");
+  return {replaced:true,turnIndex:3};
+}
+async function renderSettingsPanel() {}
+function assert(condition, message) { if (!condition) throw new Error(message); }
+` + "\n" + functions + `
+(async function() {
+  cacheRawInputForSession("char_7_chat_1", "first turn");
+  const first = bindRawInputObservationToRequest("char_7_chat_1", "request-1");
+  assert(first && first.text === "first turn" && first.boundRequestId === "request-1", "first raw observation was not bound");
+  assert(peekRawInputForSession("char_7_chat_1") === null, "bound observation remained reusable");
+  assert(bindRawInputObservationToRequest("char_7_chat_1", "request-2") === null, "second turn reused the first raw observation");
+  cacheRawInputForSession("char_7_chat_1", "second turn");
+  const second = bindRawInputObservationToRequest("char_7_chat_1", "request-2");
+  assert(second && second.text === "second turn" && second.observationId !== first.observationId, "second turn did not require a new observation");
+  assert(bindRawInputObservationToRequest("missing", "request-3") === null, "missing correlation synthesized a raw observation");
+
+  const failedSave = await saveSettings();
+  assert(failedSave === false, "backend sync failure was reported as a successful save");
+  assert(persisted.length === 1, "local settings were not retained on backend sync failure");
+  assert(runtimeStates.some(function(item) {
+    return item.key === "lastConfigSync" && item.status === "fail" &&
+      item.state && item.state.detail === "settings_saved_locally_backend_unsynced";
+  }), "backend sync failure was not made visible");
+  syncAck = {ok:true,code:"config_sync_ok"};
+  assert(await saveSettings(), "successful backend sync was not acknowledged");
+
+  const updateStatus = await refreshArchiveCenterUpdateStatus();
+  assert(updateStatus && updateStatus.status === "ok" && updateFetchCalls === 1, "global updater helper did not fetch status");
+  assert(updateStatusEl.innerHTML === "ready", "global updater helper did not update its DOM target");
+
+  stopTurnWorkflowHUDWatch("different-request", true);
+  assert(hudCleanupCalls === 1, "mismatched HUD stop did not clear elapsed UI work");
+  assert(_turnWorkflowHUDWatchToken === 10, "mismatched HUD stop terminated the active watcher");
+
+  schedulePostOutputFinalReplacement("s", {}, "final output");
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(replacementCalls === 1, "post-output replacement did not run as a single microtask");
+  process.stdout.write("ok");
+})().catch(function(err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("adapter lifecycle JS runtime fixture failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("adapter lifecycle JS runtime fixture output=%q, want ok", out)
+	}
+}
+
+func TestAdapterRecurringPathsAreExplicitOneShotRuntime(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for one-shot adapter runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSAsyncFunction(t, src, "referenceLibraryPollJob"),
+		extractArchiveCenterJSFunction(t, src, "cancelAdminBackgroundJobStream"),
+		extractArchiveCenterJSFunction(t, src, "markAdminBackgroundJobStreamUnavailable"),
+		extractArchiveCenterJSFunction(t, src, "applyAdminBackgroundJobSnapshot"),
+		extractArchiveCenterJSAsyncFunction(t, src, "pollAdminBackgroundJob"),
+		extractArchiveCenterJSAsyncFunction(t, src, "reconcileRollbackFromHostSignal"),
+	}, "\n")
+	script := `
+const _referenceLibraryState = {job:null};
+let referenceCalls = 0;
+let adminCalls = 0;
+let explorerRefreshes = 0;
+let rollbackReconcileCalls = 0;
+let rollbackCheckCalls = 0;
+let _rollbackHostSignalReconcileInFlight = false;
+const _rollbackHostSignalLastSignatureBySession = new Map();
+const _adminBackgroundJobStreams = new Map();
+const settings = {enabled:true,rollbackAutoEnabled:true};
+const R = {getCharacter:function() {}};
+function referenceLibraryPath(value) { return encodeURIComponent(String(value || "")); }
+function resolveRequestTimeoutMs() { return 19000; }
+function getRequestTimeoutSettingMs() { return 19000; }
+async function bridgeFetch(path, options) {
+  if (options && options.timeoutMs !== 19000) throw new Error("one-shot request lost UI timeout");
+  if (String(path).startsWith("/reference-jobs/")) {
+    referenceCalls++;
+    return {status:"running",kind:"reference_import"};
+  }
+  if (String(path).startsWith("/admin/jobs/")) {
+    adminCalls++;
+    return adminCalls === 1
+      ? {job_id:"admin-1",status:"running",terminal:false}
+      : {job_id:"admin-1",status:"completed",terminal:true,result:{done:true}};
+  }
+  throw new Error("unexpected path " + path);
+}
+function referenceLibraryRefreshUI() {}
+function referenceLibrarySetStatus(status) {
+  if (status !== "running") throw new Error("running reference job was misclassified");
+}
+async function referenceDiscoveryLoadLatestJob() {}
+async function referenceLibraryLoadData() {}
+async function referenceLibraryLoadVectorStatus() {}
+async function safeCall(fn) { return await fn(); }
+function refreshExplorerUI() { explorerRefreshes++; }
+async function getCurrentChatSessionId() { return "session"; }
+async function resolveCurrentActiveChatObject() {
+  return {chat:{message:[{role:"user",content:"u"},{role:"assistant",content:"a"}]}};
+}
+function extractActiveChatRollbackMessages(chat) { return chat.message; }
+function computeTailHash(messages) { return JSON.stringify(messages); }
+async function reconcileActiveChatTailDeletionWithBackend() { rollbackReconcileCalls++; return false; }
+async function checkAndAutoRollback() { rollbackCheckCalls++; }
+function debugLog() {}
+function setTimeout() { throw new Error("one-shot path scheduled a timer"); }
+function setInterval() { throw new Error("one-shot path scheduled an interval"); }
+function assert(condition, message) { if (!condition) throw new Error(message); }
+` + "\n" + functions + `
+(async function() {
+  const referenceRunning = await referenceLibraryPollJob("ref-1");
+  assert(referenceRunning && referenceRunning.status === "running" && referenceCalls === 1, "reference job call was not one-shot");
+  await Promise.resolve();
+  assert(referenceCalls === 1, "reference job scheduled recursive polling");
+  await referenceLibraryPollJob("ref-1");
+  assert(referenceCalls === 2, "explicit reference refresh did not make exactly one request");
+
+  const adminState = {loading:true,error:null,result:null,job:{job_id:"admin-1"}};
+  const adminRunning = await pollAdminBackgroundJob("reindex", adminState, "admin-1");
+  assert(adminRunning && adminRunning.status === "running" && adminCalls === 1 && adminState.loading, "admin job call was not one-shot");
+  await Promise.resolve();
+  assert(adminCalls === 1, "admin job scheduled recursive polling");
+  await pollAdminBackgroundJob("reindex", adminState, "admin-1");
+  assert(adminCalls === 2 && adminState.loading === false && adminState.result.done, "explicit admin refresh did not consume terminal status");
+
+  assert(await reconcileRollbackFromHostSignal(), "first host lifecycle signal did not reconcile rollback state");
+  assert(rollbackReconcileCalls === 2 && rollbackCheckCalls === 1, "rollback signal did not run the expected bounded reconciliation");
+  assert(!(await reconcileRollbackFromHostSignal()), "unchanged host signature reconciled more than once");
+  assert(rollbackReconcileCalls === 2 && rollbackCheckCalls === 1, "unchanged rollback signature repeated backend work");
+  process.stdout.write("ok");
+})().catch(function(err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("adapter one-shot JS runtime fixture failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("adapter one-shot JS runtime fixture output=%q, want ok", out)
+	}
+}
+
+func TestAdminBackgroundJobUsesSingleNDJSONStreamAndCleansUp(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for admin background job stream runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	openStream := extractArchiveCenterJSAsyncFunction(t, src, "openTurnWorkflowHUDStream")
+	streamFailure := extractArchiveCenterJSFunction(t, src, "turnWorkflowHUDStreamFailure")
+	cancelStream := extractArchiveCenterJSFunction(t, src, "cancelAdminBackgroundJobStream")
+	cancelAll := extractArchiveCenterJSFunction(t, src, "cancelAllAdminBackgroundJobStreams")
+	markUnavailable := extractArchiveCenterJSFunction(t, src, "markAdminBackgroundJobStreamUnavailable")
+	applySnapshot := extractArchiveCenterJSFunction(t, src, "applyAdminBackgroundJobSnapshot")
+	consumeStream := extractArchiveCenterJSAsyncFunction(t, src, "consumeAdminBackgroundJobStream")
+	startStream := extractArchiveCenterJSFunction(t, src, "startAdminBackgroundJobStream")
+	acceptJob := extractArchiveCenterJSFunction(t, src, "acceptAdminBackgroundJob")
+	renderProgress := extractArchiveCenterJSFunction(t, src, "renderAdminJobProgressHtml")
+	unload := extractArchiveCenterJSAsyncFunction(t, src, "removeRegisteredRisuHooksOnUnload")
+	streamSource := strings.Join([]string{
+		openStream, cancelStream, cancelAll, markUnavailable, applySnapshot, consumeStream, startStream, acceptJob,
+	}, "\n")
+	for _, forbidden := range []string{"setTimeout(", "setInterval(", "pollAdminBackgroundJob(", `bridgeFetch("/admin/jobs/`} {
+		if strings.Contains(streamSource, forbidden) {
+			t.Fatalf("admin job stream retained forbidden recurring transport %q", forbidden)
+		}
+	}
+	for _, required := range []string{"/events?after_revision=", "openTurnWorkflowHUDStream", "job.terminal === true"} {
+		if !strings.Contains(streamSource, required) {
+			t.Fatalf("admin job stream missing %q", required)
+		}
+	}
+	if !strings.Contains(renderProgress, "data-admin-job-transport-notice") ||
+		!strings.Contains(renderProgress, "Refresh job status") ||
+		!strings.Contains(renderProgress, "job.terminal !== true") ||
+		!strings.Contains(unload, "cancelAllAdminBackgroundJobStreams") {
+		t.Fatal("admin job stream lost typed transport notice, manual Refresh, or unload cleanup")
+	}
+
+	script := `
+const settings = {bridgeUrl:"http://127.0.0.1:28080"};
+const encoder = new TextEncoder();
+const _adminBackgroundJobStreams = new Map();
+let streamResponses = [];
+let streamPaths = [];
+let readerCancels = 0;
+let controllerAborts = 0;
+let observedState = null;
+let observedStatuses = [];
+class AbortController {
+  constructor() { this.signal = {}; this.aborted = false; }
+  abort() { if (!this.aborted) { this.aborted = true; controllerAborts++; } }
+}
+const R = {
+  nativeFetch: async function(path) {
+    streamPaths.push(String(path || ""));
+    if (streamResponses.length === 0) throw new Error("unexpected extra admin stream connection");
+    return streamResponses.shift();
+  },
+};
+function resolveBridgeRuntimeRoute() { return {url:"http://127.0.0.1:28080"}; }
+function refreshExplorerUI() {
+  if (observedState && observedState.job) observedStatuses.push(String(observedState.job.status || ""));
+}
+function responseFromLines(lines) {
+  const chunks = [encoder.encode(lines.join("\n") + "\n")];
+  return {
+    status:200,
+    ok:true,
+    body:{
+      getReader:function() {
+        return {
+          read:async function() {
+            if (chunks.length > 0) return {value:chunks.shift(),done:false};
+            return {done:true};
+          },
+          cancel:async function() { readerCancels++; },
+        };
+      },
+    },
+  };
+}
+function hangingResponse() {
+  let finishRead = null;
+  return {
+    status:200,
+    ok:true,
+    body:{
+      getReader:function() {
+        return {
+          read:function() {
+            return new Promise(function(resolve) { finishRead = resolve; });
+          },
+          cancel:async function() {
+            readerCancels++;
+            if (finishRead) finishRead({done:true});
+          },
+        };
+      },
+    },
+  };
+}
+function assert(condition, message) { if (!condition) throw new Error(message); }
+async function settle(predicate, label) {
+  for (let index = 0; index < 40 && !predicate(); index++) {
+    await new Promise(function(resolve) { setImmediate(resolve); });
+  }
+  assert(predicate(), label + " did not settle");
+}
+` + "\n" + streamFailure + "\n" + openStream + "\n" + cancelStream + "\n" + cancelAll +
+		"\n" + markUnavailable + "\n" + applySnapshot + "\n" + consumeStream + "\n" + startStream + "\n" + acceptJob + `
+(async function() {
+  const completedState = {loading:false,error:null,result:null,job:null};
+  observedState = completedState;
+  streamResponses = [responseFromLines([
+    JSON.stringify({contract_version:"admin_background_job.v1",job_id:"job-1",status:"running",revision:2,terminal:false,progress:{progress_percent:8}}),
+    JSON.stringify({contract_version:"admin_background_job.v1",job_id:"job-1",status:"completed",revision:3,terminal:true,result:{done:true}}),
+  ])];
+  assert(acceptAdminBackgroundJob("session_normalize", completedState, {
+    contract_version:"admin_background_job.v1",job_id:"job-1",status:"accepted",revision:1,terminal:false
+  }), "accepted admin job was rejected");
+  await settle(function() { return _adminBackgroundJobStreams.size === 0; }, "terminal stream");
+  assert(streamPaths.length === 1, "admin job used more than one stream connection");
+  assert(streamPaths[0].includes("/admin/jobs/job-1/events?after_revision=1"), "admin job used the wrong event route");
+  assert(observedStatuses.join(",") === "running,completed", "running to completed revisions were not rendered in order");
+  assert(completedState.loading === false && completedState.error === null && completedState.result.done, "terminal completion was not applied");
+  assert(readerCancels === 1 && controllerAborts === 1, "terminal stream did not clean reader and controller");
+
+  const authorityState = {loading:true,error:null,result:null,job:{job_id:"job-authority"}};
+  applyAdminBackgroundJobSnapshot("reindex", authorityState, "job-authority", {
+    job_id:"job-authority",status:"completed",revision:2,terminal:false,result:{done:true}
+  });
+  assert(authorityState.loading === true && authorityState.result === null, "status text bypassed backend terminal authority");
+
+  const unsupportedState = {loading:false,error:null,result:null,job:null};
+  observedState = unsupportedState;
+  streamResponses = [{status:200,ok:true,body:null}];
+  assert(acceptAdminBackgroundJob("reindex", unsupportedState, {
+    job_id:"job-unsupported",status:"accepted",revision:1,terminal:false
+  }), "unsupported transport job was rejected");
+  await settle(function() { return _adminBackgroundJobStreams.size === 0; }, "unsupported stream");
+  assert(unsupportedState.loading === true && unsupportedState.error === null, "unsupported stream was misclassified as a job failure");
+  assert(
+    unsupportedState.job.transport_notice &&
+    unsupportedState.job.transport_notice.reason_code === "stream_transport_unavailable",
+    "unsupported stream lost its typed transport notice"
+  );
+  applyAdminBackgroundJobSnapshot("reindex", unsupportedState, "job-unsupported", {
+    job_id:"job-unsupported",status:"running",revision:2,terminal:false,progress:{progress_percent:12}
+  });
+  assert(
+    unsupportedState.job.transport_notice &&
+    unsupportedState.job.transport_notice.reason_code === "stream_transport_unavailable",
+    "manual running refresh removed the typed transport notice"
+  );
+
+  const oldState = {loading:false,error:null,result:null,job:null};
+  observedState = oldState;
+  streamResponses = [hangingResponse()];
+  acceptAdminBackgroundJob("rescan", oldState, {job_id:"job-old",status:"accepted",revision:1,terminal:false});
+  await settle(function() {
+    const active = _adminBackgroundJobStreams.get("rescan");
+    return !!(active && active.reader);
+  }, "old stream reader");
+  const cancelsBeforeReplacement = readerCancels;
+  const abortsBeforeReplacement = controllerAborts;
+  const newState = {loading:false,error:null,result:null,job:null};
+  observedState = newState;
+  streamResponses = [responseFromLines([
+    JSON.stringify({job_id:"job-new",status:"completed",revision:2,terminal:true,result:{done:true}})
+  ])];
+  acceptAdminBackgroundJob("rescan", newState, {job_id:"job-new",status:"accepted",revision:1,terminal:false});
+  await settle(function() { return _adminBackgroundJobStreams.size === 0; }, "replacement stream");
+  assert(readerCancels >= cancelsBeforeReplacement + 2, "same-kind replacement or terminal did not cancel readers");
+  assert(controllerAborts >= abortsBeforeReplacement + 2, "same-kind replacement or terminal did not abort controllers");
+  cancelAllAdminBackgroundJobStreams();
+  process.stdout.write("ok");
+})().catch(function(err) {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("admin background job stream runtime fixture failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("admin background job stream runtime fixture output=%q, want ok", out)
+	}
+}
+
+func TestAdapterTimerAndConfigAcknowledgementSourceContract(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	if got := strings.Count(src, "setTimeout("); got != 2 {
+		t.Fatalf("production adapter setTimeout count=%d, want the UI-configured fetch abort and HUD elapsed timers", got)
+	}
+	if strings.Contains(src, "setInterval(") || strings.Contains(src, "clearInterval(") {
+		t.Fatal("production adapter still contains a fixed interval")
+	}
+	for _, forbidden := range []string{
+		"resolvePostOutputFinalAssistant",
+		"rollbackIdleWatcherMode",
+		"FAILED_QUEUE_SAVE_DEBOUNCE_MS",
+		"persistenceOrchResult._rawInputObservation",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("production adapter retained removed recurring policy %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`const transportAccepted = !!(result && result.status === "ok");`,
+		`const runtimeSynced = !!(trace && trace.synced === true);`,
+		`? "config_sync_ok"`,
+		`settings_saved_locally_backend_unsynced`,
+		`String(pendingRawInputObservation.boundRequestId || "") === pendingRequestId`,
+		`setTimeout(function turnWorkflowHUDElapsedFrame()`,
+		`clearTimeout(_turnWorkflowHUDElapsedTimer)`,
+	} {
+		if !strings.Contains(src, required) {
+			t.Fatalf("production adapter missing lifecycle/config contract marker %q", required)
+		}
+	}
+}
+
+func TestRuntimeTimeoutResolversPreserveExplicitUIValues(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for timeout resolver runtime fixture")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	functions := strings.Join([]string{
+		extractArchiveCenterJSFunction(t, src, "resolveRequestTimeoutMs"),
+		extractArchiveCenterJSFunction(t, src, "getCompleteTurnTimeoutMs"),
+		extractArchiveCenterJSFunction(t, src, "resolvePluginMainTimeoutMs"),
+	}, "\n")
+	script := `
+function getRequestTimeoutSettingMs() { return 800000; }
+function getCriticTimeoutMs() { return 900000; }
+function getEmbeddingTimeoutMs() { return 200000; }
+function getPluginMainTimeoutSettingMs() { return 450000; }
+function assert(condition, message) { if (!condition) throw new Error(message); }
+` + "\n" + functions + `
+assert(resolveRequestTimeoutMs(700000) === 700000, "request override was silently clamped");
+assert(resolveRequestTimeoutMs(0) === 0, "backend-owned wait was replaced by the UI request timeout");
+assert(resolveRequestTimeoutMs(-1) === 800000, "invalid request override did not use the UI setting");
+assert(getCompleteTurnTimeoutMs() === 1100000, "derived complete-turn timeout was silently clamped");
+assert(resolvePluginMainTimeoutMs(500000) === 500000, "plugin-main override was silently clamped");
+assert(resolvePluginMainTimeoutMs(NaN) === 450000, "invalid plugin-main override did not use the UI setting");
+process.stdout.write("ok");
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("timeout resolver JS runtime fixture failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("timeout resolver JS runtime fixture output=%q, want ok", out)
+	}
+	for _, forbidden := range []string{
+		"sanitizeNumber(overrideMs, getRequestTimeoutSettingMs(), 1, 600000)",
+		"sanitizeNumber(Math.max(base, critic + embedding), base, 1000, 600000)",
+		"sanitizeNumber(overrideMs, getPluginMainTimeoutSettingMs(), 1, 300000)",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("runtime timeout helper retained hidden clamp %q", forbidden)
+		}
 	}
 }

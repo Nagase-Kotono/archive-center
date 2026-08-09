@@ -27,12 +27,10 @@ import (
 
 const (
 	sourceDiscoveryMaxBytes           = 2 << 20
-	sourceDiscoveryOperationTimeout   = 9 * time.Minute
-	ollamaSourceSearchMaxRounds       = 3
-	ollamaSourceSearchMaxToolCalls    = 3
 	ollamaSourceSearchToolResultRunes = 12000
 	SourceDiscoveryUserAgent          = "ArchiveCenter-SourceDiscovery/1.0"
 	sourceCandidateExtractionContract = "source-candidate-extraction.v3"
+	ollamaSourceSearchMaxToolCalls    = 3
 )
 
 func (s *Server) registerSourceDiscoveryRoutes(mux *http.ServeMux) {
@@ -202,9 +200,7 @@ func (s *Server) handleSourceDiscoveryCreateV1(w http.ResponseWriter, r *http.Re
 		return
 	}
 	extractionConfig := s.sourceDiscoveryCriticConfig(req.ClientMeta)
-	pipelineCtx, cancel := context.WithTimeout(r.Context(), sourceDiscoveryOperationTimeout)
-	defer cancel()
-	input, result, coverage, state := s.runSourceDiscoveryPipeline(pipelineCtx, extractionConfig, input)
+	input, result, coverage, state := s.runSourceDiscoveryPipeline(r.Context(), extractionConfig, input)
 	retainedDocuments := takeSourceDiscoveryRetainedDocuments(result)
 	job, err := discoveryStore.SaveSourceDiscoveryJob(r.Context(), input, state, result, coverage)
 	if err != nil {
@@ -618,9 +614,7 @@ func (s *Server) resumeSourceDiscoveryJob(ctx context.Context, mutable store.Sou
 	prioritized := prioritizeDiscoverySections(append([]any(nil), sections[offset:]...))
 	sections = append(append([]any(nil), sections[:offset]...), prioritized...)
 	job.Result["section_candidates"] = sections
-	pipelineCtx, cancel := context.WithTimeout(ctx, sourceDiscoveryOperationTimeout)
-	defer cancel()
-	newCandidates, followUps, trace, extractErr := runSourceCandidateExtraction(pipelineCtx, cfg, input, map[string]any{"section_candidates": sections[offset:]})
+	newCandidates, followUps, trace, extractErr := runSourceCandidateExtraction(ctx, cfg, input, map[string]any{"section_candidates": sections[offset:]})
 	if extractErr != nil {
 		job.Result["extraction"] = sourceCandidateExtractionFailure(extractErr)
 		return mutable.UpdateSourceDiscoveryJob(ctx, jobID, "insufficient_source_coverage", job.Result, job.CoverageReport)
@@ -1338,15 +1332,7 @@ type sourceSearchProviderResult struct {
 
 func (s *Server) sourceSearchLLMConfigured() bool {
 	cfg := s.sourceSearchPlannerLLMConfig()
-	if strings.TrimSpace(cfg.APIKey) == "" {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case "openai", "gemini", "claude", "ollama":
-		return strings.TrimSpace(cfg.Model) != ""
-	default:
-		return false
-	}
+	return len(sourceSearchConfigMissingFields(cfg.Provider, cfg.APIKey, cfg.Model)) == 0
 }
 
 func (s *Server) discoverSourcesWithSearchLLM(ctx context.Context, input store.SourceDiscoveryInput) ([]store.SourceDiscoverySource, map[string]any, error) {
@@ -1529,8 +1515,7 @@ func addOllamaSearchAgentDiagnostics(diagnostics map[string]any, provider string
 		return
 	}
 	diagnostics["search_agent"] = true
-	diagnostics["agent_round_limit"] = ollamaSourceSearchMaxRounds
-	diagnostics["agent_tool_call_limit"] = ollamaSourceSearchMaxToolCalls
+	diagnostics["agent_termination_policy"] = "frontier_exhaustion_and_query_dedupe"
 }
 
 func applySourceSearchTermination(result map[string]any, input store.SourceDiscoveryInput, diagnostics map[string]any) {
@@ -1563,9 +1548,15 @@ func sourceDiscoverySearchQuery(input store.SourceDiscoveryInput) string {
 }
 
 func executeNativeSourceSearchLLM(ctx context.Context, cfg completeTurnLLMConfig, prompt, searchQuery string) ([]sourceSearchProviderResult, error) {
-	timeout := sourceDiscoveryLLMTimeout(cfg.TimeoutMs)
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	timeout, err := sourceDiscoveryLLMTimeout(cfg.TimeoutMs)
+	if err != nil {
+		return nil, err
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	if err := validateNativeSourceSearchEndpoint(cfg.Provider, cfg.Endpoint); err != nil {
 		return nil, err
 	}
@@ -1583,11 +1574,18 @@ func executeNativeSourceSearchLLM(ctx context.Context, cfg completeTurnLLMConfig
 	}
 }
 
-func sourceDiscoveryLLMTimeout(timeoutMs int64) time.Duration {
-	if timeoutMs <= 0 {
-		return 60 * time.Second
+func sourceDiscoveryLLMTimeout(timeoutMs int64) (time.Duration, error) {
+	if timeoutMs < 0 {
+		return 0, errors.New("source search planner timeout_ms must not be negative")
 	}
-	return time.Duration(timeoutMs) * time.Millisecond
+	if timeoutMs == 0 {
+		return 0, nil
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	if timeout <= 0 || int64(timeout/time.Millisecond) != timeoutMs {
+		return 0, errors.New("source search planner timeout_ms is outside the supported duration range")
+	}
+	return timeout, nil
 }
 
 func executeOllamaWebSearch(ctx context.Context, cfg completeTurnLLMConfig, query string, maxResults int64) ([]sourceSearchProviderResult, error) {
@@ -1649,8 +1647,12 @@ func executeOllamaSourceSearchAgent(ctx context.Context, cfg completeTurnLLMConf
 	}
 	results := []sourceSearchProviderResult{}
 	seenURLs := map[string]bool{}
+	seenQueries := map[string]bool{}
 	toolCallsUsed := 0
-	for round := 0; round < ollamaSourceSearchMaxRounds && toolCallsUsed < ollamaSourceSearchMaxToolCalls; round++ {
+	for {
+		if toolCallsUsed >= ollamaSourceSearchMaxToolCalls {
+			break
+		}
 		body := map[string]any{
 			"model": cfg.Model, "messages": messages, "tools": []any{tool}, "stream": false,
 			"think": ollamaSourceSearchThink(cfg.ReasoningEffort),
@@ -1677,6 +1679,7 @@ func executeOllamaSourceSearchAgent(ctx context.Context, cfg completeTurnLLMConf
 			break
 		}
 		messages = append(messages, message)
+		novelToolCall := false
 		for _, rawCall := range toolCalls {
 			if toolCallsUsed >= ollamaSourceSearchMaxToolCalls {
 				break
@@ -1691,6 +1694,12 @@ func executeOllamaSourceSearchAgent(ctx context.Context, cfg completeTurnLLMConf
 			if query == "" {
 				query = ollamaSourceSearchQuery(initialQuery)
 			}
+			queryKey := strings.ToLower(strings.TrimSpace(query))
+			if queryKey == "" || seenQueries[queryKey] {
+				continue
+			}
+			seenQueries[queryKey] = true
+			novelToolCall = true
 			maxResults := int64FromMap(arguments, "max_results", 10)
 			searchResults, err := executeOllamaWebSearch(ctx, cfg, query, maxResults)
 			if err != nil {
@@ -1708,6 +1717,9 @@ func executeOllamaSourceSearchAgent(ctx context.Context, cfg completeTurnLLMConf
 			messages = append(messages, map[string]any{
 				"role": "tool", "tool_name": "web_search", "content": truncateRunes(string(encoded), ollamaSourceSearchToolResultRunes),
 			})
+		}
+		if !novelToolCall {
+			break
 		}
 	}
 	if toolCallsUsed == 0 {
@@ -1806,6 +1818,9 @@ func executeOpenAINativeSourceSearch(ctx context.Context, cfg completeTurnLLMCon
 		fallback := cloneMap(body)
 		delete(fallback, "temperature")
 		delete(fallback, "reasoning")
+		if !cfg.RetryBudget.take() {
+			return nil, fmt.Errorf("OpenAI web search returned HTTP %d: %s", status, scrubProxySecret(proxyErrorDetail(status, data, raw), cfg.APIKey))
+		}
 		status, data, raw, err = proxyDoJSON(ctx, target, map[string]string{
 			"Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer " + strings.TrimSpace(cfg.APIKey),
 		}, fallback)
@@ -2216,25 +2231,14 @@ func runSourceCandidateExtraction(ctx context.Context, cfg completeTurnLLMConfig
 	attemptedSections := 0
 	processingIncomplete := false
 	batchError := ""
-	var elapsedTotal time.Duration
 	for _, batch := range batches {
 		if err := ctx.Err(); err != nil {
 			processingIncomplete = true
 			batchError = err.Error()
 			break
 		}
-		if deadline, ok := ctx.Deadline(); ok && processedSections > 0 {
-			averageBatchDuration := elapsedTotal / time.Duration(processedSectionsBatchCount(processedSections, batches))
-			if time.Until(deadline) <= averageBatchDuration+5*time.Second {
-				processingIncomplete = true
-				batchError = "operation time budget reserved before starting another extraction batch"
-				break
-			}
-		}
-		batchStarted := time.Now()
 		llmCallCount++
 		candidates, followUps, trace, err := runSourceCandidateExtractionBatch(ctx, cfg, input, batch)
-		elapsedTotal += time.Since(batchStarted)
 		if err != nil {
 			if processedSections == 0 {
 				return nil, nil, nil, err
@@ -2304,22 +2308,6 @@ func sourceCandidateExtractionPromptRuneBudget(cfg completeTurnLLMConfig) int {
 		return 24000
 	}
 	return budget
-}
-
-func processedSectionsBatchCount(processedSections int, batches [][]any) int {
-	processedBatches := 0
-	consumed := 0
-	for _, batch := range batches {
-		if consumed >= processedSections {
-			break
-		}
-		consumed += len(batch)
-		processedBatches++
-	}
-	if processedBatches == 0 {
-		return 1
-	}
-	return processedBatches
 }
 
 func summarizeSourceDiscoveryExtraction(traces []map[string]any, sections []any) map[string]any {
@@ -2451,7 +2439,7 @@ func runSourceCandidateExtractionBatch(ctx context.Context, cfg completeTurnLLMC
 	}
 	parsed, err := parseJSONFromLLMContent(content)
 	formatRetryCount := 0
-	if err != nil {
+	if err != nil && cfg.RetryBudget.take() {
 		formatRetryCount = 1
 		retryRequest := request
 		retryRequest.Messages = append(append([]any{}, request.Messages...),
@@ -2697,7 +2685,7 @@ func sourceCandidateDerivedText(candidate map[string]any) string {
 
 func callSourceCandidateExtractionLLM(ctx context.Context, cfg completeTurnLLMConfig, request dto.ProxyPluginMainRequest) (string, error) {
 	if !strings.EqualFold(strings.TrimSpace(cfg.Provider), "ollama") {
-		upstream, _, err := performProxyPluginMain(ctx, request)
+		upstream, _, err := performProxyPluginMainWithRetryBudget(ctx, request, cfg.RetryBudget)
 		if err != nil {
 			return "", err
 		}
@@ -2901,9 +2889,20 @@ func reconcileSourceCandidates(existing, incoming []map[string]any) ([]map[strin
 	duplicates := 0
 	for _, raw := range incoming {
 		candidate := cloneMap(raw)
-		evidence := sourceCandidateEvidence(candidate)
-		candidateEvidence := []map[string]any{evidence}
-		candidateEvidence = append(candidateEvidence, sliceMapFromAny(candidate["corroborating_evidence"])...)
+		candidateEvidence := sliceMapFromAny(candidate["evidence_set"])
+		if len(candidateEvidence) == 0 {
+			candidateEvidence = []map[string]any{sourceCandidateEvidence(candidate)}
+		}
+		seenEvidence := map[string]bool{}
+		for _, item := range candidateEvidence {
+			seenEvidence[sourceEvidenceKey(item)] = true
+		}
+		for _, item := range sliceMapFromAny(candidate["corroborating_evidence"]) {
+			if key := sourceEvidenceKey(item); !seenEvidence[key] {
+				candidateEvidence = append(candidateEvidence, item)
+				seenEvidence[key] = true
+			}
+		}
 		delete(candidate, "corroborating_evidence")
 		key := sourceCandidateLogicalKey(candidate)
 		if key == "\x00\x00\x00" {
@@ -3346,15 +3345,13 @@ func fetchDiscoverySource(ctx context.Context, source store.SourceDiscoverySourc
 		return nil, nil, err
 	}
 	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           discoveryDialContext,
-		ForceAttemptHTTP2:     false,
-		ResponseHeaderTimeout: 8 * time.Second,
-		TLSHandshakeTimeout:   8 * time.Second,
-		DisableKeepAlives:     true,
+		Proxy:             nil,
+		DialContext:       discoveryDialContext,
+		ForceAttemptHTTP2: false,
+		DisableKeepAlives: true,
 	}
 	client := &http.Client{
-		Transport: transport, Timeout: 15 * time.Second,
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("redirect limit exceeded")
@@ -3560,9 +3557,9 @@ func fetchDiscoveryImageObservation(ctx context.Context, rawURL, alt string) (ma
 	if err != nil {
 		return nil, err
 	}
-	transport := &http.Transport{Proxy: nil, DialContext: discoveryDialContext, ForceAttemptHTTP2: true, ResponseHeaderTimeout: 8 * time.Second, TLSHandshakeTimeout: 8 * time.Second, DisableKeepAlives: true}
+	transport := &http.Transport{Proxy: nil, DialContext: discoveryDialContext, ForceAttemptHTTP2: true, DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 15 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("redirect limit exceeded")
 		}
@@ -3653,7 +3650,7 @@ func discoveryDialContext(ctx context.Context, network, address string) (net.Con
 	if err != nil || len(addresses) == 0 {
 		return nil, errors.New("source host could not be resolved for connection")
 	}
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	dialer := &net.Dialer{}
 	return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].IP.String(), port))
 }
 

@@ -1497,3 +1497,449 @@ CREATE TABLE IF NOT EXISTS source_discovery_jobs (
         'insufficient_source_coverage','blocked_by_access_policy','failed','cancelled'
     ))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- 3.6-B. entity_identity.v1 and speaker attribution
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS entity_identities (
+    stable_entity_id       CHAR(36) PRIMARY KEY,
+    chat_session_id        VARCHAR(255) NOT NULL,
+    identity_namespace     VARCHAR(80) NOT NULL,
+    entity_kind            VARCHAR(80) NOT NULL,
+    canonical_label        VARCHAR(500) NOT NULL,
+    lifecycle_state        VARCHAR(50) NOT NULL DEFAULT 'active',
+    review_state           VARCHAR(50) NOT NULL DEFAULT 'needs_review',
+    presence_authority     VARCHAR(50) NOT NULL DEFAULT 'unverified',
+    occurrence_authority   VARCHAR(50) NOT NULL DEFAULT 'none',
+    source_contract        VARCHAR(80) NOT NULL,
+    source_revision        VARCHAR(160) NOT NULL,
+    source_logical_turn_id VARCHAR(160) NULL,
+    source_message_id      VARCHAR(255) NULL,
+    source_generation_id   VARCHAR(255) NULL,
+    source_content_hash    CHAR(64) NOT NULL,
+    source_turn            INT NOT NULL,
+    source_index           INT NOT NULL,
+    idempotency_key        VARCHAR(255) NOT NULL,
+    mapping_revision       BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    first_seen_turn        INT NOT NULL,
+    last_seen_turn         INT NOT NULL,
+    created_at             DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at             DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_entity_identity_source_occurrence (chat_session_id(120), idempotency_key(160)),
+    INDEX idx_entity_identity_session (chat_session_id(180), identity_namespace, lifecycle_state),
+    INDEX idx_entity_identity_source (chat_session_id(120), source_revision(120), source_turn),
+    INDEX idx_entity_identity_review (chat_session_id(180), review_state, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='entity_identity.v1 source-bound stable identities; display labels are not merge keys.';
+
+CREATE TABLE IF NOT EXISTS entity_identity_surfaces (
+    surface_id          CHAR(36) PRIMARY KEY,
+    stable_entity_id    CHAR(36) NOT NULL,
+    chat_session_id     VARCHAR(255) NOT NULL,
+    identity_namespace  VARCHAR(80) NOT NULL,
+    surface_kind        VARCHAR(50) NOT NULL,
+    surface_text        VARCHAR(500) NOT NULL,
+    normalized_surface  VARCHAR(255) NOT NULL,
+    surface_scope       VARCHAR(80) NOT NULL DEFAULT 'source_turn',
+    valid_from_turn     INT NOT NULL,
+    valid_to_turn       INT NULL,
+    source_contract     VARCHAR(80) NOT NULL,
+    source_revision     VARCHAR(160) NOT NULL,
+    source_turn         INT NOT NULL,
+    source_span_start   INT NULL,
+    source_span_end     INT NULL,
+    evidence_excerpt    TEXT NULL,
+    review_state        VARCHAR(50) NOT NULL DEFAULT 'needs_review',
+    idempotency_key     VARCHAR(255) NOT NULL,
+    created_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_entity_surface_source_occurrence (chat_session_id(120), idempotency_key(160)),
+    INDEX idx_entity_surface_lookup (chat_session_id(120), identity_namespace, normalized_surface(120)),
+    INDEX idx_entity_surface_identity (stable_entity_id, valid_from_turn, valid_to_turn),
+    CONSTRAINT fk_entity_surface_identity FOREIGN KEY (stable_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Source-linked names and aliases; lookup candidates only, never automatic identity merges.';
+
+CREATE TABLE IF NOT EXISTS entity_identity_links (
+    link_id             CHAR(36) PRIMARY KEY,
+    chat_session_id     VARCHAR(255) NOT NULL,
+    source_entity_id    CHAR(36) NOT NULL,
+    target_entity_id    CHAR(36) NOT NULL,
+    link_kind           VARCHAR(80) NOT NULL,
+    link_state          VARCHAR(50) NOT NULL DEFAULT 'needs_review',
+    evidence_json       JSON NOT NULL,
+    mapping_revision    BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_entity_identity_link (chat_session_id(120), source_entity_id, target_entity_id, link_kind),
+    INDEX idx_entity_identity_link_review (chat_session_id(180), link_state, updated_at),
+    CONSTRAINT fk_entity_identity_link_source FOREIGN KEY (source_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_entity_identity_link_target FOREIGN KEY (target_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Reviewed split, merge, alias, and cross-namespace links; no implicit promotion.';
+
+CREATE TABLE IF NOT EXISTS entity_identity_artifact_bindings (
+    binding_id          CHAR(36) PRIMARY KEY,
+    stable_entity_id    CHAR(36) NOT NULL,
+    chat_session_id     VARCHAR(255) NOT NULL,
+    artifact_kind       VARCHAR(80) NOT NULL,
+    artifact_role       VARCHAR(80) NOT NULL,
+    artifact_ordinal    INT NOT NULL,
+    surface_text        VARCHAR(500) NOT NULL,
+    review_state        VARCHAR(50) NOT NULL DEFAULT 'needs_review',
+    source_contract     VARCHAR(80) NOT NULL,
+    source_revision     VARCHAR(160) NOT NULL,
+    source_turn         INT NOT NULL,
+    idempotency_key     VARCHAR(255) NOT NULL,
+    created_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_entity_artifact_binding_source (chat_session_id(120), idempotency_key(160)),
+    INDEX idx_entity_artifact_binding_lookup (chat_session_id(120), source_turn, artifact_kind, artifact_ordinal),
+    INDEX idx_entity_artifact_binding_identity (stable_entity_id, source_turn),
+    CONSTRAINT fk_entity_artifact_binding_identity FOREIGN KEY (stable_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Parallel stable-ID pointers for legacy entity, KG, and state projections.';
+
+CREATE TABLE IF NOT EXISTS speaker_attributions (
+    attribution_id        CHAR(36) PRIMARY KEY,
+    chat_session_id       VARCHAR(255) NOT NULL,
+    speaker_entity_id     CHAR(36) NOT NULL,
+    identity_namespace    VARCHAR(80) NOT NULL,
+    source_role           VARCHAR(50) NOT NULL,
+    attribution_kind      VARCHAR(80) NOT NULL,
+    attribution_state     VARCHAR(50) NOT NULL,
+    review_state          VARCHAR(50) NOT NULL,
+    confidence            DOUBLE NOT NULL DEFAULT 0,
+    source_contract       VARCHAR(80) NOT NULL,
+    source_revision       VARCHAR(160) NOT NULL,
+    source_logical_turn_id VARCHAR(160) NULL,
+    source_message_id     VARCHAR(255) NULL,
+    source_generation_id  VARCHAR(255) NULL,
+    source_content_hash   CHAR(64) NOT NULL,
+    source_turn           INT NOT NULL,
+    source_span_start     INT NOT NULL,
+    source_span_end       INT NOT NULL,
+    evidence_excerpt      TEXT NOT NULL,
+    idempotency_key       VARCHAR(255) NOT NULL,
+    created_at            DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at            DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_speaker_attribution_source (chat_session_id(120), idempotency_key(160)),
+    INDEX idx_speaker_attribution_source (chat_session_id(120), source_revision(120), source_turn),
+    INDEX idx_speaker_attribution_review (chat_session_id(180), review_state, updated_at),
+    INDEX idx_speaker_attribution_entity (speaker_entity_id, source_turn),
+    CONSTRAINT fk_speaker_attribution_identity FOREIGN KEY (speaker_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Grounded in-world speaker spans; ambiguous speakers remain needs_review.';
+
+-- ---------------------------------------------------------------------------
+-- Exact-source atomic memory projection
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS precise_memory_units (
+    id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    unit_id                    CHAR(36) NOT NULL,
+    contract_version           VARCHAR(80) NOT NULL DEFAULT 'precise_memory_unit.v1',
+    chat_session_id            VARCHAR(255) NOT NULL,
+    source_turn_start          INT NOT NULL,
+    source_turn_end            INT NOT NULL,
+    source_contract            VARCHAR(80) NOT NULL,
+    source_revision            VARCHAR(160) NOT NULL,
+    source_logical_turn_id     VARCHAR(160) NULL,
+    source_message_id          VARCHAR(255) NULL,
+    source_generation_id       VARCHAR(255) NULL,
+    source_content_hash        CHAR(64) NOT NULL,
+    source_role                VARCHAR(80) NOT NULL,
+    source_span_start          INT NOT NULL,
+    source_span_end            INT NOT NULL,
+    evidence_excerpt           TEXT NOT NULL,
+    evidence_hash              CHAR(64) NOT NULL,
+    root_evidence_id           BIGINT UNSIGNED NULL,
+    direct_evidence_ids_json   JSON NOT NULL,
+    memory_kind                VARCHAR(80) NOT NULL,
+    memory_subtype             VARCHAR(120) NULL,
+    payload_json               JSON NOT NULL,
+    actor_entity_id            CHAR(36) NULL,
+    subject_entity_id          CHAR(36) NULL,
+    affected_entity_id         CHAR(36) NULL,
+    location_entity_id         CHAR(36) NULL,
+    object_entity_id           CHAR(36) NULL,
+    relationship_key           VARCHAR(255) NULL,
+    truth_scope                VARCHAR(80) NOT NULL,
+    epistemic_mode             VARCHAR(80) NOT NULL,
+    authority_class            VARCHAR(80) NOT NULL,
+    admission_state            VARCHAR(50) NOT NULL,
+    review_state               VARCHAR(50) NOT NULL,
+    visibility                 VARCHAR(80) NOT NULL,
+    knowledge_holder_entity_id CHAR(36) NULL,
+    reveal_condition           VARCHAR(255) NULL,
+    confidence                 DOUBLE NOT NULL DEFAULT 0,
+    idempotency_key            VARCHAR(255) NOT NULL,
+    lifecycle_state            VARCHAR(50) NOT NULL DEFAULT 'active',
+    created_at                 DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at                 DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_precise_memory_unit_id (unit_id),
+    UNIQUE KEY uq_precise_memory_source_payload (chat_session_id(120), idempotency_key(160)),
+    INDEX idx_precise_memory_source (chat_session_id(120), source_revision(120), source_turn_start),
+    INDEX idx_precise_memory_kind (chat_session_id(120), memory_kind, lifecycle_state, source_turn_start),
+    INDEX idx_precise_memory_review (chat_session_id(120), admission_state, review_state, updated_at),
+    INDEX idx_precise_memory_root_evidence (root_evidence_id),
+    CONSTRAINT fk_precise_memory_root_evidence FOREIGN KEY (root_evidence_id) REFERENCES direct_evidence_records(id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_actor FOREIGN KEY (actor_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_subject FOREIGN KEY (subject_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_affected FOREIGN KEY (affected_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_location FOREIGN KEY (location_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_object FOREIGN KEY (object_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT fk_precise_memory_knower FOREIGN KEY (knowledge_holder_entity_id) REFERENCES entity_identities(stable_entity_id) ON DELETE SET NULL,
+    CONSTRAINT chk_precise_memory_kind CHECK (memory_kind IN ('event', 'state', 'utterance', 'observation', 'boundary', 'profile')),
+    CONSTRAINT chk_precise_memory_span CHECK (source_span_start >= 0 AND source_span_end > source_span_start),
+    CONSTRAINT chk_precise_memory_turn_range CHECK (source_turn_start > 0 AND source_turn_end >= source_turn_start)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='precise_memory_unit.v1 exact-source atomic projection; legacy aggregate memories remain unchanged.';
+
+-- ---------------------------------------------------------------------------
+-- Accepted-source derivation lifecycle and durable vector work
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS memory_source_revisions (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    contract_version VARCHAR(80) NOT NULL DEFAULT 'memory_source_revision.v1',
+    source_revision VARCHAR(160) NOT NULL,
+    chat_session_id VARCHAR(255) NOT NULL,
+    logical_turn_id VARCHAR(160) NOT NULL,
+    turn_index INT NOT NULL,
+    source_message_id VARCHAR(255) NULL,
+    source_generation_id VARCHAR(255) NULL,
+    branch_id VARCHAR(255) NULL,
+    branch_state VARCHAR(50) NOT NULL DEFAULT 'not_exposed',
+    raw_user_content LONGTEXT NOT NULL,
+    raw_assistant_content LONGTEXT NOT NULL,
+    combined_content_hash CHAR(64) NOT NULL,
+    user_observed_content_hash VARCHAR(255) NULL,
+    assistant_observed_content_hash VARCHAR(255) NULL,
+    hash_algorithm VARCHAR(80) NOT NULL,
+    host_observed_at_ms BIGINT NOT NULL,
+    lifecycle_state VARCHAR(50) NOT NULL DEFAULT 'active',
+    derived_admission_state VARCHAR(30) NOT NULL DEFAULT 'pending',
+    derived_admission_version VARCHAR(120) NOT NULL DEFAULT '',
+    derived_extractor_version VARCHAR(120) NOT NULL DEFAULT '',
+    derived_index_version VARCHAR(120) NOT NULL DEFAULT '',
+    derived_result_hash CHAR(64) NULL,
+    derived_result_json JSON NULL,
+    derived_admitted_at DATETIME(3) NULL,
+    critic_input_snapshot_json JSON NULL,
+    critic_input_snapshot_hash CHAR(64) NULL,
+    active_logical_turn_slot VARCHAR(160)
+        GENERATED ALWAYS AS (CASE WHEN lifecycle_state = 'active' THEN logical_turn_id ELSE NULL END) PERSISTENT,
+    superseded_by_revision VARCHAR(160) NULL,
+    invalidation_reason VARCHAR(500) NULL,
+    invalidated_at DATETIME(3) NULL,
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_memory_source_revision (source_revision),
+    UNIQUE KEY uq_memory_source_active_turn (chat_session_id, active_logical_turn_slot),
+    INDEX idx_memory_source_logical_turn (chat_session_id(160), logical_turn_id(120), lifecycle_state, host_observed_at_ms),
+    INDEX idx_memory_source_turn (chat_session_id(160), turn_index, lifecycle_state),
+    INDEX idx_memory_source_generation (chat_session_id(160), source_generation_id(120)),
+    CONSTRAINT chk_memory_source_lifecycle CHECK (lifecycle_state IN ('active', 'superseded', 'invalidated', 'deleted')),
+    CONSTRAINT chk_memory_source_admission CHECK (derived_admission_state IN ('pending', 'committed')),
+    CONSTRAINT chk_memory_source_turn CHECK (turn_index > 0),
+    CONSTRAINT chk_memory_source_branch_state CHECK (branch_state IN ('observed', 'not_exposed'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Host-observed accepted raw user/assistant source revisions; no inferred branch identity.';
+
+CREATE TABLE IF NOT EXISTS memory_derivation_dependencies (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    contract_version VARCHAR(80) NOT NULL DEFAULT 'memory_derivation_dependency.v1',
+    chat_session_id VARCHAR(255) NOT NULL,
+    source_revision VARCHAR(160) NOT NULL,
+    root_source_pointer VARCHAR(255) NOT NULL,
+    child_artifact_type VARCHAR(80) NOT NULL,
+    child_artifact_id VARCHAR(255) NOT NULL,
+    parent_artifact_type VARCHAR(80) NOT NULL,
+    parent_artifact_id VARCHAR(255) NOT NULL,
+    derivation_version VARCHAR(120) NOT NULL,
+    extractor_version VARCHAR(120) NOT NULL,
+    index_version VARCHAR(120) NOT NULL,
+    lifecycle_state VARCHAR(50) NOT NULL DEFAULT 'active',
+    invalidated_at DATETIME(3) NULL,
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_memory_derivation_edge (source_revision(120), child_artifact_type, child_artifact_id(120), parent_artifact_type, parent_artifact_id(120), derivation_version(80), extractor_version(80), index_version(80)),
+    INDEX idx_memory_derivation_child (chat_session_id(160), child_artifact_type, child_artifact_id(120), lifecycle_state),
+    INDEX idx_memory_derivation_parent (chat_session_id(160), parent_artifact_type, parent_artifact_id(120), lifecycle_state),
+    INDEX idx_memory_derivation_source (chat_session_id(160), source_revision(120), lifecycle_state),
+    CONSTRAINT fk_memory_derivation_source FOREIGN KEY (source_revision) REFERENCES memory_source_revisions(source_revision) ON DELETE RESTRICT,
+    CONSTRAINT chk_memory_derivation_lifecycle CHECK (lifecycle_state IN ('active', 'invalidated', 'deleted'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='memory_derivation_dependency.v1 normalized parent-to-child lineage.';
+
+CREATE TABLE IF NOT EXISTS memory_reprocessing_jobs (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    contract_version VARCHAR(80) NOT NULL DEFAULT 'memory_reprocessing_job.v1',
+    idempotency_key CHAR(64) NOT NULL,
+    chat_session_id VARCHAR(255) NOT NULL,
+    source_revision VARCHAR(160) NOT NULL,
+    source_contract VARCHAR(120) NOT NULL,
+    derivation_version VARCHAR(120) NOT NULL,
+    extractor_version VARCHAR(120) NOT NULL,
+    index_version VARCHAR(120) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    attempts INT NOT NULL DEFAULT 0,
+    retry_after DATETIME(3) NULL,
+    lease_owner VARCHAR(255) NULL,
+    lease_until DATETIME(3) NULL,
+    last_error TEXT NULL,
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_memory_reprocessing_idempotency (idempotency_key),
+    INDEX idx_memory_reprocessing_claim (status, retry_after, lease_until, created_at),
+    INDEX idx_memory_reprocessing_source (chat_session_id(160), source_revision(120), status),
+    CONSTRAINT fk_memory_reprocessing_source FOREIGN KEY (source_revision) REFERENCES memory_source_revisions(source_revision) ON DELETE RESTRICT,
+    CONSTRAINT chk_memory_reprocessing_status CHECK (status IN ('pending', 'leased', 'retryable', 'permanent', 'completed', 'stale_rejected'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='memory_reprocessing_job.v1 durable revision-aware worker queue.';
+
+CREATE TABLE IF NOT EXISTS memory_vector_outbox (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    contract_version VARCHAR(80) NOT NULL DEFAULT 'memory_vector_outbox.v1',
+    operation_key CHAR(64) NOT NULL,
+    operation VARCHAR(20) NOT NULL,
+    chat_session_id VARCHAR(255) NOT NULL,
+    source_revision VARCHAR(160) NOT NULL,
+    document_id VARCHAR(255) NOT NULL,
+    document_json JSON NULL,
+    embedding_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    required_source_state VARCHAR(20) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    attempts INT NOT NULL DEFAULT 0,
+    retry_after DATETIME(3) NULL,
+    lease_owner VARCHAR(255) NULL,
+    lease_until DATETIME(3) NULL,
+    last_error TEXT NULL,
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_memory_vector_operation (operation_key),
+    INDEX idx_memory_vector_claim (status, embedding_ready, retry_after, lease_until, created_at),
+    INDEX idx_memory_vector_source (chat_session_id(160), source_revision(120), status),
+    INDEX idx_memory_vector_document (document_id(180), operation, status),
+    CONSTRAINT fk_memory_vector_source FOREIGN KEY (source_revision) REFERENCES memory_source_revisions(source_revision) ON DELETE RESTRICT,
+    CONSTRAINT chk_memory_vector_operation CHECK (operation IN ('delete', 'upsert')),
+    CONSTRAINT chk_memory_vector_required_source CHECK (required_source_state IN ('active', 'inactive')),
+    CONSTRAINT chk_memory_vector_status CHECK (status IN ('pending', 'leased', 'retryable', 'permanent', 'completed', 'stale_rejected', 'needs_embedding'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Idempotent revision-fenced vector delete/upsert outbox; provider secrets are never stored.';
+
+-- ---------------------------------------------------------------------------
+-- 3.7-D session route binding and exhaustive migration parity ledgers
+-- The canonical schema command reruns these IF NOT EXISTS definitions as its
+-- existing-install compatibility pass; previously shipped ledgers also remain
+-- recorded in immutable migration 007.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS session_route_bindings (
+    binding_id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    contract_version              VARCHAR(80)     NOT NULL,
+    stable_character_id           VARCHAR(255)    NOT NULL,
+    host_chat_id                  VARCHAR(255)    NOT NULL,
+    canonical_session_id          VARCHAR(255)    NOT NULL,
+    binding_state                 VARCHAR(50)     NOT NULL DEFAULT 'active',
+    binding_reason                VARCHAR(100)    NOT NULL,
+    redirected_from_session_id    VARCHAR(255)    NULL,
+    redirect_migration_id         BIGINT UNSIGNED NULL,
+    revision                      BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    created_at                    DATETIME(3)      DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at                    DATETIME(3)      DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_session_route_host_identity (stable_character_id, host_chat_id),
+    INDEX idx_session_route_canonical (canonical_session_id(180), binding_state),
+    INDEX idx_session_route_redirect (redirect_migration_id),
+    CONSTRAINT fk_session_route_redirect_migration
+        FOREIGN KEY (redirect_migration_id) REFERENCES session_migrations(id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Durable official-host identity to canonical Archive Center session route with exact readback acknowledgement.';
+
+CREATE TABLE IF NOT EXISTS session_migration_artifact_parity (
+    parity_id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    migration_id             BIGINT UNSIGNED NOT NULL,
+    manifest_version         VARCHAR(80)     NOT NULL,
+    table_name               VARCHAR(100)    NOT NULL,
+    parent_table_name        VARCHAR(100)    NULL,
+    session_column_name      VARCHAR(100)    NULL,
+    migration_policy         VARCHAR(50)     NOT NULL,
+    source_row_count         BIGINT          NULL,
+    source_content_hash      CHAR(64)        NULL,
+    target_row_count         BIGINT          NULL,
+    target_content_hash      CHAR(64)        NULL,
+    row_map_expected_count   BIGINT          NULL,
+    row_map_verified_count   BIGINT          NULL,
+    fk_expected_count        BIGINT          NULL,
+    fk_verified_count        BIGINT          NULL,
+    vector_expected_count    BIGINT          NULL,
+    vector_expected_id_hash  CHAR(64)        NULL,
+    vector_actual_count      BIGINT          NULL,
+    vector_actual_id_hash    CHAR(64)        NULL,
+    parity_state             VARCHAR(50)     NOT NULL DEFAULT 'unverified',
+    blocker_code             VARCHAR(120)    NULL,
+    verified_at              DATETIME(3)     NULL,
+    created_at               DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at               DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_session_migration_manifest_table (migration_id, manifest_version, table_name),
+    INDEX idx_session_migration_parity_state (migration_id, parity_state),
+    CONSTRAINT fk_session_migration_artifact_parity
+        FOREIGN KEY (migration_id) REFERENCES session_migrations(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Per-manifest-table count/hash, row-map, FK, and vector expected-ID parity gate.';
+
+CREATE TABLE IF NOT EXISTS session_migration_artifact_row_map (
+    migration_id       BIGINT UNSIGNED NOT NULL,
+    table_name         VARCHAR(100)    NOT NULL,
+    key_column_name    VARCHAR(100)    NOT NULL,
+    source_key         VARCHAR(255)    NOT NULL,
+    target_key         VARCHAR(255)    NOT NULL,
+    row_status         VARCHAR(50)     NOT NULL DEFAULT 'copied',
+    created_at         DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at         DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    PRIMARY KEY (migration_id, table_name, key_column_name, source_key),
+    UNIQUE KEY uq_session_migration_artifact_target
+        (migration_id, table_name, key_column_name, target_key),
+    INDEX idx_session_migration_artifact_row_status (migration_id, row_status),
+    CONSTRAINT fk_session_migration_artifact_row_map
+        FOREIGN KEY (migration_id) REFERENCES session_migrations(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Typed-as-text allowlisted row and alternate-key remap ledger for numeric, UUID, and revision-key artifacts.';
+
+CREATE TABLE IF NOT EXISTS session_migration_vector_expected_ids (
+    migration_id       BIGINT UNSIGNED NOT NULL,
+    document_id        VARCHAR(255)    NOT NULL,
+    source_table       VARCHAR(100)    NOT NULL,
+    source_row_id      VARCHAR(255)    NOT NULL,
+    observed           BOOLEAN         NOT NULL DEFAULT FALSE,
+    observed_at        DATETIME(3)     NULL,
+    created_at         DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    PRIMARY KEY (migration_id, document_id),
+    INDEX idx_session_migration_vector_observed (migration_id, observed),
+    CONSTRAINT fk_session_migration_vector_expected
+        FOREIGN KEY (migration_id) REFERENCES session_migrations(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Exact expected Chroma document IDs for migration parity; counts alone are insufficient.';
+
+CREATE TABLE IF NOT EXISTS session_migration_saga_steps (
+    step_id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    migration_id    BIGINT UNSIGNED NOT NULL,
+    phase            VARCHAR(80)     NOT NULL,
+    phase_state      VARCHAR(50)     NOT NULL DEFAULT 'pending',
+    attempt_count    INT             NOT NULL DEFAULT 0,
+    request_hash     CHAR(64)        NULL,
+    result_json      JSON            NULL,
+    last_error       TEXT            NULL,
+    started_at       DATETIME(3)     NULL,
+    completed_at     DATETIME(3)     NULL,
+    created_at       DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at       DATETIME(3)     DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) NOT NULL,
+    UNIQUE KEY uq_session_migration_saga_phase (migration_id, phase),
+    INDEX idx_session_migration_saga_state (phase_state, updated_at),
+    CONSTRAINT fk_session_migration_saga_step
+        FOREIGN KEY (migration_id) REFERENCES session_migrations(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Recoverable MariaDB/Chroma session migration saga phases; no destructive phase may skip parity.';

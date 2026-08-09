@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -471,17 +472,68 @@ func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	deleteFenceObservedAtMS := time.Now().UTC().UnixMilli()
+	s.invalidateCompleteTurnSourceAcceptances(
+		ctx, sid, 1, "session_delete", deleteFenceObservedAtMS,
+	)
 	if err := rollbackStore.DeleteSession(ctx, sid); err != nil {
 		writeInternalError(w, err.Error())
 		return
 	}
+	s.invalidateCompleteTurnSourceAcceptances(
+		ctx, sid, 1, "session_delete", time.Now().UTC().UnixMilli(),
+	)
 
 	vectorCleanup := map[string]any{
 		"attempted": false,
 		"ok":        true,
 		"error":     nil,
 	}
-	if s.Vector != nil {
+	lifecycleOutbox := false
+	if _, ok := s.Store.(store.SourceRevisionStore); ok {
+		lifecycleOutbox = true
+		if availability, hasAvailability := s.Store.(store.MemoryDerivationLifecycleAvailability); hasAvailability &&
+			!availability.MemoryDerivationLifecycleEnabled() {
+			lifecycleOutbox = false
+		}
+	}
+	if lifecycleOutbox {
+		runtimeConfig := s.runtimeConfigSnapshot()
+		results := []memoryVectorProcessResult{}
+		if leaseDuration := memoryWorkerLeaseDuration(runtimeConfig); runtimeConfig.Synced && leaseDuration > 0 {
+			results = s.processMemoryVectorOutboxBatch(
+				ctx,
+				fmt.Sprintf("session-delete:%s", sid),
+				time.Now().UTC(),
+				leaseDuration,
+				0,
+			)
+		}
+		s.wakeMemoryWorkers()
+		completed := 0
+		retryable := 0
+		permanent := 0
+		for _, result := range results {
+			switch result.CanonicalState {
+			case "completed", "stale_rejected":
+				completed++
+			case "retryable":
+				retryable++
+			case "permanent":
+				permanent++
+			}
+		}
+		vectorCleanup = map[string]any{
+			"attempted":        true,
+			"ok":               true,
+			"mode":             "durable_outbox",
+			"processed":        len(results),
+			"completed":        completed,
+			"retryable_queued": retryable,
+			"permanent":        permanent,
+			"error":            nil,
+		}
+	} else if s.Vector != nil {
 		vectorCleanup["attempted"] = true
 		if err := s.Vector.DeleteSession(ctx, sid); err != nil {
 			if errors.Is(err, vector.ErrNotEnabled) {

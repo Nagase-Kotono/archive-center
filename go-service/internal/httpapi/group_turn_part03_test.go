@@ -41,14 +41,15 @@ func TestCompleteTurnSubjectiveEntityMemoriesAutoSaveByOwner(t *testing.T) {
 				"target_reveal_policy": "requires_explicit_attachment",
 			},
 			map[string]any{
-				"owner_entity_key":  "asuna",
-				"owner_entity_name": "Asuna",
-				"owner_entity_role": "npc",
-				"memory_text":       "Asuna privately believes Siwoo is hiding fear from her.",
-				"importance_10":     6,
-				"emotional_weight":  0.7,
-				"evidence_excerpt":  "hiding fear",
-				"secret_guard":      true,
+				"owner_entity_key":     "asuna",
+				"owner_entity_name":    "Asuna",
+				"owner_entity_role":    "npc",
+				"memory_text":          "Asuna privately believes Siwoo is hiding fear from her.",
+				"importance_10":        6,
+				"emotional_weight":     0.7,
+				"evidence_excerpt":     "hiding fear",
+				"secret_guard":         true,
+				"target_reveal_policy": "owner_private_until_revealed",
 			},
 		},
 		"persona_capsule_candidates": []any{},
@@ -97,16 +98,19 @@ func TestCompleteTurnSubjectiveEntityMemoryDuplicateSkipped(t *testing.T) {
 	srv.Store = fake
 	srv.StoreOpenError = nil
 
-	extraction := normalizeCriticExtraction(map[string]any{
+	extraction := map[string]any{
 		"subjective_entity_memories": []any{
 			map[string]any{
 				"owner_entity_key":  "siwoo",
 				"owner_entity_name": "Siwoo",
+				"owner_entity_role": "protagonist",
+				"owner_visibility":  "player_known",
 				"memory_text":       memoryText,
 				"source_turn_index": 3,
+				"evidence_excerpt":  "same hallway becomes dangerous",
 			},
 		},
-	})
+	}
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-subjective", 3, extraction, "The same hallway becomes dangerous when revisited.", completeTurnEmbeddingConfig{}, time.Unix(1300, 0))
 	if result.SubjectiveEntityMemories != 0 || len(fake.savedEntityMemories) != 0 {
 		t.Fatalf("duplicate subjective memory should be skipped, result=%#v saved=%#v", result, fake.savedEntityMemories)
@@ -123,7 +127,56 @@ func TestCompleteTurnSubjectiveEntityMemoryDuplicateSkipped(t *testing.T) {
 	}
 }
 
-func TestCompleteTurnSubjectiveEntityMemoryCanonicalizesOwnerAliases(t *testing.T) {
+func TestCompleteTurnProtectedSubjectiveMemoryCollectsBroadlyAndDefaultsRevealPolicy(t *testing.T) {
+	fake := &turnRecordingStore{}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	srv.StoreOpenError = nil
+
+	extraction := map[string]any{
+		"subjective_entity_memories": []any{
+			map[string]any{
+				"owner_entity_key":     "mina",
+				"owner_entity_name":    "Mina",
+				"owner_entity_role":    "npc",
+				"owner_visibility":     "owner_private",
+				"memory_text":          "Mina privately remembers hiding the key.",
+				"target_reveal_policy": "owner_private_until_revealed",
+				"secret_guard":         true,
+			},
+			map[string]any{
+				"owner_entity_key":  "rowan",
+				"owner_entity_name": "Rowan",
+				"owner_entity_role": "npc",
+				"owner_visibility":  "owner_private",
+				"memory_text":       "Rowan privately suspects Mina.",
+				"evidence_excerpt":  "Rowan suspects Mina",
+				"secret_guard":      true,
+			},
+		},
+	}
+	result := srv.saveCriticExtractionArtifacts(
+		context.Background(), "sess-protected", 5, extraction,
+		"Mina hid the key. Rowan suspects Mina.",
+		completeTurnEmbeddingConfig{}, time.Unix(1500, 0),
+	)
+	if result.SubjectiveEntityMemories != 2 || len(fake.savedEntityMemories) != 2 {
+		t.Fatalf("private generated memories should be collected without an evidence-text gate: result=%#v saved=%#v", result, fake.savedEntityMemories)
+	}
+	if fake.savedEntityMemories[0].OwnerEntityKey != "mina" ||
+		fake.savedEntityMemories[0].TargetRevealPolicy != "owner_private_until_revealed" ||
+		fake.savedEntityMemories[1].OwnerEntityKey != "rowan" ||
+		fake.savedEntityMemories[1].TargetRevealPolicy != "owner_private_until_revealed" {
+		t.Fatalf("private memory policy mismatch: %#v", fake.savedEntityMemories)
+	}
+	for _, skip := range result.SkipReasons {
+		if skip["surface"] == "subjective_entity_memories" && fmt.Sprint(skip["reason"]) == "protected_memory_evidence_required" {
+			t.Fatalf("storage-time protected-memory evidence filter returned: %#v", result.SkipReasons)
+		}
+	}
+}
+
+func TestCompleteTurnSubjectiveEntityMemoryDoesNotGuessRomanizedOwnerAlias(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnCharStates: []store.CharacterState{{CharacterName: "\uc774\uc2dc\uc6b0"}},
 	}
@@ -136,30 +189,33 @@ func TestCompleteTurnSubjectiveEntityMemoryCanonicalizesOwnerAliases(t *testing.
 			map[string]any{
 				"owner_entity_key":  "siwoo",
 				"owner_entity_name": "Siwoo",
+				"owner_entity_role": "protagonist",
+				"owner_visibility":  "player_known",
 				"memory_text":       "Siwoo privately remembers that Exit 2 felt unsafe.",
 				"source_turn_index": 4,
+				"evidence_excerpt":  "Exit 2 felt unsafe",
 			},
 		},
 	})
-	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-subjective", 4, extraction, "Exit 2 felt unsafe.", completeTurnEmbeddingConfig{}, time.Unix(1400, 0))
+	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-subjective", 4, extraction, "Later, Exit 2 felt unsafe.", completeTurnEmbeddingConfig{}, time.Unix(1400, 0))
 	if result.SubjectiveEntityMemories != 1 || len(fake.savedEntityMemories) != 1 {
 		t.Fatalf("expected one canonical subjective memory, result=%#v saved=%#v", result, fake.savedEntityMemories)
 	}
 	saved := fake.savedEntityMemories[0]
 	if saved.OwnerEntityKey != "siwoo" || saved.PersonaEntityKey != "siwoo" {
-		t.Fatalf("owner alias key was not canonicalized: %+v", saved)
+		t.Fatalf("owner key changed without explicit identity evidence: %+v", saved)
 	}
-	if saved.OwnerEntityName != "\uc774\uc2dc\uc6b0" || saved.PersonaEntityName != "\uc774\uc2dc\uc6b0" {
-		t.Fatalf("owner display name should use canonical character state: %+v", saved)
+	if saved.OwnerEntityName != "Siwoo" || saved.PersonaEntityName != "Siwoo" {
+		t.Fatalf("romanized owner was merged into a stored character without explicit evidence: %+v", saved)
 	}
-	for _, needle := range []string{"owner_entity_alias:Siwoo", "entity_alias_canonicalized", "raw_owner_entity_name:Siwoo"} {
-		if !strings.Contains(saved.TagsJSON, needle) {
-			t.Fatalf("canonical alias tag %q missing from %s", needle, saved.TagsJSON)
+	for _, forbidden := range []string{"entity_alias_canonicalized", "raw_owner_entity_name:Siwoo"} {
+		if strings.Contains(saved.TagsJSON, forbidden) {
+			t.Fatalf("unconfirmed alias tag %q must not be added to %s", forbidden, saved.TagsJSON)
 		}
 	}
 }
 
-func TestSaveCriticExtractionArtifactsNormalizesMultilingualEntityAliases(t *testing.T) {
+func TestSaveCriticExtractionArtifactsPreservesUnconfirmedMultilingualAliases(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnCharStates: []store.CharacterState{{CharacterName: "Mina"}},
 	}
@@ -173,12 +229,16 @@ func TestSaveCriticExtractionArtifactsNormalizesMultilingualEntityAliases(t *tes
 		"evidence_excerpts": []any{"Mina promised Rowan she would return."},
 		"entities": map[string]any{
 			"characters": []any{map[string]any{
-				"name":        "\uBBFC\uC544",
-				"aliases":     []any{"Mina", "\uBBFC\uC544"},
-				"description": "returning ally",
+				"name":               "Mina",
+				"aliases":            []any{"Mina", "\uBBFC\uC544"},
+				"description":        "returning ally",
+				"reference_contract": "critic_entity_reference.v1",
+				"reference_scope":    "session_stable",
+				"name_expression":    "Mina",
+				"evidence_excerpt":   "Mina promised Rowan",
 			}},
 		},
-		"kg_triples": []any{map[string]any{"subject": "\uBBFC\uC544", "predicate": "promised", "object": "Rowan"}},
+		"kg_triples": []any{map[string]any{"semantic_class": "event_fact", "subject": "Mina", "predicate": "promised", "object": "Rowan"}},
 	})
 
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-multi", 4, extraction, "Mina promised Rowan she would return.", completeTurnEmbeddingConfig{}, time.Unix(100, 0))
@@ -186,13 +246,13 @@ func TestSaveCriticExtractionArtifactsNormalizesMultilingualEntityAliases(t *tes
 		t.Fatalf("expected entity and KG saves, result=%#v entities=%#v kg=%#v", result, fake.savedEntities, fake.savedKGTriples)
 	}
 	if len(fake.savedEntities) != 1 || fake.savedEntities[0].Name != "Mina" {
-		t.Fatalf("expected Korean entity name to canonicalize to Mina, got %#v", fake.savedEntities)
+		t.Fatalf("unconfirmed multilingual alias was rewritten: %#v", fake.savedEntities)
 	}
 	if !strings.Contains(fake.savedEntities[0].AliasesJSON, "Mina") || !strings.Contains(fake.savedEntities[0].AliasesJSON, "\uBBFC\uC544") {
 		t.Fatalf("expected aliases to preserve display variants, got %#v", fake.savedEntities[0])
 	}
 	if len(fake.savedKGTriples) != 1 || fake.savedKGTriples[0].Subject != "Mina" || fake.savedKGTriples[0].Object != "Rowan" {
-		t.Fatalf("expected KG subject to use canonical display name, got %#v", fake.savedKGTriples)
+		t.Fatalf("unconfirmed KG subject was rewritten: %#v", fake.savedKGTriples)
 	}
 }
 
@@ -213,18 +273,28 @@ func TestSaveCriticExtractionArtifactsGuardsTransientDescriptorsAndParticipants(
 			},
 		},
 		"character_deltas": []any{
-			map[string]any{"name": "red-haired girl", "status": map[string]any{"emotion": "curious"}, "events": []any{map[string]any{"type": "sighting", "detail": "She watched from the door."}}},
-			map[string]any{"name": "Mina", "events": []any{map[string]any{"type": "relationship_shift", "detail": "Mina trusted Rowan more."}}},
+			map[string]any{
+				"name": "red-haired girl", "reference_contract": "critic_entity_reference.v1", "reference_scope": "turn_local_descriptor", "name_expression": "red-haired girl", "evidence_excerpt": "a red-haired girl watched",
+				"status": map[string]any{"emotion": "curious"}, "events": []any{map[string]any{"type": "sighting", "detail": "She watched from the door."}},
+			},
+			map[string]any{
+				"name": "Mina", "reference_contract": "critic_entity_reference.v1", "reference_scope": "session_stable", "name_expression": "Mina", "evidence_excerpt": "Mina and Rowan made a plan",
+				"events": []any{map[string]any{"type": "relationship_shift", "detail": "Mina trusted Rowan more."}},
+			},
 		},
 		"pending_threads": []any{map[string]any{"thread_type": "promise", "title": "Mina asks Rowan about the plan", "owner": "{{user}}", "target": "Mina"}},
 	})
 
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-scrub", 5, extraction, "Mina and Rowan made a plan while a red-haired girl watched.", completeTurnEmbeddingConfig{}, time.Unix(200, 0))
-	if result.CharacterStates != 1 || len(fake.savedCharacterStates) != 1 || fake.savedCharacterStates[0].CharacterName != "Mina" {
-		t.Fatalf("expected only anchored Mina character state, result=%#v states=%#v", result, fake.savedCharacterStates)
+	stateNames := map[string]bool{}
+	for _, state := range fake.savedCharacterStates {
+		stateNames[state.CharacterName] = true
 	}
-	if result.CharacterEvents != 1 || len(fake.savedCharacterEvents) != 1 || fake.savedCharacterEvents[0].CharacterName != "Mina" {
-		t.Fatalf("expected only anchored Mina character event, result=%#v events=%#v", result, fake.savedCharacterEvents)
+	if result.CharacterStates != 2 || len(fake.savedCharacterStates) != 2 || !stateNames["Mina"] || !stateNames["red-haired girl"] {
+		t.Fatalf("source-observed descriptor or named character state was lost, result=%#v states=%#v", result, fake.savedCharacterStates)
+	}
+	if result.CharacterEvents != 1 || len(fake.savedCharacterEvents) != 1 || fake.savedCharacterEvents[0].CharacterName != "red-haired girl" {
+		t.Fatalf("source-observed character event was not preserved, result=%#v events=%#v", result, fake.savedCharacterEvents)
 	}
 	var stateDeltas string
 	for _, item := range fake.savedActiveStates {
@@ -234,10 +304,10 @@ func TestSaveCriticExtractionArtifactsGuardsTransientDescriptorsAndParticipants(
 		}
 	}
 	if !strings.Contains(stateDeltas, "Mina") || !strings.Contains(stateDeltas, "Rowan") || strings.Contains(stateDeltas, "{{user}}") {
-		t.Fatalf("expected safe pair-only relationship delta and no participant placeholder, state_deltas=%s", stateDeltas)
+		t.Fatalf("expected pair-only relationship delta and no participant placeholder, state_deltas=%s", stateDeltas)
 	}
 	if len(fake.savedPendingThreads) != 1 || fake.savedPendingThreads[0].Owner != "" || fake.savedPendingThreads[0].Target != "Mina" {
-		t.Fatalf("expected pending thread participant owner scrubbed and safe target kept, got %#v", fake.savedPendingThreads)
+		t.Fatalf("expected pending thread participant owner scrubbed and target kept, got %#v", fake.savedPendingThreads)
 	}
 }
 
@@ -290,7 +360,7 @@ func TestSaveCriticExtractionArtifactsAppliesSoftPrune(t *testing.T) {
 	}
 }
 
-func TestCompleteTurnMemorySemanticDedupSkipsInsertAndReinforcesExisting(t *testing.T) {
+func TestCompleteTurnRepeatedSummaryAcrossTurnsRemainsASeparateTurnMemory(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnMemories: []store.Memory{
 			{ID: 42, ChatSessionID: "sess-dedup", TurnIndex: 2, SummaryJSON: `{"turn_summary":"Mina promised Rowan she would return with the brass key."}`, Importance: 0.4},
@@ -309,24 +379,19 @@ func TestCompleteTurnMemorySemanticDedupSkipsInsertAndReinforcesExisting(t *test
 	if result.Errors != 0 {
 		t.Fatalf("semantic dedup should not error, result=%#v", result)
 	}
-	if len(fake.savedMemories) != 0 || result.Memories != 0 {
-		t.Fatalf("expected duplicate memory insert to be skipped, result=%#v saved=%#v", result, fake.savedMemories)
+	if len(fake.savedMemories) != 1 || result.Memories != 1 {
+		t.Fatalf("repeated wording from a later turn was dropped as the same incident, result=%#v saved=%#v", result, fake.savedMemories)
 	}
-	if got := fake.updatedImportance[42]; got < 0.79 || got > 0.81 {
-		t.Fatalf("expected existing memory importance reinforced to 0.8, got %.2f updates=%#v", got, fake.updatedImportance)
+	if len(fake.updatedImportance) != 0 {
+		t.Fatalf("a prior-turn memory was rewritten by text similarity: %#v", fake.updatedImportance)
 	}
-	if !containsString(result.Warnings, "memory_semantic_dedup_merged") {
-		t.Fatalf("expected memory_semantic_dedup_merged warning, got %#v", result.Warnings)
+	if containsString(result.Warnings, "memory_semantic_dedup_merged") {
+		t.Fatalf("text similarity merge returned: %#v", result.Warnings)
 	}
-	foundAudit := false
 	for _, item := range fake.savedAuditLogs {
-		if item.EventType == "memory_semantic_dedup" && item.Source == "critic" && strings.Contains(item.DetailsJSON, `"merged_memory_id":42`) {
-			foundAudit = true
-			break
+		if item.EventType == "memory_semantic_dedup" {
+			t.Fatalf("text similarity audit returned: %#v", item)
 		}
-	}
-	if !foundAudit {
-		t.Fatalf("expected memory_semantic_dedup audit log, got %#v", fake.savedAuditLogs)
 	}
 }
 
@@ -406,7 +471,7 @@ func TestConfigUpdateRuntimeSettingsFeedCompleteTurnCritic(t *testing.T) {
 		"turn_summary":      "Runtime config critic extracted one durable memory.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"The runtime-configured critic is active."},
-		"kg_triples":        []any{map[string]any{"subject": "Critic", "predicate": "extracts", "object": "Memory"}},
+		"kg_triples":        []any{testEntityScalarKG("state_fact", "critic", "event", "is", "active", "state", "The runtime-configured critic is active.")},
 	})
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
@@ -533,7 +598,7 @@ func TestSaveCriticExtractionArtifactsSkipsDuplicateEvidenceAndKGForSameTurn(t *
 		"turn_summary":      "Mina promises Rowan she will return.",
 		"importance_score":  6,
 		"evidence_excerpts": []any{"Mina promises Rowan she will return."},
-		"kg_triples":        []any{map[string]any{"subject": "Mina", "predicate": "promises", "object": "Rowan", "valid_from": 7}},
+		"kg_triples":        []any{map[string]any{"semantic_class": "event_fact", "subject": "Mina", "predicate": "promises", "object": "Rowan", "valid_from": 7}},
 	})
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-dupe-artifacts", 7, extraction, "Mina promises Rowan she will return.", completeTurnEmbeddingConfig{}, time.Unix(700, 0))
 	if result.Evidence != 0 || result.KGTriples != 0 {
@@ -544,7 +609,35 @@ func TestSaveCriticExtractionArtifactsSkipsDuplicateEvidenceAndKGForSameTurn(t *
 	}
 }
 
-func TestSaveCriticExtractionArtifactsSkipsFuzzyEvidenceAndActiveKGDuplicates(t *testing.T) {
+func TestSaveCriticExtractionArtifactsAcceptsTupleKGAndScalarEntities(t *testing.T) {
+	fake := &turnRecordingStore{}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	srv.StoreOpenError = nil
+
+	extraction := map[string]any{
+		"kg_triples": []any{[]any{"김민지", "is_member_of", "마케팅팀"}},
+		"entities": map[string]any{
+			"characters": []any{"김민지"},
+			"locations":  []any{"마케팅팀"},
+		},
+	}
+	result := srv.saveCriticExtractionArtifacts(
+		context.Background(), "sess-tuple-kg", 2, extraction,
+		"김민지는 마케팅팀 소속이다.", completeTurnEmbeddingConfig{}, time.Unix(1700, 0),
+	)
+	if result.KGTriples != 1 || len(fake.savedKGTriples) != 1 {
+		t.Fatalf("tuple KG was not stored: result=%#v saved=%#v", result, fake.savedKGTriples)
+	}
+	if got := fake.savedKGTriples[0]; got.Subject != "김민지" || got.Predicate != "is_member_of" || got.Object != "마케팅팀" {
+		t.Fatalf("tuple KG changed during storage: %#v", got)
+	}
+	if result.Entities != 2 || len(fake.savedEntities) != 2 {
+		t.Fatalf("scalar entities were not stored: result=%#v saved=%#v", result, fake.savedEntities)
+	}
+}
+
+func TestSaveCriticExtractionArtifactsKeepsDistinctEvidenceAndSkipsExactActiveKGDuplicate(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnEvidence: []store.DirectEvidence{{
 			ChatSessionID:   "sess-dupe-artifacts-fuzzy",
@@ -569,14 +662,14 @@ func TestSaveCriticExtractionArtifactsSkipsFuzzyEvidenceAndActiveKGDuplicates(t 
 		"turn_summary":      "Mina repeats her promise to return and protect Rowan.",
 		"importance_score":  6,
 		"evidence_excerpts": []any{"Mina promises Rowan she will return."},
-		"kg_triples":        []any{map[string]any{"subject": "Mina", "predicate": "protects", "object": "Rowan", "valid_from": 7}},
+		"kg_triples":        []any{map[string]any{"semantic_class": "event_fact", "subject": "Mina", "predicate": "protects", "object": "Rowan", "valid_from": 7}},
 	})
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-dupe-artifacts-fuzzy", 7, extraction, "Mina promises Rowan she will return. Mina protects Rowan.", completeTurnEmbeddingConfig{}, time.Unix(701, 0))
-	if result.Evidence != 0 || result.KGTriples != 0 {
-		t.Fatalf("fuzzy/active duplicate artifacts were saved, evidence=%d kg=%d skip=%#v", result.Evidence, result.KGTriples, result.SkipReasons)
+	if result.Evidence != 1 || result.KGTriples != 0 {
+		t.Fatalf("distinct evidence or exact KG duplicate was handled incorrectly, evidence=%d kg=%d skip=%#v", result.Evidence, result.KGTriples, result.SkipReasons)
 	}
-	if len(fake.savedEvidence) != 0 || len(fake.savedKGTriples) != 0 {
-		t.Fatalf("duplicate save calls occurred, evidence=%d kg=%d", len(fake.savedEvidence), len(fake.savedKGTriples))
+	if len(fake.savedEvidence) != 1 || len(fake.savedKGTriples) != 0 {
+		t.Fatalf("distinct evidence or exact KG duplicate write count is wrong, evidence=%d kg=%d", len(fake.savedEvidence), len(fake.savedKGTriples))
 	}
 }
 
@@ -620,7 +713,7 @@ func TestExplorerRegenerateMemoryUsesCompleteTurnArtifactPipeline(t *testing.T) 
 		"turn_summary":      "Rowan accepts Mina's request and confirms the cellar route.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"Rowan accepts and confirms the cellar route is the only safe path."},
-		"kg_triples":        []any{map[string]any{"subject": "Rowan", "predicate": "guards", "object": "cellar route"}},
+		"kg_triples":        []any{testEntityScalarKG("state_fact", "cellar route", "location", "is", "the only safe path", "state", "Rowan accepts and confirms the cellar route is the only safe path.")},
 		"world_rules":       []any{map[string]any{"scope": "location", "scope_name": "cellar", "category": "access", "key": "cellar_route_only_safe_path", "value": "The cellar route is the only safe path."}},
 	})
 	chatResp, _ := json.Marshal(map[string]any{
@@ -635,7 +728,7 @@ func TestExplorerRegenerateMemoryUsesCompleteTurnArtifactPipeline(t *testing.T) 
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
-	body := `{"chat_session_id":"sess-explorer-regen","turn_index":4,"client_meta":{"critic":{"api_key":"sk-test","endpoint":"https://api.example.com/v1","model":"critic-test","provider":"openai"}}}`
+	body := `{"chat_session_id":"sess-explorer-regen","turn_index":4,"client_meta":{"critic":{"api_key":"sk-test","endpoint":"https://api.example.com/v1","model":"critic-test","provider":"openai","timeout_ms":45000}}}`
 	req := httptest.NewRequest(http.MethodPost, "/explorer/memories/regenerate", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -707,7 +800,7 @@ func TestCompleteTurnCriticLedgerWiringBehindFeatureFlag(t *testing.T) {
 		mux := http.NewServeMux()
 		srv.RegisterRoutes(mux)
 
-		body := `{"chat_session_id":"sess-ledger-wiring","turn_index":6,"user_input":"Mina asks what Rowan remembers.","assistant_content":"Rowan answers with a new visible reply.","request_type":"model","output_language_override":{"language":"ko"},"client_meta":{"critic":{"api_key":"sk-test","endpoint":"https://api.example.com/v1","model":"critic-ledger-test","provider":"openai"}}}`
+		body := `{"chat_session_id":"sess-ledger-wiring","turn_index":6,"user_input":"Mina asks what Rowan remembers.","assistant_content":"Rowan answers with a new visible reply.","request_type":"model","output_language_override":{"language":"ko"},"client_meta":{"critic":{"api_key":"sk-test","endpoint":"https://api.example.com/v1","model":"critic-ledger-test","provider":"openai","timeout_ms":45000}}}`
 		req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -808,7 +901,10 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 		"turn_summary":      "Imported HypaMemory says Chloe trusts Hero after the rooftop promise.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{"Chloe trusts Hero after the rooftop promise."},
-		"kg_triples":        []any{map[string]any{"subject": "Chloe", "predicate": "trusts", "object": "Hero"}},
+		"relationship_observations": []any{map[string]any{
+			"source_entity": "Chloe", "source_entity_expression": "Chloe", "target_entity": "Hero", "target_entity_expression": "Hero",
+			"domain": "trust", "domain_expression": "trusts", "observation": "Chloe trusts Hero after the rooftop promise", "support_kind": "explicit_observed_state", "evidence_excerpt": "Chloe trusts Hero after the rooftop promise.",
+		}},
 	})
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
@@ -834,7 +930,7 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	updateBody := `{"criticApiKey":"sk-runtime","criticEndpoint":"https://api.example.com/v1","criticModel":"runtime-critic","criticProvider":"openai","embeddingApiKey":"sk-embed","embeddingEndpoint":"https://api.example.com/v1/embeddings","embeddingModel":"embed-model","embeddingProvider":"openai"}`
+	updateBody := `{"criticApiKey":"sk-runtime","criticEndpoint":"https://api.example.com/v1","criticModel":"runtime-critic","criticProvider":"openai","criticTimeout":45,"embeddingApiKey":"sk-embed","embeddingEndpoint":"https://api.example.com/v1/embeddings","embeddingModel":"embed-model","embeddingProvider":"openai","embeddingTimeout":30}`
 	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(updateBody)))
 	updateReq.Header.Set("Content-Type", "application/json")
 	updateRec := httptest.NewRecorder()
@@ -859,14 +955,14 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 	if resp["status"] != "ok" || resp["succeeded"] != float64(1) || resp["failed"] != float64(0) {
 		t.Fatalf("expected successful HypaMemory import, got %+v", resp)
 	}
-	if len(fake.savedMemories) != 1 || len(fake.savedEvidence) != 1 || len(fake.savedKGTriples) != 1 {
+	if len(fake.savedMemories) != 1 || len(fake.savedEvidence) != 1 || len(fake.savedKGTriples) != 0 {
 		t.Fatalf("expected HypaMemory Critic artifacts, memories=%d evidence=%d kg=%d", len(fake.savedMemories), len(fake.savedEvidence), len(fake.savedKGTriples))
 	}
-	if fake.savedMemories[0].TurnIndex != -42 || fake.savedEvidence[0].SourceTurnStart != -42 || fake.savedKGTriples[0].SourceTurn != -42 {
-		t.Fatalf("expected HypaMemory import artifacts to use negative import turn index, memory=%d evidence=%d kg=%d", fake.savedMemories[0].TurnIndex, fake.savedEvidence[0].SourceTurnStart, fake.savedKGTriples[0].SourceTurn)
+	if fake.savedMemories[0].TurnIndex != -42 || fake.savedEvidence[0].SourceTurnStart != -42 {
+		t.Fatalf("expected HypaMemory import artifacts to use negative import turn index, memory=%d evidence=%d", fake.savedMemories[0].TurnIndex, fake.savedEvidence[0].SourceTurnStart)
 	}
-	if len(vec.docs) != 2 {
-		t.Fatalf("expected memory and evidence vector upserts for imported memory, got %d", len(vec.docs))
+	if len(vec.docs) != 1 {
+		t.Fatalf("relationship-scoped imported memory must stay out of generic vector; expected evidence only, got %d", len(vec.docs))
 	}
 	if !hasAuditEvent(fake.savedAuditLogs, "hypamemory_import") {
 		t.Fatalf("expected hypamemory_import audit log, got %#v", fake.savedAuditLogs)
@@ -895,7 +991,7 @@ func TestImportHypamemoryScoringPassRaisesLowCriticImportance(t *testing.T) {
 		"turn_summary":      "Imported HypaMemory says Hero was shot before and Chloe took him to hospital.",
 		"importance_score":  2,
 		"evidence_excerpts": []any{"Hero was shot before and Chloe took him to hospital."},
-		"kg_triples":        []any{map[string]any{"subject": "Hero", "predicate": "was_taken_to", "object": "hospital"}},
+		"kg_triples":        []any{map[string]any{"semantic_class": "location_fact", "subject": "Hero", "predicate": "was_taken_to", "object": "hospital"}},
 	})
 	scoringResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
@@ -931,7 +1027,7 @@ func TestImportHypamemoryScoringPassRaisesLowCriticImportance(t *testing.T) {
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	updateBody := `{"criticApiKey":"sk-runtime","criticEndpoint":"https://api.example.com/v1","criticModel":"runtime-critic","criticProvider":"openai","embeddingApiKey":"sk-embed","embeddingEndpoint":"https://api.example.com/v1/embeddings","embeddingModel":"embed-model","embeddingProvider":"openai"}`
+	updateBody := `{"criticApiKey":"sk-runtime","criticEndpoint":"https://api.example.com/v1","criticModel":"runtime-critic","criticProvider":"openai","criticTimeout":45,"embeddingApiKey":"sk-embed","embeddingEndpoint":"https://api.example.com/v1/embeddings","embeddingModel":"embed-model","embeddingProvider":"openai","embeddingTimeout":30}`
 	updateReq := httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader([]byte(updateBody)))
 	updateReq.Header.Set("Content-Type", "application/json")
 	updateRec := httptest.NewRecorder()
@@ -1004,10 +1100,11 @@ func TestCompleteTurnCriticProviderFailurePreservesRawTurnAndReportsReason(t *te
 		"user_input":        "Mina asks Rowan to remember the blue key.",
 		"assistant_content": "Rowan promises to keep the blue key safe.",
 		"client_meta": map[string]any{"critic": map[string]any{
-			"api_key":  apiKey,
-			"endpoint": "https://api.example.com/v1",
-			"model":    "critic-model",
-			"provider": "openai",
+			"api_key":    apiKey,
+			"endpoint":   "https://api.example.com/v1",
+			"model":      "critic-model",
+			"provider":   "openai",
+			"timeout_ms": 45000,
 		}},
 	}
 	raw, _ := json.Marshal(body)
@@ -1029,8 +1126,8 @@ func TestCompleteTurnCriticProviderFailurePreservesRawTurnAndReportsReason(t *te
 	if resp["save_ok"] != true || resp["critic_triggered"] != false {
 		t.Fatalf("expected raw save with critic failure, got %+v", resp)
 	}
-	if resp["derived_retry_required"] != true {
-		t.Fatalf("critic failure must keep derived retry eligible: %+v", resp)
+	if resp["derived_retry_required"] != false || resp["queue_action"] != "retry" || resp["retryable"] != true {
+		t.Fatalf("non-durable critic failure must request transport retry without claiming backend ownership: %+v", resp)
 	}
 	if resp["chat_logs_saved"] != float64(2) || resp["derived_artifacts_saved"] != float64(0) {
 		t.Fatalf("unexpected save counters: %+v", resp)
@@ -1041,12 +1138,12 @@ func TestCompleteTurnCriticProviderFailurePreservesRawTurnAndReportsReason(t *te
 	reasons, _ := resp["fail_reasons"].([]any)
 	found := false
 	for _, item := range reasons {
-		if strings.Contains(fmt.Sprint(item), "critic_extract_failed") {
+		if strings.Contains(fmt.Sprint(item), "CRITIC_PROVIDER_HTTP_ERROR") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected critic_extract_failed reason, got %+v", resp["fail_reasons"])
+		t.Fatalf("expected typed critic provider reason, got %+v", resp["fail_reasons"])
 	}
 	if !hasAuditEvent(fake.savedAuditLogs, "critic_extract_failed") {
 		t.Fatalf("expected critic_extract_failed audit log, got %#v", fake.savedAuditLogs)

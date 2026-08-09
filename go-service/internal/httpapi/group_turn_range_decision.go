@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,7 +18,7 @@ import (
 const (
 	rollbackDecisionContractVersion = "rollback.decision.v1"
 	routingTurnContractVersion      = "session-routing.turn-resolution.v1"
-	rollbackDecisionTTL             = 2 * time.Minute
+	rollbackDecisionMax             = 1024
 )
 
 type routingTurnBaseline struct {
@@ -46,6 +48,7 @@ type rollbackDecisionRequest struct {
 	DuplicateBlocked              bool                 `json:"duplicate_blocked"`
 	PendingOutputGuard            bool                 `json:"pending_output_guard"`
 	HostLifecycleObservation      string               `json:"host_lifecycle_observation"`
+	LifecycleActionObservation    string               `json:"lifecycle_action_observation"`
 	AllowManualCandidate          bool                 `json:"allow_manual_candidate"`
 	Baseline                      *routingTurnBaseline `json:"baseline,omitempty"`
 }
@@ -64,43 +67,59 @@ type rollbackDecisionResponse struct {
 	EffectiveCompleted  int    `json:"effective_completed_turns"`
 	BaselineApplied     bool   `json:"baseline_applied"`
 	DecisionToken       string `json:"decision_token,omitempty"`
-	ExpiresAt           string `json:"expires_at,omitempty"`
+	LifecycleAction     string `json:"lifecycle_action"`
+	TurnWorkflowHUD     any    `json:"turn_workflow_hud,omitempty"`
 }
 
 type rollbackDecisionRecord struct {
-	Token         string
-	SessionID     string
-	FromTurn      int
-	RequestSource string
-	ExpiresAt     time.Time
+	Token           string
+	SessionID       string
+	FromTurn        int
+	RequestSource   string
+	LifecycleAction string
+	Sequence        uint64
 }
 
 type rollbackDecisionLedger struct {
-	mu      sync.Mutex
-	records map[string]rollbackDecisionRecord
+	mu           sync.Mutex
+	records      map[string]rollbackDecisionRecord
+	nextSequence uint64
 }
 
 func newRollbackDecisionLedger() *rollbackDecisionLedger {
 	return &rollbackDecisionLedger{records: map[string]rollbackDecisionRecord{}}
 }
 
-func (l *rollbackDecisionLedger) issue(sessionID string, fromTurn int, requestSource string) rollbackDecisionRecord {
+func (l *rollbackDecisionLedger) issue(sessionID string, fromTurn int, requestSource, lifecycleAction string) rollbackDecisionRecord {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now().UTC()
-	for token, record := range l.records {
-		if now.After(record.ExpiresAt) {
-			delete(l.records, token)
-		}
+	if len(l.records) >= rollbackDecisionMax {
+		l.evictOldestLocked()
 	}
 	bytes := make([]byte, 18)
 	if _, err := rand.Read(bytes); err != nil {
 		bytes = []byte(now.Format("20060102150405.000000000"))
 	}
 	token := hex.EncodeToString(bytes)
-	record := rollbackDecisionRecord{Token: token, SessionID: sessionID, FromTurn: fromTurn, RequestSource: requestSource, ExpiresAt: now.Add(rollbackDecisionTTL)}
+	l.nextSequence++
+	record := rollbackDecisionRecord{Token: token, SessionID: sessionID, FromTurn: fromTurn, RequestSource: requestSource, LifecycleAction: lifecycleAction, Sequence: l.nextSequence}
 	l.records[token] = record
 	return record
+}
+
+func (l *rollbackDecisionLedger) evictOldestLocked() {
+	oldestToken := ""
+	var oldestSequence uint64
+	for token, record := range l.records {
+		if oldestToken == "" || record.Sequence < oldestSequence {
+			oldestToken = token
+			oldestSequence = record.Sequence
+		}
+	}
+	if oldestToken != "" {
+		delete(l.records, oldestToken)
+	}
 }
 
 func (l *rollbackDecisionLedger) consume(token, sessionID string, fromTurn int) (rollbackDecisionRecord, bool) {
@@ -111,7 +130,7 @@ func (l *rollbackDecisionLedger) consume(token, sessionID string, fromTurn int) 
 		return rollbackDecisionRecord{}, false
 	}
 	delete(l.records, token)
-	if time.Now().UTC().After(record.ExpiresAt) || record.SessionID != sessionID || record.FromTurn != fromTurn {
+	if record.SessionID != sessionID || record.FromTurn != fromTurn {
 		return rollbackDecisionRecord{}, false
 	}
 	return record, true
@@ -131,6 +150,15 @@ func (s *Server) handleRollbackDecision(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	req.Baseline = s.resolveDurableSessionRoutingBaseline(r.Context(), req.ChatSessionID, req.Baseline)
+	backendLatestAuthoritative := false
+	if rangeStore, ok := s.Store.(interface {
+		LatestSessionTurnIndex(context.Context, string) (int, error)
+	}); ok {
+		if latestTurn, err := rangeStore.LatestSessionTurnIndex(r.Context(), strings.TrimSpace(req.ChatSessionID)); err == nil {
+			req.BackendLatestTurn = latestTurn
+			backendLatestAuthoritative = true
+		}
+	}
 	if req.IncompleteTailCandidate &&
 		req.DeletionObserved &&
 		req.RemovedAssistantCount == 0 &&
@@ -139,9 +167,16 @@ func (s *Server) handleRollbackDecision(w http.ResponseWriter, r *http.Request) 
 		req.BackendLatestTurn > 0 &&
 		req.CandidateFromTurn == req.BackendLatestTurn &&
 		s.Store != nil {
-		logs, err := s.Store.ListChatLogs(r.Context(), strings.TrimSpace(req.ChatSessionID), 0, 0)
+		fromTurn, toTurn := 0, 0
+		if backendLatestAuthoritative {
+			fromTurn, toTurn = req.BackendLatestTurn, req.BackendLatestTurn
+		}
+		logs, err := s.Store.ListChatLogs(r.Context(), strings.TrimSpace(req.ChatSessionID), fromTurn, toTurn)
 		if err == nil && len(logs) > 0 {
-			actualLatestTurn := 0
+			actualLatestTurn := req.BackendLatestTurn
+			if !backendLatestAuthoritative {
+				actualLatestTurn = 0
+			}
 			for _, item := range logs {
 				if item.TurnIndex > actualLatestTurn {
 					actualLatestTurn = item.TurnIndex
@@ -163,9 +198,22 @@ func (s *Server) handleRollbackDecision(w http.ResponseWriter, r *http.Request) 
 	}
 	resp := calculateRollbackDecision(req)
 	if resp.Allowed {
-		record := s.rollbackDecisionLedger().issue(resp.ChatSessionID, resp.FromTurn, req.RequestSource)
+		record := s.rollbackDecisionLedger().issue(resp.ChatSessionID, resp.FromTurn, req.RequestSource, resp.LifecycleAction)
 		resp.DecisionToken = record.Token
-		resp.ExpiresAt = record.ExpiresAt.Format(time.RFC3339Nano)
+		requestSource := strings.TrimSpace(req.RequestSource)
+		if requestSource == "" {
+			requestSource = "auto"
+		}
+		resp.TurnWorkflowHUD = s.turnWorkflowHUDOperationNotice(
+			fmt.Sprintf("rollback:%s:%d:%s", resp.ChatSessionID, resp.FromTurn, requestSource),
+			resp.ChatSessionID,
+			resp.FromTurn,
+			"running",
+			"notice",
+			"turn_hud.notice.delete_detected",
+			"turn_hud.notice.delete_detected_detail",
+			"ASSISTANT_OUTPUT_DELETE_DETECTED",
+		)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -191,6 +239,17 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 	}
 	if req.PendingOutputGuard || rollbackObservationHasPendingGeneration(req.HostLifecycleObservation) {
 		resp.Reason = "pending_output_guard"
+		return resp
+	}
+	lifecycleAction := strings.ToLower(strings.TrimSpace(req.LifecycleActionObservation))
+	switch lifecycleAction {
+	case "":
+		// This decision contract only admits a verified host deletion. Callers
+		// performing an output replacement must explicitly observe supersession.
+		lifecycleAction = store.LogicalTurnLifecycleDeleted
+	case store.LogicalTurnLifecycleDeleted, store.LogicalTurnLifecycleSuperseded:
+	default:
+		resp.Reason = "lifecycle_action_observation_invalid"
 		return resp
 	}
 	manual := strings.EqualFold(strings.TrimSpace(req.RequestSource), "manual")
@@ -256,6 +315,7 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 	resp.MinFromTurn = minFrom
 	resp.EffectiveCompleted = effectiveCompleted
 	resp.BaselineApplied = baselineApplied
+	resp.LifecycleAction = lifecycleAction
 	return resp
 }
 
@@ -269,19 +329,23 @@ func rollbackObservationHasPendingGeneration(observation string) bool {
 }
 
 type sessionRoutingTurnResolutionRequest struct {
-	ChatSessionID         string                   `json:"chat_session_id"`
-	Mode                  string                   `json:"mode"`
-	HostChatID            string                   `json:"host_chat_id,omitempty"`
-	HostChatIDState       string                   `json:"host_chat_id_state,omitempty"`
-	LatestUserHash        string                   `json:"latest_user_hash,omitempty"`
-	LatestAssistantHash   string                   `json:"latest_assistant_hash,omitempty"`
-	LocalTurnIndex        int                      `json:"local_turn_index"`
-	VisibleCompletedTurns int                      `json:"visible_completed_turns"`
-	RisuUserMessageIndex  *int                     `json:"risu_user_message_index,omitempty"`
-	ObservedPairOrdinal   int                      `json:"observed_pair_ordinal,omitempty"`
-	Observations          []routingTurnObservation `json:"observations,omitempty"`
-	Baseline              *routingTurnBaseline     `json:"baseline,omitempty"`
-	canonicalTailAligned  bool
+	ChatSessionID          string                   `json:"chat_session_id"`
+	Mode                   string                   `json:"mode"`
+	StableCharacterID      string                   `json:"stable_character_id,omitempty"`
+	StableCharacterIDState string                   `json:"stable_character_id_state,omitempty"`
+	HostChatID             string                   `json:"host_chat_id,omitempty"`
+	HostChatIDState        string                   `json:"host_chat_id_state,omitempty"`
+	BindRequestedSession   bool                     `json:"bind_requested_session,omitempty"`
+	BindingMode            string                   `json:"binding_mode,omitempty"`
+	LatestUserHash         string                   `json:"latest_user_hash,omitempty"`
+	LatestAssistantHash    string                   `json:"latest_assistant_hash,omitempty"`
+	LocalTurnIndex         int                      `json:"local_turn_index"`
+	VisibleCompletedTurns  int                      `json:"visible_completed_turns"`
+	RisuUserMessageIndex   *int                     `json:"risu_user_message_index,omitempty"`
+	ObservedPairOrdinal    int                      `json:"observed_pair_ordinal,omitempty"`
+	Observations           []routingTurnObservation `json:"observations,omitempty"`
+	Baseline               *routingTurnBaseline     `json:"baseline,omitempty"`
+	canonicalTailAligned   bool
 }
 
 type routingTurnObservation struct {
@@ -301,19 +365,26 @@ type routingTurnResolvedObservation struct {
 }
 
 type sessionRoutingTurnResolutionResponse struct {
-	Status               string                           `json:"status"`
-	ContractVersion      string                           `json:"contract_version"`
-	ChatSessionID        string                           `json:"chat_session_id,omitempty"`
-	IdentityResolution   string                           `json:"identity_resolution,omitempty"`
-	Resolution           string                           `json:"resolution"`
-	TurnIndex            int                              `json:"turn_index"`
-	CompletedTurns       int                              `json:"completed_turns"`
-	LocalTurnIndex       int                              `json:"local_turn_index"`
-	LocalTurnSource      string                           `json:"local_turn_source"`
-	ProtectedBeforeTurn  int                              `json:"protected_before_turn"`
-	MinFromTurn          int                              `json:"min_from_turn"`
-	BaselineApplied      bool                             `json:"baseline_applied"`
-	ResolvedObservations []routingTurnResolvedObservation `json:"resolved_observations,omitempty"`
+	Status                 string                           `json:"status"`
+	ContractVersion        string                           `json:"contract_version"`
+	Code                   string                           `json:"code,omitempty"`
+	ChatSessionID          string                           `json:"chat_session_id,omitempty"`
+	IdentityResolution     string                           `json:"identity_resolution,omitempty"`
+	BindingContractVersion string                           `json:"binding_contract_version,omitempty"`
+	BindingRequired        bool                             `json:"binding_required"`
+	BindingAcknowledged    bool                             `json:"binding_acknowledged"`
+	BindingCreated         bool                             `json:"binding_created,omitempty"`
+	BindingUpdated         bool                             `json:"binding_updated,omitempty"`
+	LockedSourceRedirect   bool                             `json:"locked_source_redirect,omitempty"`
+	Resolution             string                           `json:"resolution"`
+	TurnIndex              int                              `json:"turn_index"`
+	CompletedTurns         int                              `json:"completed_turns"`
+	LocalTurnIndex         int                              `json:"local_turn_index"`
+	LocalTurnSource        string                           `json:"local_turn_source"`
+	ProtectedBeforeTurn    int                              `json:"protected_before_turn"`
+	MinFromTurn            int                              `json:"min_from_turn"`
+	BaselineApplied        bool                             `json:"baseline_applied"`
+	ResolvedObservations   []routingTurnResolvedObservation `json:"resolved_observations,omitempty"`
 }
 
 func (s *Server) handleSessionRoutingTurnResolution(w http.ResponseWriter, r *http.Request) {
@@ -322,27 +393,112 @@ func (s *Server) handleSessionRoutingTurnResolution(w http.ResponseWriter, r *ht
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "code": "invalid_session_routing_observation"})
 		return
 	}
-	canonicalSessionID, identityResolution, canonicalTailAligned := s.resolveObservedRisuSessionIdentity(r.Context(), req)
-	if canonicalSessionID != "" {
-		req.ChatSessionID = canonicalSessionID
+	identity := s.resolveObservedRisuSessionIdentity(r.Context(), req)
+	if identity.bindingError != nil {
+		writeJSON(w, http.StatusOK, sessionRoutingTurnResolutionResponse{
+			Status:                 "error",
+			ContractVersion:        routingTurnContractVersion,
+			Code:                   "session_route_binding_failed",
+			ChatSessionID:          strings.TrimSpace(req.ChatSessionID),
+			IdentityResolution:     identity.resolution,
+			BindingContractVersion: store.SessionRouteBindingContractVersion,
+			BindingRequired:        true,
+			BindingAcknowledged:    false,
+			Resolution:             "binding_failed",
+		})
+		return
 	}
-	req.canonicalTailAligned = canonicalTailAligned
+	if identity.sessionID != "" {
+		req.ChatSessionID = identity.sessionID
+	}
+	req.canonicalTailAligned = identity.canonicalTailAligned
 	req.Baseline = s.resolveDurableSessionRoutingBaseline(r.Context(), req.ChatSessionID, req.Baseline)
 	resp := calculateSessionRoutingTurnResolution(req)
 	resp.ChatSessionID = strings.TrimSpace(req.ChatSessionID)
-	resp.IdentityResolution = identityResolution
+	resp.IdentityResolution = identity.resolution
+	resp.BindingContractVersion = identity.bindingContractVersion
+	resp.BindingRequired = identity.bindingRequired
+	resp.BindingAcknowledged = identity.bindingAcknowledged
+	resp.BindingCreated = identity.bindingCreated
+	resp.BindingUpdated = identity.bindingUpdated
+	resp.LockedSourceRedirect = identity.lockedSourceRedirect
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req sessionRoutingTurnResolutionRequest) (string, string, bool) {
+type observedRisuSessionIdentityResolution struct {
+	sessionID              string
+	resolution             string
+	canonicalTailAligned   bool
+	bindingContractVersion string
+	bindingRequired        bool
+	bindingAcknowledged    bool
+	bindingCreated         bool
+	bindingUpdated         bool
+	lockedSourceRedirect   bool
+	bindingError           error
+}
+
+func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req sessionRoutingTurnResolutionRequest) observedRisuSessionIdentityResolution {
 	requested := strings.TrimSpace(req.ChatSessionID)
 	hostChatID := strings.TrimSpace(req.HostChatID)
+	stableCharacterID := strings.TrimSpace(req.StableCharacterID)
+	if req.StableCharacterIDState == "observed" && stableCharacterID != "" &&
+		req.HostChatIDState == "observed" && hostChatID != "" {
+		resolution := observedRisuSessionIdentityResolution{
+			sessionID:              requested,
+			resolution:             "durable_binding_required",
+			bindingContractVersion: store.SessionRouteBindingContractVersion,
+			bindingRequired:        true,
+		}
+		bindingStore, ok := s.Store.(store.SessionRouteBindingStore)
+		if !ok {
+			resolution.bindingError = errors.New("session route binding store unavailable")
+			return resolution
+		}
+		bindingMode := strings.TrimSpace(req.BindingMode)
+		if bindingMode == "" {
+			bindingMode = store.SessionRouteBindingModeResolveOrCreate
+		}
+		if req.BindRequestedSession && bindingMode == store.SessionRouteBindingModeResolveOrCreate {
+			bindingMode = store.SessionRouteBindingModeManualAttach
+		}
+		result, err := bindingStore.BindSessionRoute(ctx, store.SessionRouteBindingRequest{
+			StableCharacterID:  stableCharacterID,
+			HostChatID:         hostChatID,
+			RequestedSessionID: requested,
+			Mode:               bindingMode,
+		})
+		if err != nil || result == nil || !result.ReadbackVerified ||
+			strings.TrimSpace(result.Binding.CanonicalSessionID) == "" {
+			if err == nil {
+				err = errors.New("session route binding readback unverified")
+			}
+			resolution.bindingError = err
+			return resolution
+		}
+		resolution.sessionID = strings.TrimSpace(result.Binding.CanonicalSessionID)
+		resolution.bindingAcknowledged = true
+		resolution.bindingCreated = result.Created
+		resolution.bindingUpdated = result.Updated
+		resolution.lockedSourceRedirect = result.LockedSourceRedirect
+		switch {
+		case result.LockedSourceRedirect:
+			resolution.resolution = "durable_binding_locked_source_redirect"
+		case result.Created:
+			resolution.resolution = "durable_binding_created"
+		case result.Updated:
+			resolution.resolution = "durable_binding_updated"
+		default:
+			resolution.resolution = "durable_binding_existing"
+		}
+		return resolution
+	}
 	if req.HostChatIDState != "observed" || hostChatID == "" || s.Store == nil {
-		return requested, "host_chat_id_unobserved", false
+		return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "host_chat_id_unobserved"}
 	}
 	sessions, err := s.Store.ListSessions(ctx)
 	if err != nil {
-		return requested, "session_list_unavailable", false
+		return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "session_list_unavailable"}
 	}
 	suffix := "_cid_" + hostChatID
 	candidates := make([]store.SessionSummary, 0, 2)
@@ -353,7 +509,7 @@ func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req ses
 		}
 	}
 	if len(candidates) == 0 {
-		return requested, "new_host_chat_id", false
+		return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "new_host_chat_id"}
 	}
 
 	userHash := strings.TrimSpace(req.LatestUserHash)
@@ -394,7 +550,7 @@ func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req ses
 			}
 		}
 		if len(matched) == 1 {
-			return strings.TrimSpace(matched[0].ChatSessionID), "existing_host_chat_tail_match", true
+			return observedRisuSessionIdentityResolution{sessionID: strings.TrimSpace(matched[0].ChatSessionID), resolution: "existing_host_chat_tail_match", canonicalTailAligned: true}
 		}
 		if len(matched) > 1 {
 			candidates = matched
@@ -403,13 +559,13 @@ func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req ses
 			// Copy/cold-start damage can leave that CID attached to a backend
 			// tail that is not the chat RisuAI is currently showing.
 			if turnMismatchObserved {
-				return requested, "existing_host_chat_turn_mismatch", false
+				return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "existing_host_chat_turn_mismatch"}
 			}
-			return requested, "existing_host_chat_tail_mismatch", false
+			return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "existing_host_chat_tail_mismatch"}
 		}
 	}
 	if len(candidates) == 1 {
-		return strings.TrimSpace(candidates[0].ChatSessionID), "existing_host_chat_id", false
+		return observedRisuSessionIdentityResolution{sessionID: strings.TrimSpace(candidates[0].ChatSessionID), resolution: "existing_host_chat_id"}
 	}
 
 	best := candidates[0]
@@ -423,14 +579,14 @@ func (s *Server) resolveObservedRisuSessionIdentity(ctx context.Context, req ses
 		}
 	}
 	if !bestTied {
-		return strings.TrimSpace(best.ChatSessionID), "existing_host_chat_most_complete", false
+		return observedRisuSessionIdentityResolution{sessionID: strings.TrimSpace(best.ChatSessionID), resolution: "existing_host_chat_most_complete"}
 	}
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate.ChatSessionID) == requested {
-			return requested, "existing_host_chat_requested_alias", false
+			return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "existing_host_chat_requested_alias"}
 		}
 	}
-	return requested, "host_chat_id_ambiguous", false
+	return observedRisuSessionIdentityResolution{sessionID: requested, resolution: "host_chat_id_ambiguous"}
 }
 
 func (s *Server) resolveDurableSessionRoutingBaseline(ctx context.Context, sessionID string, clientBaseline *routingTurnBaseline) *routingTurnBaseline {

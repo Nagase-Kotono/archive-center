@@ -8,6 +8,11 @@ START_AFTER=false
 SYSTEMD=false
 SERVICE_NAME="archive-center"
 RUN_USER="${SUDO_USER:-$(id -un 2>/dev/null || printf archive-center)}"
+EXTERNAL_OPERATION_TIMEOUT_SECONDS="${AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS:-}"
+REQUEST_TIMEOUT_SECONDS="${AC_REQUEST_TIMEOUT_SECONDS:-30}"
+READINESS_TIMEOUT_SECONDS="${AC_READINESS_TIMEOUT_SECONDS:-180}"
+READINESS_POLL_INTERVAL_SECONDS="${AC_READINESS_POLL_INTERVAL_SECONDS:-1}"
+SERVICE_RESTART_SECONDS="${AC_SERVICE_RESTART_SECONDS:-}"
 
 usage() {
 	cat <<'EOF'
@@ -21,6 +26,12 @@ Options:
   --systemd               Linux only: install/update systemd service.
   --service-name NAME     systemd service name. Default: archive-center
   --user NAME             systemd service user. Default: $SUDO_USER/current user
+  --external-operation-timeout-seconds N
+                          Caller-selected bound for each GitHub HTTP operation.
+                          Or set AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS.
+  --service-restart-seconds N
+                          systemd restart delay. Required with --systemd, or
+                          set AC_SERVICE_RESTART_SECONDS.
   --help                  Show this help.
 
 This installs from GitHub Release assets, not from raw git source.
@@ -120,6 +131,16 @@ while [ "$#" -gt 0 ]; do
 			RUN_USER=$2
 			shift 2
 			;;
+		--external-operation-timeout-seconds)
+			[ "$#" -ge 2 ] || die "missing value for --external-operation-timeout-seconds"
+			EXTERNAL_OPERATION_TIMEOUT_SECONDS=$2
+			shift 2
+			;;
+		--service-restart-seconds)
+			[ "$#" -ge 2 ] || die "missing value for --service-restart-seconds"
+			SERVICE_RESTART_SECONDS=$2
+			shift 2
+			;;
 		--help|-h)
 			usage
 			exit 0
@@ -134,6 +155,26 @@ case "$REPO" in
 	*/*) ;;
 	*) die "repo must be OWNER/REPO" ;;
 esac
+
+case "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" in
+	''|*[!0-9]*|0)
+		die "supply --external-operation-timeout-seconds or AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS as a positive integer; no hidden download deadline is used"
+		;;
+esac
+case "$SERVICE_RESTART_SECONDS" in
+	"") ;;
+	*[!0-9]*|0) die "service restart seconds must be a positive integer" ;;
+esac
+if [ "$SYSTEMD" = "true" ] && [ -z "$SERVICE_RESTART_SECONDS" ]; then
+	die "--systemd requires --service-restart-seconds or AC_SERVICE_RESTART_SECONDS; no hidden restart delay is used"
+fi
+
+AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS=$EXTERNAL_OPERATION_TIMEOUT_SECONDS
+AC_REQUEST_TIMEOUT_SECONDS=$REQUEST_TIMEOUT_SECONDS
+AC_READINESS_TIMEOUT_SECONDS=$READINESS_TIMEOUT_SECONDS
+AC_READINESS_POLL_INTERVAL_SECONDS=$READINESS_POLL_INTERVAL_SECONDS
+export AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS AC_REQUEST_TIMEOUT_SECONDS
+export AC_READINESS_TIMEOUT_SECONDS AC_READINESS_POLL_INTERVAL_SECONDS
 
 need_cmd curl
 need_cmd python3
@@ -163,7 +204,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 release_json="$WORK_DIR/release.json"
-curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: Archive-Center-Installer" "$API_URL" -o "$release_json"
+curl --connect-timeout "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" --max-time "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: Archive-Center-Installer" "$API_URL" -o "$release_json"
 
 release_tag=$(python3 - "$release_json" <<'PY'
 import json, sys
@@ -228,8 +269,8 @@ PY
 
 zip_path="$WORK_DIR/$asset_name"
 sums_path="$WORK_DIR/$sums_name"
-curl -fsSL -H "User-Agent: Archive-Center-Installer" "$sums_url" -o "$sums_path"
-curl -fL -H "User-Agent: Archive-Center-Installer" "$asset_url" -o "$zip_path"
+curl --connect-timeout "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" --max-time "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" -fsSL -H "User-Agent: Archive-Center-Installer" "$sums_url" -o "$sums_path"
+curl --connect-timeout "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" --max-time "$EXTERNAL_OPERATION_TIMEOUT_SECONDS" -fL -H "User-Agent: Archive-Center-Installer" "$asset_url" -o "$zip_path"
 
 expected=$(python3 - "$sums_path" "$asset_name" <<'PY'
 import re
@@ -287,6 +328,27 @@ if [ ! -d "$PERSISTENT_DATA_DIR/mariadb-data" ] && [ -n "$previous_current" ] &&
 fi
 
 safe_link_current "$package_root" "$INSTALL_DIR/current"
+data_root_pointer="$INSTALL_DIR/data-root.txt"
+stable_launcher="$INSTALL_DIR/start-archive-center.sh"
+case "$PLATFORM" in
+	linux-*) current_launcher="start-archive-center-linux.sh" ;;
+	macos-*) current_launcher="Start Archive Center macOS.command" ;;
+	termux-*) current_launcher="install-and-start-termux.sh" ;;
+	*) die "installed package launcher could not be selected for $PLATFORM" ;;
+esac
+printf '%s\n' "$PERSISTENT_DATA_DIR" > "$data_root_pointer"
+{
+	printf '%s\n' '#!/usr/bin/env sh'
+	printf '%s\n' 'set -eu'
+	printf '%s\n' 'INSTALL_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)'
+	printf '%s\n' 'DATA_ROOT_POINTER="$INSTALL_ROOT/data-root.txt"'
+	printf '%s\n' '[ -f "$DATA_ROOT_POINTER" ] || { printf '\''ERROR: installed data-root pointer is missing: %s\n'\'' "$DATA_ROOT_POINTER" >&2; exit 1; }'
+	printf '%s\n' 'IFS= read -r ARCHIVE_CENTER_DATA_DIR < "$DATA_ROOT_POINTER"'
+	printf '%s\n' '[ -n "$ARCHIVE_CENTER_DATA_DIR" ] || { printf '\''ERROR: installed data-root pointer is empty: %s\n'\'' "$DATA_ROOT_POINTER" >&2; exit 1; }'
+	printf '%s\n' 'export ARCHIVE_CENTER_DATA_DIR'
+	printf 'exec sh "$INSTALL_ROOT/current/%s" "$@"\n' "$current_launcher"
+} > "$stable_launcher"
+chmod 755 "$stable_launcher"
 printf '%s\n' "$release_tag" > "$INSTALL_DIR/current-version.txt"
 
 printf 'Installed Archive Center %s\n' "$release_tag"
@@ -315,9 +377,13 @@ User=$RUN_USER
 Group=$RUN_USER
 WorkingDirectory=$INSTALL_DIR/current
 Environment="ARCHIVE_CENTER_DATA_DIR=$data_dir_escaped"
-ExecStart=/bin/sh $INSTALL_DIR/current/start-archive-center-linux.sh --no-install
+Environment="AC_EXTERNAL_OPERATION_TIMEOUT_SECONDS=$EXTERNAL_OPERATION_TIMEOUT_SECONDS"
+Environment="AC_REQUEST_TIMEOUT_SECONDS=$REQUEST_TIMEOUT_SECONDS"
+Environment="AC_READINESS_TIMEOUT_SECONDS=$READINESS_TIMEOUT_SECONDS"
+Environment="AC_READINESS_POLL_INTERVAL_SECONDS=$READINESS_POLL_INTERVAL_SECONDS"
+ExecStart=/bin/sh $INSTALL_DIR/start-archive-center.sh --no-install
 Restart=on-failure
-RestartSec=5
+RestartSec=$SERVICE_RESTART_SECONDS
 NoNewPrivileges=true
 
 [Install]
@@ -331,10 +397,5 @@ EOF
 fi
 
 if [ "$START_AFTER" = "true" ]; then
-	export ARCHIVE_CENTER_DATA_DIR="$PERSISTENT_DATA_DIR"
-	case "$PLATFORM" in
-		linux-*) exec sh "$INSTALL_DIR/current/start-archive-center-linux.sh" ;;
-		macos-*) exec sh "$INSTALL_DIR/current/scripts/start-full-macos.sh" ;;
-		termux-*) exec sh "$INSTALL_DIR/current/install-and-start-termux.sh" ;;
-	esac
+	exec sh "$stable_launcher"
 fi

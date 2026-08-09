@@ -96,6 +96,15 @@ func finalizeCanonicalStateWriteCost(cost *canonicalStateWriteCostMeasurement) {
 
 func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, turnIndex int, extraction map[string]any, content string, embCfg completeTurnEmbeddingConfig, now time.Time, existingEvidenceArg ...[]store.DirectEvidence) artifactSaveResult {
 	result := artifactSaveResult{EmbeddingStatus: "not_requested", VectorStatus: "not_requested"}
+	var resolved bool
+	extraction, resolved = s.resolveCommittedMemoryAdmissionExtraction(ctx, sid, extraction, &result)
+	if !resolved {
+		return result
+	}
+	if len(sliceFromAny(extraction["user_interaction_profile"])) > 0 {
+		extraction["user_interaction_profile"] = []any{}
+		result.addSkipReason("user_interaction_profile", "explicit_host_ooc_observation_required", nil)
+	}
 	cost := &canonicalStateWriteCostMeasurement{}
 	var existingCanonicalLayers []store.CanonicalStateLayer
 	if s.Store != nil {
@@ -124,10 +133,12 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 	}
 	languageContext := completeTurnLanguageContextFromExtraction(extraction)
 	extraction = applyLanguageMemoryWriteContract(extraction, languageContext)
+	identityProjection := s.buildEntityIdentityProjection(ctx, sid, turnIndex, extraction, content, now, &result)
 	if mergedExtraction, applied := applyConfirmedIdentityAliasCanonicalMerge(extraction); applied > 0 {
 		extraction = mergedExtraction
 		result.Warnings = append(result.Warnings, "confirmed_identity_alias_canonical_merge_applied")
 	}
+	extraction = appendPreciseMemoryEvidenceExcerpts(ctx, extraction)
 	extraction = appendNarrativeStateEvidenceExcerpts(extraction)
 	memorySearchText := completeTurnMemorySearchText(summary, extraction, content)
 	searchText := strings.TrimSpace(memorySearchText.Text)
@@ -137,7 +148,11 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 	embedding := "[]"
 	embeddingModel := "not_configured"
 	var embeddingVector []float32
-	if embCfg.hasConfig() && searchText != "" {
+	perspectiveScopedSearch := memoryAdmissionHasPerspectiveScopedContent(extraction)
+	if perspectiveScopedSearch {
+		embeddingModel = "perspective_scoped_typed_delivery"
+		result.EmbeddingStatus = "skipped_perspective_scoped"
+	} else if embCfg.hasConfig() && searchText != "" && !usesVoyageContextualizedEmbedding(embCfg) {
 		embeddingStartedAt := time.Now()
 		emb, model, err := callEmbedding(ctx, embCfg, searchText)
 		result.addTiming("embedding", embeddingStartedAt)
@@ -155,99 +170,127 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 	}
 
 	recordPersonaCapsuleCandidateTrace(extraction, turnIndex, &result)
-	s.saveSubjectiveEntityMemoriesFromExtraction(ctx, sid, turnIndex, extraction, content, now, &result)
 
-	if summary != "" {
-		archiveHint := mapFromAny(extraction["archive_hint"])
-		emotionalIntensity := clampFloat(extractionFloatFromAny(extraction["emotional_intensity"], 0), 0, 1)
-		narrativeSignificance := clampFloat(extractionFloatFromAny(extraction["narrative_significance"], 0), 0, 1)
-		baseImportance := clampFloat(extractionFloatFromAny(extraction["importance_score"], 3), 1, 10)
-		emotionalBoost := emotionalImportanceBoost(emotionalIntensity)
-		finalImportance := clampFloat(baseImportance+emotionalBoost, 1, 10)
-		mem := &store.Memory{
-			ChatSessionID:         sid,
-			TurnIndex:             turnIndex,
-			SummaryJSON:           mustCompactJSON(extraction),
-			Embedding:             embedding,
-			EmbeddingModel:        embeddingModel,
-			Importance:            finalImportance / 10.0,
-			EmotionalBoost:        emotionalBoost,
-			Evidence:              mustCompactJSON(map[string]any{"evidence_excerpts": stringsFromAny(extraction["evidence_excerpts"]), "relationship_memory": extraction["relationship_memory"]}),
-			EmotionalIntensity:    emotionalIntensity,
-			NarrativeSignificance: narrativeSignificance,
-			PlaceWing:             stringFromMap(archiveHint, "wing"),
-			PlaceRoom:             stringFromMap(archiveHint, "room"),
-			CreatedAt:             now,
+	admissionErrorsBefore := result.Errors
+	admissionHandled, admittedEvidence, admittedPreciseUnits := s.commitAcceptedMemoryAdmission(
+		ctx, sid, turnIndex, extraction, content, summary, searchText,
+		memorySearchText, embCfg, embedding, embeddingModel, embeddingVector,
+		languageContext, existingEvidence, identityProjection, now, &result,
+	)
+	if admissionHandled {
+		if result.Errors > admissionErrorsBefore {
+			return result
 		}
-		if existingID, existingSummary := s.memoryForTurnAlreadyExists(ctx, sid, turnIndex, &result); existingID > 0 {
-			result.addSkipReason("memories", "duplicate_source_turn_memory", map[string]any{
-				"turn_index":       turnIndex,
-				"existing_id":      existingID,
-				"existing_summary": existingSummary,
-				"new_summary":      summary,
-			})
-			result.Warnings = append(result.Warnings, "memory_duplicate_source_turn_skipped")
-		} else if s.mergeSimilarMemoryInsteadOfInsert(ctx, sid, summary, mem.Importance, now, &result) {
-			result.Warnings = append(result.Warnings, "memory_semantic_dedup_merged")
-		} else {
-			result.trySave("SaveMemory", func() error {
-				return s.Store.SaveMemory(ctx, mem)
+		existingEvidence = admittedEvidence
+		s.savePostAdmissionPreciseMemoryProjections(ctx, sid, admittedPreciseUnits, now, &result)
+	}
+	if !admissionHandled {
+		if summary != "" {
+			archiveHint := mapFromAny(extraction["archive_hint"])
+			emotionalIntensity := clampFloat(extractionFloatFromAny(extraction["emotional_intensity"], 0), 0, 1)
+			narrativeSignificance := clampFloat(extractionFloatFromAny(extraction["narrative_significance"], 0), 0, 1)
+			baseImportance := clampFloat(extractionFloatFromAny(extraction["importance_score"], 3), 1, 10)
+			emotionalBoost := emotionalImportanceBoost(emotionalIntensity)
+			finalImportance := clampFloat(baseImportance+emotionalBoost, 1, 10)
+			mem := &store.Memory{
+				ChatSessionID:         sid,
+				TurnIndex:             turnIndex,
+				SummaryJSON:           mustCompactJSON(extraction),
+				Embedding:             embedding,
+				EmbeddingModel:        embeddingModel,
+				Importance:            finalImportance / 10.0,
+				EmotionalBoost:        emotionalBoost,
+				Evidence:              mustCompactJSON(map[string]any{"evidence_excerpts": stringsFromAny(extraction["evidence_excerpts"]), "relationship_memory": extraction["relationship_memory"]}),
+				EmotionalIntensity:    emotionalIntensity,
+				NarrativeSignificance: narrativeSignificance,
+				PlaceWing:             stringFromMap(archiveHint, "wing"),
+				PlaceRoom:             stringFromMap(archiveHint, "room"),
+				CreatedAt:             now,
+			}
+			if existingID, existingSummary := s.memoryForTurnAlreadyExists(ctx, sid, turnIndex, &result); existingID > 0 {
+				result.addSkipReason("memories", "duplicate_source_turn_memory", map[string]any{
+					"turn_index":       turnIndex,
+					"existing_id":      existingID,
+					"existing_summary": existingSummary,
+					"new_summary":      summary,
+				})
+				result.Warnings = append(result.Warnings, "memory_duplicate_source_turn_skipped")
+			} else {
+				result.trySave("SaveMemory", func() error {
+					return s.Store.SaveMemory(ctx, mem)
+				}, &result, func() {
+					result.Memories++
+					s.upsertMemoryVector(ctx, sid, turnIndex, mem, searchText, embeddingVector, &result)
+				})
+			}
+		}
+
+		for excerptIndex, text := range stringsFromAny(extraction["evidence_excerpts"]) {
+			originalText := text
+			text = sanitizeEvidenceExcerptForTurn(text, content)
+			if text == "" {
+				result.addSkipReason("direct_evidence", "not_grounded_in_current_turn", originalText)
+				continue
+			}
+			if directEvidenceAlreadyExistsForTurn(existingEvidence, sid, turnIndex, text) {
+				result.addSkipReason("direct_evidence", "duplicate_source_turn_excerpt", map[string]any{"turn_index": turnIndex, "text": text})
+				continue
+			}
+			ev := &store.DirectEvidence{
+				ChatSessionID:        sid,
+				EvidenceKind:         "turn_excerpt",
+				EvidenceText:         text,
+				SourceTurnStart:      turnIndex,
+				SourceTurnEnd:        turnIndex,
+				TurnAnchor:           turnIndex,
+				ArchiveState:         "verified_direct",
+				CaptureStage:         "critic_extract",
+				CaptureVerification:  "verified",
+				CommittedGate:        "auto_grounded_excerpt",
+				LineageJSON:          mustCompactJSON(completeTurnEvidenceLineage("critic.evidence_excerpts", excerptIndex, languageContext)),
+				SourceMessageIDsJSON: mustCompactJSON([]string{fmt.Sprintf("turn:%d", turnIndex)}),
+				CreatedAt:            now,
+			}
+			baseImportance := clampFloat(extractionFloatFromAny(extraction["importance_score"], 3), 1, 10) / 10.0
+			result.ConflictResolutions = append(result.ConflictResolutions, resolveCanonicalConflict(*ev, existingEvidence)...)
+			result.RetentionDecisions = append(result.RetentionDecisions, applyRetentionPolicy(ev, baseImportance, existingEvidence))
+			result.trySave("SaveEvidence", func() error {
+				return s.Store.SaveEvidence(ctx, ev)
 			}, &result, func() {
-				result.Memories++
-				s.upsertMemoryVector(ctx, sid, turnIndex, mem, searchText, embeddingVector, &result)
+				result.Evidence++
+				existingEvidence = append(existingEvidence, *ev)
+				s.upsertDerivedArtifactVector(ctx, sid, turnIndex, "evidence", "direct_evidence_records", ev.ID, "direct_evidence.v1", directEvidenceVectorDocumentText(*ev), embCfg, &result)
 			})
 		}
-	}
 
-	for excerptIndex, text := range stringsFromAny(extraction["evidence_excerpts"]) {
-		originalText := text
-		text = sanitizeEvidenceExcerptForTurn(text, content)
-		if text == "" {
-			result.addSkipReason("direct_evidence", "not_grounded_in_current_turn", originalText)
-			continue
-		}
-		if directEvidenceAlreadyExistsForTurn(existingEvidence, sid, turnIndex, text) {
-			result.addSkipReason("direct_evidence", "duplicate_source_turn_excerpt", map[string]any{"turn_index": turnIndex, "text": text})
-			continue
-		}
-		ev := &store.DirectEvidence{
-			ChatSessionID:        sid,
-			EvidenceKind:         "turn_excerpt",
-			EvidenceText:         text,
-			SourceTurnStart:      turnIndex,
-			SourceTurnEnd:        turnIndex,
-			TurnAnchor:           turnIndex,
-			ArchiveState:         "verified_direct",
-			CaptureStage:         "critic_extract",
-			CaptureVerification:  "verified",
-			CommittedGate:        "auto_grounded_excerpt",
-			LineageJSON:          mustCompactJSON(completeTurnEvidenceLineage("critic.evidence_excerpts", excerptIndex, languageContext)),
-			SourceMessageIDsJSON: mustCompactJSON([]string{fmt.Sprintf("turn:%d", turnIndex)}),
-			CreatedAt:            now,
-		}
-		baseImportance := clampFloat(extractionFloatFromAny(extraction["importance_score"], 3), 1, 10) / 10.0
-		result.ConflictResolutions = append(result.ConflictResolutions, resolveCanonicalConflict(*ev, existingEvidence)...)
-		result.RetentionDecisions = append(result.RetentionDecisions, applyRetentionPolicy(ev, baseImportance, existingEvidence))
-		result.trySave("SaveEvidence", func() error {
-			return s.Store.SaveEvidence(ctx, ev)
-		}, &result, func() {
-			result.Evidence++
-			existingEvidence = append(existingEvidence, *ev)
-			s.upsertDerivedArtifactVector(ctx, sid, turnIndex, "evidence", "direct_evidence_records", ev.ID, "direct_evidence.v1", directEvidenceVectorDocumentText(*ev), embCfg, &result)
-		})
+		// Current narrative state is resolved only after direct evidence has been
+		// persisted, so every accepted change can point back to concrete evidence.
+		s.savePreciseMemoryUnitsFromExtraction(ctx, sid, turnIndex, extraction, content, existingEvidence, identityProjection, now, &result)
 	}
-
-	// Current narrative state is resolved only after direct evidence has been
-	// persisted, so every accepted change can point back to concrete evidence.
+	s.saveSubjectiveEntityMemoriesFromExtraction(ctx, sid, turnIndex, extraction, content, now, &result)
 	s.saveNarrativeStateFromExtraction(ctx, sid, turnIndex, extraction, content, existingEvidence, now, &result)
+	s.saveStoryClockFromExtraction(ctx, sid, turnIndex, extraction, content, existingEvidence, now, &result)
 
-	for _, item := range sliceFromAny(extraction["kg_triples"]) {
+	for tripleIndex, item := range sliceFromAny(extraction["kg_triples"]) {
 		triple := mapFromAny(item)
+		if len(triple) == 0 {
+			parts := sliceFromAny(item)
+			if len(parts) >= 3 {
+				triple = map[string]any{
+					"subject":   extractionStringFromAny(parts[0]),
+					"predicate": extractionStringFromAny(parts[1]),
+					"object":    extractionStringFromAny(parts[2]),
+				}
+			}
+		}
+		if identityProjection != nil {
+			identityProjection.bindKGTriple(ctx, triple, tripleIndex, &result)
+		}
 		subject := s.canonicalCharacterName(ctx, sid, sanitizeKGPart(stringFromMap(triple, "subject")))
 		predicate := sanitizeKGPredicate(stringFromMap(triple, "predicate"))
 		object := s.canonicalCharacterName(ctx, sid, sanitizeKGPart(stringFromMap(triple, "object")))
-		if shouldSkipKGTriple(subject, predicate, object, sid) {
-			result.addSkipReason("kg_triples", "placeholder_or_control_edge", map[string]any{"subject": subject, "predicate": predicate, "object": object})
+		if subject == "" || predicate == "" || object == "" {
+			result.addSkipReason("kg_triples", "incomplete_triple", map[string]any{"subject": subject, "predicate": predicate, "object": object})
 			continue
 		}
 		validFrom := intFromAny(triple["valid_from"], turnIndex)
@@ -286,7 +329,8 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 		})
 	}
 
-	s.saveCharacterAndStateArtifacts(ctx, sid, turnIndex, extraction, embCfg, now, &result, existingCanonicalLayers, cost)
+	s.saveCharacterAndStateArtifacts(ctx, sid, turnIndex, extraction, content, embCfg, now, &result, existingCanonicalLayers, cost, identityProjection)
+	s.saveReversibleStatesFromExtraction(ctx, sid, turnIndex, extraction, content, existingEvidence, identityProjection, now, &result)
 	finalizeCanonicalStateWriteCost(cost)
 	if cost.StateWriteCount > 0 {
 		result.CanonicalStateWriteCost = cost
@@ -317,62 +361,6 @@ func (s *Server) memoryForTurnAlreadyExists(ctx context.Context, sid string, tur
 		return mem.ID, summary
 	}
 	return 0, ""
-}
-
-func (s *Server) mergeSimilarMemoryInsteadOfInsert(ctx context.Context, sid, summary string, newImportance float64, now time.Time, result *artifactSaveResult) bool {
-	if s.Store == nil || strings.TrimSpace(summary) == "" {
-		return false
-	}
-	memories, err := s.Store.ListMemories(ctx, sid, 0, 0)
-	if err != nil {
-		result.Warnings = append(result.Warnings, "memory_semantic_dedup_list_failed")
-		return false
-	}
-	var best *store.Memory
-	bestScore := 0.0
-	for i := range memories {
-		mem := &memories[i]
-		if mem.ID <= 0 {
-			continue
-		}
-		existingSummary := memorySummaryText(*mem)
-		if existingSummary == "" {
-			continue
-		}
-		score := simpleTokenSimilarity(summary, existingSummary)
-		if score > bestScore {
-			bestScore = score
-			best = mem
-		}
-	}
-	if best == nil || bestScore < 0.78 {
-		return false
-	}
-	if updater, ok := s.Store.(memoryImportanceUpdater); ok && newImportance > best.Importance {
-		targetImportance := newImportance
-		result.trySave("UpdateMemoryImportance(memory_dedup)", func() error {
-			return updater.UpdateMemoryImportance(ctx, sid, best.ID, targetImportance)
-		}, result, func() {})
-	}
-	details := map[string]any{
-		"policy_version":      "p1250.memory_semantic_dedup.v1",
-		"merged_memory_id":    best.ID,
-		"similarity":          bestScore,
-		"new_turn_summary":    summary,
-		"existing_summary":    memorySummaryText(*best),
-		"new_importance":      newImportance,
-		"existing_importance": best.Importance,
-	}
-	result.trySave("SaveAuditLog(memory_semantic_dedup)", func() error {
-		return s.Store.SaveAuditLog(ctx, &store.AuditLog{
-			ChatSessionID: sid,
-			EventType:     "memory_semantic_dedup",
-			Source:        "critic",
-			DetailsJSON:   mustCompactJSON(details),
-			CreatedAt:     now,
-		})
-	}, result, func() {})
-	return true
 }
 
 func memorySummaryText(mem store.Memory) string {
@@ -415,10 +403,7 @@ func directEvidenceAlreadyExistsForTurn(existing []store.DirectEvidence, sid str
 		if existingText == "" {
 			continue
 		}
-		if existingText == needle ||
-			strings.Contains(existingText, needle) ||
-			strings.Contains(needle, existingText) ||
-			simpleTokenSimilarity(existingText, needle) >= 0.86 {
+		if existingText == needle {
 			return true
 		}
 	}

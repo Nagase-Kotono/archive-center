@@ -2,27 +2,317 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/risulongmemory/archive-center-go/internal/dto"
+	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
+var (
+	criticAuthorizationSecretPattern = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;}\]]+`)
+	criticBearerSecretPattern        = regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._~+/=-]+`)
+	criticJSONSecretPattern          = regexp.MustCompile(`(?i)("(?:x-api-key|api[_-]?key|password|client_secret|access_token|refresh_token)"\s*:\s*)"[^"]*"`)
+	criticKVSecretPattern            = regexp.MustCompile(`(?i)((?:x-api-key|api[_-]?key|password|client_secret|access_token|refresh_token)\s*[:=]\s*)[^\s,;}\]]+`)
+)
+
+type criticPipelineError struct {
+	Code       string
+	Stage      string
+	Retryable  bool
+	HTTPStatus int
+	Cause      error
+}
+
+const completeTurnCriticInputBudgetObservationContract = "critic_input_budget_observation.v1"
+const completeTurnCriticInputSnapshotContract = "critic_reprocessing_input.v1"
+
+type completeTurnCriticInputPolicy struct {
+	AuxiliaryMaxChars int    `json:"auxiliary_max_chars"`
+	ConfiguredChars   int    `json:"configured_chars"`
+	LedgerChars       int    `json:"ledger_chars"`
+	Source            string `json:"source"`
+}
+
+type completeTurnCriticInputSnapshot struct {
+	ContractVersion    string                        `json:"contract_version"`
+	SourceRevision     string                        `json:"source_revision"`
+	ChatSessionID      string                        `json:"chat_session_id"`
+	TurnIndex          int                           `json:"turn_index"`
+	UserInput          string                        `json:"user_input"`
+	AssistantContent   string                        `json:"assistant_content"`
+	ContextMessages    []map[string]any              `json:"context_messages"`
+	ArchiveLedger      map[string]any                `json:"archive_ledger"`
+	ActiveWorldRules   []map[string]any              `json:"active_world_rules"`
+	OutputLanguage     map[string]any                `json:"output_language_override"`
+	LanguageContext    map[string]any                `json:"language_context"`
+	PreviewPass        map[string]any                `json:"preview_pass"`
+	InputPolicy        completeTurnCriticInputPolicy `json:"input_policy"`
+	PipelineVersion    string                        `json:"pipeline_version"`
+	SystemPromptSHA256 string                        `json:"system_prompt_sha256"`
+}
+
+type completeTurnCriticInputReplay struct {
+	SourceRevision string
+	SnapshotJSON   string
+	SnapshotHash   string
+	Required       bool
+}
+
+type completeTurnCriticAuxiliaryCandidate struct {
+	Kind       string
+	ID         string
+	Order      int
+	Relevance  float64
+	Persistent bool
+	TurnIndex  int
+	Value      map[string]any
+	Messages   []map[string]any
+}
+
+func (e *criticPipelineError) Error() string {
+	if e == nil {
+		return "critic pipeline failed"
+	}
+	if e.Cause == nil {
+		return e.Code
+	}
+	return e.Code + ": " + e.Cause.Error()
+}
+
+func (e *criticPipelineError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func newCriticPipelineError(code, stage string, retryable bool, httpStatus int, cause error) *criticPipelineError {
+	return &criticPipelineError{
+		Code:       strings.TrimSpace(code),
+		Stage:      strings.TrimSpace(stage),
+		Retryable:  retryable,
+		HTTPStatus: httpStatus,
+		Cause:      cause,
+	}
+}
+
+func criticPipelineErrorDetails(err error) map[string]any {
+	var pipelineErr *criticPipelineError
+	if !errors.As(err, &pipelineErr) || pipelineErr == nil {
+		return map[string]any{
+			"code":      "CRITIC_UNKNOWN_FAILED",
+			"stage":     "unknown",
+			"retryable": true,
+		}
+	}
+	out := map[string]any{
+		"code":      pipelineErr.Code,
+		"stage":     pipelineErr.Stage,
+		"retryable": pipelineErr.Retryable,
+	}
+	if pipelineErr.HTTPStatus > 0 {
+		out["http_status"] = pipelineErr.HTTPStatus
+	}
+	return out
+}
+
+func classifyCriticProviderError(err error, status int) *criticPipelineError {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return newCriticPipelineError("CRITIC_PROVIDER_TIMEOUT", "provider_call", true, status, err)
+	case errors.Is(err, context.Canceled):
+		return newCriticPipelineError("CRITIC_PROVIDER_CANCELED", "provider_call", false, status, err)
+	}
+	var emptyContentErr *proxyEmptyContentError
+	if errors.As(err, &emptyContentErr) {
+		return newCriticPipelineError("CRITIC_EMPTY_RESPONSE", "provider_response", true, status, err)
+	}
+	var localRequestErr *proxyLocalRequestError
+	if errors.As(err, &localRequestErr) {
+		stage := strings.TrimSpace(localRequestErr.Stage)
+		code := "CRITIC_REQUEST_BUILD_FAILED"
+		if stage == "configuration" {
+			code = "CRITIC_CONFIG_INVALID"
+		}
+		if stage == "" {
+			stage = "request_build"
+		}
+		return newCriticPipelineError(code, stage, false, 0, err)
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		if networkErr.Timeout() {
+			return newCriticPipelineError("CRITIC_PROVIDER_TIMEOUT", "provider_call", true, status, err)
+		}
+		return newCriticPipelineError("CRITIC_PROVIDER_CALL_FAILED", "provider_call", true, status, err)
+	}
+	if status >= http.StatusBadRequest {
+		retryable := status == http.StatusRequestTimeout ||
+			status == http.StatusTooEarly ||
+			status == http.StatusTooManyRequests ||
+			status >= http.StatusInternalServerError
+		return newCriticPipelineError("CRITIC_PROVIDER_HTTP_ERROR", "provider_response", retryable, status, err)
+	}
+	return newCriticPipelineError("CRITIC_PROVIDER_CALL_FAILED", "provider_call", true, status, err)
+}
+
+func criticFailureTrace(promptSource string, cfg completeTurnLLMConfig, status int, err error, content string) map[string]any {
+	trace := map[string]any{
+		"prompt_source": promptSource,
+		"provider":      strings.TrimSpace(cfg.Provider),
+		"model":         strings.TrimSpace(cfg.Model),
+	}
+	for key, value := range criticPipelineErrorDetails(err) {
+		trace[key] = value
+	}
+	if status > 0 {
+		trace["http_status"] = status
+	}
+	preview := strings.TrimSpace(scrubCriticFailureText(content, cfg.APIKey))
+	if preview == "" && err != nil {
+		preview = scrubCriticFailureText(err.Error(), cfg.APIKey)
+	}
+	if preview != "" {
+		trace["raw_preview"] = truncateRunes(preview, 1000)
+	}
+	return trace
+}
+
+func scrubCriticFailureText(text, apiKey string) string {
+	out := text
+	if key := strings.TrimSpace(apiKey); key != "" {
+		out = strings.ReplaceAll(out, key, "[redacted]")
+	}
+	out = criticAuthorizationSecretPattern.ReplaceAllString(out, `${1}[redacted]`)
+	out = criticBearerSecretPattern.ReplaceAllString(out, "Bearer [redacted]")
+	out = criticJSONSecretPattern.ReplaceAllString(out, `${1}"[redacted]"`)
+	out = criticKVSecretPattern.ReplaceAllString(out, `${1}[redacted]`)
+	return out
+}
+
+func (s *Server) completeTurnCriticInputPolicy(clientMeta map[string]any) completeTurnCriticInputPolicy {
+	defaults := dto.PrepareTurnSettings{}
+	defaults.ApplyDefaults()
+	configuredChars := intPtrValue(defaults.MaxInputContextChars, 0)
+	source := "prepare_turn_default"
+	observation := mapFromAny(clientMeta["critic_input_budget_observation"])
+	if stringFromMap(observation, "contract_version") == completeTurnCriticInputBudgetObservationContract {
+		if observed, ok := observation["max_input_context_chars"]; ok {
+			configuredChars = intFromAny(observed, configuredChars)
+			source = "risu_host_setting_observation"
+		}
+	}
+	if configuredChars < 0 {
+		configuredChars = 0
+	}
+	ledgerChars := 0
+	if s != nil && s.Cfg.CriticLedgerEnabled {
+		ledgerChars = criticArchiveLedgerDefaultLimits(s.Cfg.RuntimeProfile).MaxCharsTotal
+	}
+	return completeTurnCriticInputPolicy{
+		AuxiliaryMaxChars: configuredChars + ledgerChars,
+		ConfiguredChars:   configuredChars,
+		LedgerChars:       ledgerChars,
+		Source:            source,
+	}
+}
+
+func criticSystemPromptHash(prompt string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(prompt)))
+}
+
+func mapFromOptionalMap(value *map[string]any) map[string]any {
+	if value == nil || *value == nil {
+		return nil
+	}
+	return cloneMapAny(*value)
+}
+
+func (s *Server) persistCompleteTurnCriticInputSnapshot(
+	ctx context.Context,
+	snapshot completeTurnCriticInputSnapshot,
+) (string, error) {
+	if s == nil || s.Store == nil {
+		return "", store.ErrNotEnabled
+	}
+	writer, ok := s.Store.(store.CriticInputSnapshotStore)
+	if !ok {
+		return "", store.ErrNotEnabled
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(encoded))
+	if err := writer.SaveCriticInputSnapshot(
+		ctx,
+		snapshot.ChatSessionID,
+		snapshot.SourceRevision,
+		string(encoded),
+		hash,
+		time.Now().UTC(),
+	); err != nil {
+		return "", err
+	}
+	return hash, nil
+}
+
+func decodeCompleteTurnCriticInputSnapshot(
+	replay completeTurnCriticInputReplay,
+	sid string,
+	turnIndex int,
+	currentUserInput string,
+	currentAssistantContent string,
+) (*completeTurnCriticInputSnapshot, string, error) {
+	raw := strings.TrimSpace(replay.SnapshotJSON)
+	expectedHash := strings.ToLower(strings.TrimSpace(replay.SnapshotHash))
+	if raw == "" || expectedHash == "" {
+		return nil, "", errors.New("critic_input_snapshot_missing")
+	}
+	actualHash := fmt.Sprintf("%x", sha256.Sum256([]byte(raw)))
+	if actualHash != expectedHash {
+		return nil, "", errors.New("critic_input_snapshot_hash_mismatch")
+	}
+	var snapshot completeTurnCriticInputSnapshot
+	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
+		return nil, "", fmt.Errorf("critic_input_snapshot_invalid_json: %w", err)
+	}
+	if snapshot.ContractVersion != completeTurnCriticInputSnapshotContract ||
+		strings.TrimSpace(snapshot.SourceRevision) != strings.TrimSpace(replay.SourceRevision) ||
+		strings.TrimSpace(snapshot.ChatSessionID) != strings.TrimSpace(sid) ||
+		snapshot.TurnIndex != turnIndex {
+		return nil, "", errors.New("critic_input_snapshot_identity_mismatch")
+	}
+	if snapshot.UserInput != currentUserInput || snapshot.AssistantContent != currentAssistantContent {
+		return nil, "", errors.New("critic_input_snapshot_source_mismatch")
+	}
+	return &snapshot, actualHash, nil
+}
+
 func (s *Server) runCompleteTurnCritic(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, outputLanguageOverride *map[string]any, cfg completeTurnLLMConfig, languageContextArg ...map[string]any) (map[string]any, map[string]any, error) {
-	return s.runCompleteTurnCriticWithInputPolicy(ctx, sid, turnIndex, userInput, assistantContent, contextMessages, outputLanguageOverride, cfg, false, languageContextArg...)
+	return s.runCompleteTurnCriticWithInputPolicy(ctx, sid, turnIndex, userInput, assistantContent, contextMessages, outputLanguageOverride, cfg, false, s.completeTurnCriticInputPolicy(nil), completeTurnCriticInputReplay{}, languageContextArg...)
 }
 
 func (s *Server) runCompleteTurnCriticFromCanonicalLogs(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, cfg completeTurnLLMConfig) (map[string]any, map[string]any, error) {
-	return s.runCompleteTurnCriticWithInputPolicy(ctx, sid, turnIndex, userInput, assistantContent, nil, nil, cfg, true)
+	return s.runCompleteTurnCriticWithInputPolicy(ctx, sid, turnIndex, userInput, assistantContent, nil, nil, cfg, true, s.completeTurnCriticInputPolicy(nil), completeTurnCriticInputReplay{})
 }
 
-func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, outputLanguageOverride *map[string]any, cfg completeTurnLLMConfig, canonicalChatLogs bool, languageContextArg ...map[string]any) (map[string]any, map[string]any, error) {
+func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, outputLanguageOverride *map[string]any, cfg completeTurnLLMConfig, canonicalChatLogs bool, inputPolicy completeTurnCriticInputPolicy, replay completeTurnCriticInputReplay, languageContextArg ...map[string]any) (map[string]any, map[string]any, error) {
 	if !cfg.hasConfig() {
-		return nil, nil, errors.New("critic_config_missing")
+		err := newCriticPipelineError("CRITIC_CONFIG_MISSING", "configuration", false, 0, errors.New("critic_config_missing"))
+		return nil, criticFailureTrace("", cfg, 0, err, ""), err
 	}
 	var languageContext map[string]any
 	if len(languageContextArg) > 0 {
@@ -38,15 +328,194 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 		sanitizedUserInput = sanitizeTextForCriticInput(userInput)
 		sanitizedAssistantContent = sanitizeTextForCriticInput(assistantContent)
 	}
-	safeUserInput := boundCompleteTurnCriticInput(sanitizedUserInput, 4000)
-	safeAssistantContent := boundCompleteTurnCriticInput(sanitizedAssistantContent, 9000)
-	if strings.TrimSpace(safeUserInput+"\n"+safeAssistantContent) == "" {
-		return nil, map[string]any{"prompt_source": promptSource, "source_aware_ingest_guard": !canonicalChatLogs, "canonical_chat_logs": canonicalChatLogs}, errors.New("critic_input_empty_after_sanitize")
+	criticUserInput := boundCompleteTurnCriticInput(sanitizedUserInput, 0)
+	criticAssistantContent := boundCompleteTurnCriticInput(sanitizedAssistantContent, 0)
+	if strings.TrimSpace(criticUserInput+"\n"+criticAssistantContent) == "" {
+		err := newCriticPipelineError("CRITIC_INPUT_EMPTY", "input", false, 0, errors.New("critic_input_empty_after_sanitize"))
+		trace := criticFailureTrace(promptSource, cfg, 0, err, "")
+		trace["source_aware_ingest_guard"] = !canonicalChatLogs
+		trace["canonical_chat_logs"] = canonicalChatLogs
+		return nil, trace, err
 	}
-	safeContextMessages := sanitizeContextMessagesForCriticInput(contextMessages)
-	previewPass := s.buildCompleteTurnCriticPreviewPass(ctx, sid, turnIndex, safeContextMessages, safeUserInput, safeAssistantContent)
-	criticArchiveLedgerPromptInput, criticArchiveLedgerTrace := s.buildCompleteTurnCriticArchiveLedgerInput(ctx, sid, turnIndex, safeAssistantContent, outputLanguageOverride)
-	userPrompt := buildCompleteTurnCriticPromptWithLanguageContext(sid, turnIndex, safeUserInput, safeAssistantContent, safeContextMessages, outputLanguageOverride, previewPass, languageContext, criticArchiveLedgerPromptInput)
+	criticContextMessages := []map[string]any{}
+	criticArchiveLedgerPromptInput := map[string]any(nil)
+	selectedActiveWorldRules := []map[string]any{}
+	previewPass := map[string]any(nil)
+	contextSelectionTrace := map[string]any{}
+	criticArchiveLedgerTrace := map[string]any{}
+	activeWorldRuleTrace := map[string]any{}
+	snapshotTrace := map[string]any{"status": "not_required"}
+
+	if replay.Required {
+		snapshot, snapshotHash, err := decodeCompleteTurnCriticInputSnapshot(replay, sid, turnIndex, criticUserInput, criticAssistantContent)
+		if err != nil {
+			snapshotErr := newCriticPipelineError("CRITIC_INPUT_SNAPSHOT_INVALID", "input_snapshot", false, 0, err)
+			trace := criticFailureTrace(promptSource, cfg, 0, snapshotErr, "")
+			trace["input_snapshot"] = map[string]any{"status": "invalid", "source_revision": replay.SourceRevision}
+			return nil, trace, snapshotErr
+		}
+		currentSystemPromptHash := criticSystemPromptHash(systemPrompt)
+		if snapshot.PipelineVersion != completeTurnCriticPipelineVersion ||
+			snapshot.SystemPromptSHA256 != currentSystemPromptHash {
+			snapshotErr := newCriticPipelineError(
+				"CRITIC_INPUT_SNAPSHOT_INVALID",
+				"input_snapshot",
+				false,
+				0,
+				errors.New("critic_input_snapshot_prompt_contract_mismatch"),
+			)
+			trace := criticFailureTrace(promptSource, cfg, 0, snapshotErr, "")
+			trace["input_snapshot"] = map[string]any{
+				"status":           "invalid",
+				"source_revision":  replay.SourceRevision,
+				"pipeline_version": snapshot.PipelineVersion,
+			}
+			return nil, trace, snapshotErr
+		}
+		criticUserInput = snapshot.UserInput
+		criticAssistantContent = snapshot.AssistantContent
+		criticContextMessages = snapshot.ContextMessages
+		criticArchiveLedgerPromptInput = snapshot.ArchiveLedger
+		selectedActiveWorldRules = snapshot.ActiveWorldRules
+		previewPass = snapshot.PreviewPass
+		languageContext = snapshot.LanguageContext
+		inputPolicy = snapshot.InputPolicy
+		if snapshot.OutputLanguage == nil {
+			outputLanguageOverride = nil
+		} else {
+			restoredOutputLanguage := cloneMapAny(snapshot.OutputLanguage)
+			outputLanguageOverride = &restoredOutputLanguage
+		}
+		contextSelectionTrace = map[string]any{
+			"mode":                  "durable_critic_input_snapshot",
+			"snapshot_contract":     snapshot.ContractVersion,
+			"context_message_count": len(criticContextMessages),
+		}
+		criticArchiveLedgerTrace = map[string]any{
+			"status":              "snapshot_replay",
+			"selected_item_count": len(sliceFromAny(mapFromAny(criticArchiveLedgerPromptInput)["items"])),
+		}
+		activeWorldRuleTrace = map[string]any{
+			"status":         "snapshot_replay",
+			"selected_count": len(selectedActiveWorldRules),
+		}
+		snapshotTrace = map[string]any{
+			"status":            "replayed",
+			"contract_version":  snapshot.ContractVersion,
+			"source_revision":   snapshot.SourceRevision,
+			"snapshot_hash":     snapshotHash,
+			"prompt_hash_match": true,
+		}
+	} else {
+		criticContextMessages = sanitizeContextMessagesForCriticInput(contextMessages)
+		contextSelectionTrace = map[string]any{"mode": "host_context", "host_messages_used": len(criticContextMessages)}
+		relevantMemoryContext := []map[string]any{}
+		if canonicalChatLogs {
+			criticContextMessages, relevantMemoryContext, contextSelectionTrace = s.buildCompleteTurnCriticCanonicalContext(ctx, sid, turnIndex, criticUserInput+"\n"+criticAssistantContent, len(criticContextMessages))
+		}
+		criticArchiveLedgerPromptInput, criticArchiveLedgerTrace = s.buildCompleteTurnCriticArchiveLedgerInput(ctx, sid, turnIndex, criticAssistantContent, outputLanguageOverride)
+		activeWorldRules, activeTrace := s.buildCompleteTurnActiveWorldRuleInput(ctx, sid)
+		activeWorldRuleTrace = activeTrace
+		selectedActiveWorldRules = activeWorldRules
+		if canonicalChatLogs {
+			var auxiliaryTrace map[string]any
+			criticContextMessages, criticArchiveLedgerPromptInput, auxiliaryTrace = applyCompleteTurnCriticAuxiliaryBudget(
+				criticContextMessages,
+				relevantMemoryContext,
+				criticArchiveLedgerPromptInput,
+				activeWorldRules,
+				criticUserInput+"\n"+criticAssistantContent,
+				inputPolicy,
+			)
+			contextSelectionTrace["auxiliary_input"] = auxiliaryTrace
+			criticArchiveLedgerTrace["selected_item_count"] = len(sliceFromAny(mapFromAny(criticArchiveLedgerPromptInput)["items"]))
+			selectedActiveWorldRules = []map[string]any{}
+			for _, raw := range sliceFromAny(mapFromAny(criticArchiveLedgerPromptInput)["active_world_rules"]) {
+				if item := mapFromAny(raw); len(item) > 0 {
+					selectedActiveWorldRules = append(selectedActiveWorldRules, item)
+				}
+			}
+			activeWorldRuleTrace["selected_count"] = len(selectedActiveWorldRules)
+		} else {
+			if len(relevantMemoryContext) > 0 {
+				if criticArchiveLedgerPromptInput == nil {
+					criticArchiveLedgerPromptInput = map[string]any{}
+				}
+				criticArchiveLedgerPromptInput["relevant_turn_memories"] = relevantMemoryContext
+			}
+			if len(activeWorldRules) > 0 {
+				if criticArchiveLedgerPromptInput == nil {
+					criticArchiveLedgerPromptInput = map[string]any{}
+				}
+				criticArchiveLedgerPromptInput["active_world_rules"] = activeWorldRules
+			}
+		}
+		previewPass = s.buildCompleteTurnCriticPreviewPass(ctx, sid, turnIndex, criticContextMessages, criticUserInput, criticAssistantContent)
+		if strings.TrimSpace(replay.SourceRevision) != "" {
+			snapshotHash, err := s.persistCompleteTurnCriticInputSnapshot(ctx, completeTurnCriticInputSnapshot{
+				ContractVersion:    completeTurnCriticInputSnapshotContract,
+				SourceRevision:     strings.TrimSpace(replay.SourceRevision),
+				ChatSessionID:      strings.TrimSpace(sid),
+				TurnIndex:          turnIndex,
+				UserInput:          criticUserInput,
+				AssistantContent:   criticAssistantContent,
+				ContextMessages:    criticContextMessages,
+				ArchiveLedger:      criticArchiveLedgerPromptInput,
+				ActiveWorldRules:   selectedActiveWorldRules,
+				OutputLanguage:     mapFromOptionalMap(outputLanguageOverride),
+				LanguageContext:    languageContext,
+				PreviewPass:        previewPass,
+				InputPolicy:        inputPolicy,
+				PipelineVersion:    completeTurnCriticPipelineVersion,
+				SystemPromptSHA256: criticSystemPromptHash(systemPrompt),
+			})
+			if err != nil {
+				snapshotTrace = map[string]any{
+					"status":          "persist_failed",
+					"source_revision": replay.SourceRevision,
+					"reason":          "critic_input_snapshot_persist_failed",
+				}
+			} else {
+				snapshotTrace = map[string]any{
+					"status":           "persisted",
+					"contract_version": completeTurnCriticInputSnapshotContract,
+					"source_revision":  replay.SourceRevision,
+					"snapshot_hash":    snapshotHash,
+				}
+			}
+		}
+	}
+	userPrompt := buildCompleteTurnCriticPromptWithLanguageContext(sid, turnIndex, criticUserInput, criticAssistantContent, criticContextMessages, outputLanguageOverride, previewPass, languageContext, criticArchiveLedgerPromptInput)
+	contextMessagesJSON, _ := json.Marshal(criticContextMessages)
+	archiveLedgerJSON, _ := json.Marshal(criticArchiveLedgerPromptInput)
+	inputBudgetTrace := map[string]any{
+		"contract_version":             completeTurnCriticInputBudgetObservationContract,
+		"user_input_chars":             len([]rune(criticUserInput)),
+		"assistant_content_chars":      len([]rune(criticAssistantContent)),
+		"current_turn_chars":           len([]rune(criticUserInput)) + len([]rune(criticAssistantContent)),
+		"current_turn_bounded":         false,
+		"current_turn_content_changed": false,
+		"context_messages_chars":       len([]rune(string(contextMessagesJSON))),
+		"archive_ledger_chars":         len([]rune(string(archiveLedgerJSON))),
+		"system_prompt_chars":          len([]rune(systemPrompt)),
+		"user_prompt_chars":            len([]rune(userPrompt)),
+		"final_prompt_chars":           len([]rune(systemPrompt)) + len([]rune(userPrompt)),
+	}
+	providerRetryTrace := map[string]any{}
+	attachInputBudgetTrace := func(trace map[string]any) map[string]any {
+		if trace == nil {
+			trace = map[string]any{}
+		}
+		trace["input_budget"] = inputBudgetTrace
+		trace["context_selection"] = contextSelectionTrace
+		trace["critic_archive_ledger"] = criticArchiveLedgerTrace
+		trace["active_world_rule_contract"] = activeWorldRuleTrace
+		trace["input_snapshot"] = snapshotTrace
+		if len(providerRetryTrace) > 0 {
+			trace["provider_retry"] = providerRetryTrace
+		}
+		return trace
+	}
 	maxTokens := cfg.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 1600
@@ -81,51 +550,75 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 		req.GlmThinkingType = &cfg.GlmThinkingType
 	}
 	applyProxyOverridesFromLLMConfig(&req, cfg)
+	jsonPolicy := proxyRequestPolicy{JSONResponse: true, Purpose: "complete_turn_critic"}
 
-	upstream, _, err := performProxyPluginMain(ctx, req)
-	providerRetryTrace := map[string]any{}
+	upstream, upstreamStatus, err := performProxyPluginMainWithRetryBudgetAndPolicy(ctx, req, cfg.RetryBudget, jsonPolicy)
 	if err != nil {
-		retryUserInput, userRedacted := redactSensitiveCriticRetryText(safeUserInput)
-		retryAssistantContent, assistantRedacted := redactSensitiveCriticRetryText(safeAssistantContent)
-		if !userRedacted && !assistantRedacted {
-			return nil, nil, err
+		providerErr := classifyCriticProviderError(err, upstreamStatus)
+		firstFailureTrace := criticFailureTrace(promptSource, cfg, upstreamStatus, providerErr, "")
+		if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+			firstFailureTrace["request_overrides"] = requestOverrides
 		}
-		retryPreviewPass := s.buildCompleteTurnCriticPreviewPass(ctx, sid, turnIndex, safeContextMessages, retryUserInput, retryAssistantContent)
-		retryPrompt := buildCompleteTurnCriticPromptWithLanguageContext(sid, turnIndex, retryUserInput, retryAssistantContent, safeContextMessages, outputLanguageOverride, retryPreviewPass, languageContext, criticArchiveLedgerPromptInput)
-		retryReq := req
-		retryReq.Messages = []any{map[string]any{"role": "system", "content": systemPrompt}, map[string]any{"role": "user", "content": retryPrompt}}
-		retryUpstream, _, retryErr := performProxyPluginMain(ctx, retryReq)
+		if !cfg.RetryBudget.take() {
+			return nil, attachInputBudgetTrace(firstFailureTrace), providerErr
+		}
+		retryUpstream, retryStatus, retryErr := performProxyPluginMainWithRetryBudgetAndPolicy(ctx, req, cfg.RetryBudget, jsonPolicy)
 		providerRetryTrace = map[string]any{
-			"mode":                "sensitive_input_redacted_retry",
-			"user_input_redacted": userRedacted,
-			"assistant_redacted":  assistantRedacted,
-			"first_error":         err.Error(),
-			"retry_preview_pass":  retryPreviewPass,
+			"mode":                         "unchanged_input_retry",
+			"current_turn_content_changed": false,
+			"first_failure":                firstFailureTrace,
 		}
 		if retryErr != nil {
-			providerRetryTrace["retry_error"] = retryErr.Error()
-			return nil, providerRetryTrace, fmt.Errorf("%w; redacted critic retry failed: %v", err, retryErr)
+			retryPipelineErr := classifyCriticProviderError(retryErr, retryStatus)
+			retryFailureTrace := criticFailureTrace(promptSource, cfg, retryStatus, retryPipelineErr, "")
+			if requestOverrides := mapFromAny(retryUpstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+				retryFailureTrace["request_overrides"] = requestOverrides
+			}
+			return nil, attachInputBudgetTrace(retryFailureTrace), retryPipelineErr
 		}
 		upstream = retryUpstream
-		previewPass = retryPreviewPass
-		safeUserInput = retryUserInput
-		safeAssistantContent = retryAssistantContent
+		upstreamStatus = retryStatus
 	}
 	content := chatCompletionText(upstream)
+	if strings.TrimSpace(content) == "" {
+		emptyErr := newCriticPipelineError("CRITIC_EMPTY_RESPONSE", "provider_response", true, upstreamStatus, errors.New("critic provider returned no assistant content"))
+		trace := criticFailureTrace(promptSource, cfg, upstreamStatus, emptyErr, "")
+		if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+			trace["request_overrides"] = requestOverrides
+		}
+		return nil, attachInputBudgetTrace(trace), emptyErr
+	}
 	parsed, err := parseJSONFromLLMContent(content)
 	if err != nil {
-		return nil, map[string]any{"raw_preview": truncateRunes(content, 1000), "prompt_source": promptSource}, err
+		code := "CRITIC_JSON_PARSE_FAILED"
+		if strings.Contains(err.Error(), "critic_json_missing") {
+			code = "CRITIC_JSON_MISSING"
+		}
+		parseErr := newCriticPipelineError(code, "json_parse", true, upstreamStatus, err)
+		parseTrace := criticFailureTrace(promptSource, cfg, upstreamStatus, parseErr, content)
+		if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+			parseTrace["request_overrides"] = requestOverrides
+		}
+		return nil, attachInputBudgetTrace(parseTrace), parseErr
 	}
+	if err := validateCriticExtractionSchema(parsed); err != nil {
+		schemaErr := newCriticPipelineError("CRITIC_SCHEMA_INVALID", "schema_validation", true, upstreamStatus, err)
+		schemaTrace := criticFailureTrace(promptSource, cfg, upstreamStatus, schemaErr, content)
+		if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+			schemaTrace["request_overrides"] = requestOverrides
+		}
+		return nil, attachInputBudgetTrace(schemaTrace), schemaErr
+	}
+	parsed, quarantineTrace := quarantineCriticProtectedCandidates(parsed, criticUserInput, criticAssistantContent)
+	trustedRPIdentities := s.resolveTrustedRPCharacterIdentities(ctx, sid, parsed)
+	parsed, interactionAdmissionTrace := admitCriticInteractionLanesWithTrustedIdentities(parsed, criticUserInput, criticAssistantContent, trustedRPIdentities)
 	trace := map[string]any{
 		"prompt_source": promptSource,
 		"model":         extractionFirstNonEmpty(extractionStringFromAny(upstream["model"]), cfg.Model),
+		"provider":      strings.TrimSpace(cfg.Provider),
+		"http_status":   upstreamStatus,
 		"usage":         upstream["usage"],
-		"input_budget": map[string]any{
-			"user_input_chars":        len([]rune(safeUserInput)),
-			"assistant_content_chars": len([]rune(safeAssistantContent)),
-			"user_input_bounded":      len([]rune(sanitizedUserInput)) > len([]rune(safeUserInput)),
-			"assistant_bounded":       len([]rune(sanitizedAssistantContent)) > len([]rune(safeAssistantContent)),
-		},
+		"input_budget":  inputBudgetTrace,
 		"pipeline": map[string]any{
 			"policy_version": completeTurnCriticPipelineVersion,
 			"stages": map[string]any{
@@ -151,21 +644,35 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 		},
 		"preview_pass": previewPass,
 	}
+	if len(quarantineTrace) > 0 {
+		trace["protected_candidate_quarantine"] = quarantineTrace
+	}
+	if len(interactionAdmissionTrace) > 0 {
+		trace["interaction_admission"] = interactionAdmissionTrace
+	}
 	if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
 		trace["request_overrides"] = requestOverrides
 	}
 	trace["critic_archive_ledger"] = criticArchiveLedgerTrace
+	trace["context_selection"] = contextSelectionTrace
+	trace["active_world_rule_contract"] = activeWorldRuleTrace
+	trace["input_snapshot"] = snapshotTrace
+	if len(providerRetryTrace) > 0 {
+		trace["provider_retry"] = providerRetryTrace
+	}
 	if len(languageContext) > 0 {
 		trace["language_context"] = languageContext
 		trace["memory_write_contract"] = completeTurnMemoryWriteContract(languageContext)
 	}
-	if len(providerRetryTrace) > 0 {
-		trace["provider_retry"] = providerRetryTrace
-	}
 	normalized := normalizeCriticExtraction(parsed)
 	if len(worldRuleItemsForSave(normalized)) == 0 && (cfg.ForceWorldRuleAudit || shouldRunFocusedWorldRuleAudit(normalized)) {
-		auditedRules, auditTrace := s.runCompleteTurnWorldRuleAudit(ctx, sid, turnIndex, safeUserInput, safeAssistantContent, safeContextMessages, previewPass, normalized, cfg)
+		auditedRules, auditTrace := s.runCompleteTurnWorldRuleAudit(ctx, sid, turnIndex, criticUserInput, criticAssistantContent, criticContextMessages, previewPass, normalized, cfg, selectedActiveWorldRules)
 		trace["world_rule_audit"] = auditTrace
+		if stringFromMap(auditTrace, "status") == "error" {
+			cause := extractionFirstNonEmpty(stringFromMap(auditTrace, "error"), "focused_world_rule_audit_failed")
+			auditErr := newCriticPipelineError("CRITIC_WORLD_RULE_AUDIT_FAILED", "world_rule_audit", true, 0, errors.New(cause))
+			return nil, trace, auditErr
+		}
 		if len(worldRuleItemsForSave(auditedRules)) > 0 {
 			var mergedCount int
 			normalized, mergedCount = mergeWorldRuleAuditIntoExtraction(normalized, auditedRules)
@@ -186,9 +693,38 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 			"reason": reason,
 		}
 	}
-	normalized = enrichNormalizedCriticExtractionForFocusedRecall(normalized, safeUserInput, safeAssistantContent, turnIndex)
+	normalized = enrichNormalizedCriticExtractionForFocusedRecall(normalized, criticUserInput, criticAssistantContent, turnIndex)
 	normalized = applyLanguageMemoryWriteContract(normalized, languageContext)
 	return normalized, trace, nil
+}
+
+func (s *Server) resolveTrustedRPCharacterIdentities(ctx context.Context, sid string, extraction map[string]any) map[string]*interactionStableCharacterIdentity {
+	resolver, ok := s.Store.(store.UniqueActiveEntitySurfaceIdentityResolver)
+	if !ok {
+		return nil
+	}
+	resolved := map[string]*interactionStableCharacterIdentity{}
+	for _, raw := range sliceFromAny(extraction["rp_character_profile"]) {
+		profile := mapFromAny(raw)
+		character := strings.TrimSpace(extractionFirstNonEmpty(stringFromMap(profile, "character"), stringFromMap(profile, "entity"), stringFromMap(profile, "name")))
+		proof := mapFromAny(profile["identity_proof"])
+		stableEntityID := strings.TrimSpace(stringFromMap(proof, "stable_entity_id"))
+		namespace := strings.ToLower(strings.TrimSpace(stringFromMap(proof, "identity_namespace")))
+		if character == "" || stableEntityID == "" || stringFromMap(proof, "contract_version") != inWorldIdentityProofContract ||
+			(namespace != "session_npc" && namespace != "session_player") {
+			continue
+		}
+		identity, err := resolver.ResolveUniqueActiveEntityIdentityBySurface(ctx, sid, comparableEntityKey(character))
+		if err != nil || strings.TrimSpace(identity.StableEntityID) != stableEntityID ||
+			strings.TrimSpace(identity.IdentityNamespace) != namespace {
+			continue
+		}
+		resolved[comparableEntityKey(character)] = &interactionStableCharacterIdentity{
+			stableEntityID: identity.StableEntityID,
+			namespace:      identity.IdentityNamespace,
+		}
+	}
+	return resolved
 }
 
 func shouldRunFocusedWorldRuleAudit(extraction map[string]any) bool {
@@ -212,7 +748,7 @@ func shouldRunFocusedWorldRuleAudit(extraction map[string]any) bool {
 	return status == "positive" || status == "found" || status == "needs_world_rule"
 }
 
-func (s *Server) runCompleteTurnWorldRuleAudit(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, previewPass map[string]any, initialExtraction map[string]any, cfg completeTurnLLMConfig) (map[string]any, map[string]any) {
+func (s *Server) runCompleteTurnWorldRuleAudit(ctx context.Context, sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, previewPass map[string]any, initialExtraction map[string]any, cfg completeTurnLLMConfig, selectedActiveWorldRuleInput ...[]map[string]any) (map[string]any, map[string]any) {
 	trace := map[string]any{
 		"status":           "skipped",
 		"policy_version":   "world_rule_audit.v1",
@@ -226,22 +762,25 @@ func (s *Server) runCompleteTurnWorldRuleAudit(ctx context.Context, sid string, 
 		trace["reason"] = "empty_turn"
 		return nil, trace
 	}
-	prompt := buildCompleteTurnWorldRuleAuditPrompt(sid, turnIndex, userInput, assistantContent, contextMessages, previewPass, initialExtraction)
-	maxTokens := cfg.MaxTokens
-	if maxTokens <= 0 || maxTokens > 1200 {
-		maxTokens = 1200
+	activeWorldRules := []map[string]any{}
+	activeWorldRuleTrace := map[string]any{}
+	if len(selectedActiveWorldRuleInput) > 0 {
+		activeWorldRules = selectedActiveWorldRuleInput[0]
+		activeWorldRuleTrace = map[string]any{
+			"status":         "selected_primary_critic_input",
+			"included_count": len(activeWorldRules),
+		}
+	} else {
+		activeWorldRules, activeWorldRuleTrace = s.buildCompleteTurnActiveWorldRuleInput(ctx, sid)
 	}
+	trace["active_world_rule_contract"] = activeWorldRuleTrace
+	prompt := buildCompleteTurnWorldRuleAuditPrompt(sid, turnIndex, userInput, assistantContent, contextMessages, previewPass, initialExtraction, activeWorldRules)
+	maxTokens := cfg.MaxTokens
 	maxCompletionTokens := cfg.MaxCompletionTokens
-	if maxCompletionTokens <= 0 || maxCompletionTokens > 1200 {
+	if maxCompletionTokens <= 0 {
 		maxCompletionTokens = maxTokens
 	}
-	if maxCompletionTokens < 700 {
-		maxCompletionTokens = 700
-	}
 	temp := cfg.Temperature
-	if temp > 0.3 {
-		temp = 0.2
-	}
 	req := dto.ProxyPluginMainRequest{
 		APIKey:              &cfg.APIKey,
 		Endpoint:            &cfg.Endpoint,
@@ -268,10 +807,13 @@ func (s *Server) runCompleteTurnWorldRuleAudit(ctx context.Context, sid string, 
 	}
 	applyProxyOverridesFromLLMConfig(&req, cfg)
 	trace["llm_call_attempt"] = true
-	upstream, _, err := performProxyPluginMain(ctx, req)
+	upstream, _, err := performProxyPluginMainWithRetryBudgetAndPolicy(ctx, req, cfg.RetryBudget, proxyRequestPolicy{JSONResponse: true, Purpose: "complete_turn_world_rule_audit"})
 	if err != nil {
 		trace["status"] = "error"
 		trace["error"] = err.Error()
+		if requestOverrides := mapFromAny(upstream["_proxy_request_overrides"]); len(requestOverrides) > 0 {
+			trace["request_overrides"] = requestOverrides
+		}
 		return nil, trace
 	}
 	content := chatCompletionText(upstream)
@@ -297,10 +839,15 @@ func (s *Server) runCompleteTurnWorldRuleAudit(ctx context.Context, sid string, 
 	return normalized, trace
 }
 
-func buildCompleteTurnWorldRuleAuditPrompt(sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, previewPass map[string]any, initialExtraction map[string]any) string {
+func buildCompleteTurnWorldRuleAuditPrompt(sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, previewPass map[string]any, initialExtraction map[string]any, activeWorldRuleInput ...[]map[string]any) string {
 	ctx, _ := json.Marshal(contextMessages)
 	preview, _ := json.Marshal(previewPass)
 	initial, _ := json.Marshal(initialExtraction)
+	var activeRules any
+	if len(activeWorldRuleInput) > 0 {
+		activeRules = activeWorldRuleInput[0]
+	}
+	active, _ := json.Marshal(activeRules)
 	return strings.Join([]string{
 		"Audit whether the completed turn establishes durable world rules that the main extraction missed.",
 		"Return ONLY JSON. Do not use markdown fences.",
@@ -309,14 +856,11 @@ func buildCompleteTurnWorldRuleAuditPrompt(sid string, turnIndex int, userInput 
 		"Decision contract:",
 		"- This is an AI judgement step. Do not rely on keyword lists, genre names, or instruction examples as facts.",
 		"- Extract the abstract invariant established by the session's own evidence.",
-		"- A world rule is a durable constraint that should remain true after this exchange: physical/natural law, supernatural or technology mechanic, progression or reward economy, acquisition method, access gate, location constraint, social law, institution/custom, faction norm, rank/authority rule, contract, resource/logistics limit, schedule/calendar rule, taboo, or equivalent stable setting law.",
-		"- Creation myths, cosmology, divine non-intervention rules, origin rules for monsters/threats, granted powers, chosen-agent roles, sacred/institutional authority, and stable religious doctrine are world rules when the turn presents them as setting truth rather than rumor or metaphor.",
-		"- It can appear in any genre: academy, workplace, household, romance, survival, fantasy, dungeon/progression, sci-fi, political, slice-of-life, or apocalypse.",
+		"- A world rule is any source-grounded constraint or invariant that should remain true beyond this exchange. Judge durability from the story evidence rather than a fixed category or genre list.",
 		"- If the latest turn only has a temporary action, mood, one-off dialogue, rejected plan, speculation, or private thought with no durable setting constraint, return empty arrays.",
-		"- If the latest turn confirms a durable rule, world_rules must not be empty. Emit compact evidence-bound rules with scope, category, key, value, and optional scope_name/genre/confidence/verification.",
-		"- Use the canonical scope vocabulary exactly: root, region, location, faction, system, session.",
-		"- Scope guidance: root=universal cosmology or setting-wide law; region=named country/city/territory/large area; location=concrete place/base/building/dungeon/site; faction=organization/church/guild/government/gang/party/team; system=magic/technology/progression/economy/combat/reward mechanics; session=temporary session-only plan or rule without a more specific stable scope.",
-		"- Do not put named regions, named locations, named factions, or progression mechanics under root just because they are important. Use their specific scope and scope_name.",
+		"- If the latest turn confirms a durable rule, world_rules must not be empty. Preserve the rule with whatever descriptive fields the evidence supports; key and value are sufficient for collection.",
+		"- Active_World_Rules_JSON contains the current unsuppressed stored rules. For a changed or explicitly reaffirmed existing rule, reuse its exact scope, scope_name, category, and key even when the output language differs. Never translate an existing key into a new key. If the latest turn supplies no new evidence or change for an existing rule, omit that unchanged repeat.",
+		"- When scope or category is useful, describe the story's own structure. Do not discard a rule because its scope or category is unfamiliar.",
 		"- Mirror the same durable rules in world_state.rules when they shape the current setting state.",
 		"- Do not invent mechanics. If uncertain, use audit.reason and return empty arrays.",
 		"",
@@ -342,6 +886,10 @@ func buildCompleteTurnWorldRuleAuditPrompt(sid string, turnIndex int, userInput 
 		"<Initial_Critic_Extraction_JSON>",
 		string(initial),
 		"</Initial_Critic_Extraction_JSON>",
+		"",
+		"<Active_World_Rules_JSON>",
+		string(active),
+		"</Active_World_Rules_JSON>",
 	}, "\n")
 }
 
@@ -398,13 +946,403 @@ func (s *Server) buildCompleteTurnCriticArchiveLedgerInput(ctx context.Context, 
 	trace["item_count"] = len(resp.Items)
 	trace["vector_status"] = resp.VectorStatus
 	trace["language"] = resp.Language
-	trace["safety"] = resp.Safety
 	trace["degraded"] = resp.Degraded
 	trace["warnings"] = resp.Warnings
 	trace["write_attempted"] = resp.WriteAttempted
 	trace["vector_write_attempted"] = resp.VectorWriteAttempted
 	trace["llm_call_attempted"] = resp.LLMCallAttempted
 	return promptInput, trace
+}
+
+func (s *Server) buildCompleteTurnCriticCanonicalContext(ctx context.Context, sid string, turnIndex int, query string, hostMessageCount int) ([]map[string]any, []map[string]any, map[string]any) {
+	contextMessages := []map[string]any{}
+	relevantMemories := []map[string]any{}
+	warnings := []string{}
+	selectedTurns := map[int]bool{}
+	previousTurnChars := 0
+	readPair := func(sourceTurn int, kind string) ([]map[string]any, bool) {
+		rows, err := s.Store.ListChatLogs(ctx, sid, sourceTurn, sourceTurn)
+		if err != nil {
+			warnings = append(warnings, err.Error())
+			return nil, false
+		}
+		userText := ""
+		assistantText := ""
+		for _, row := range rows {
+			if row.TurnIndex != sourceTurn || (row.ChatSessionID != "" && row.ChatSessionID != sid) {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(row.Role)) {
+			case "user":
+				if userText == "" {
+					userText = sanitizeCriticStorageText(row.Content)
+				}
+			case "assistant":
+				if assistantText == "" {
+					assistantText = sanitizeCriticStorageText(row.Content)
+				}
+			}
+		}
+		if userText == "" || assistantText == "" {
+			return nil, false
+		}
+		return []map[string]any{
+			{"role": "user", "content": userText, "turn_index": sourceTurn, "source": kind, "support_only": true},
+			{"role": "assistant", "content": assistantText, "turn_index": sourceTurn, "source": kind, "support_only": true},
+		}, true
+	}
+
+	previousTurn := turnIndex - 1
+	if previousTurn > 0 {
+		if pair, ok := readPair(previousTurn, "previous_canonical_turn"); ok {
+			contextMessages = append(contextMessages, pair...)
+			selectedTurns[previousTurn] = true
+			for _, message := range pair {
+				previousTurnChars += len([]rune(stringFromMap(message, "content")))
+				query = strings.TrimSpace(query + "\n" + stringFromMap(message, "content"))
+			}
+		}
+	}
+	rows, err := s.Store.ListMemories(ctx, sid, 0, maxInt(turnIndex-1, 0))
+	selectionTrace := map[string]any{}
+	if err != nil {
+		warnings = append(warnings, err.Error())
+	} else {
+		eligible := make([]store.Memory, 0, len(rows))
+		for _, row := range rows {
+			if row.TurnIndex > 0 && row.TurnIndex < turnIndex {
+				eligible = append(eligible, row)
+			}
+		}
+		eligible, protectedTrace := prefilterPrepareTurnProtectedAggregateMemories(eligible)
+		eligible, holderTrace := prefilterPrepareTurnHolderScopedPerspectiveMemories(eligible)
+		selection := collapsePrepareTurnMemoryLaneSelection(selectPrepareTurnMemoryLanes(eligible, query, len(eligible)))
+		selectionTrace = selection.Trace
+		selectionTrace["protected_prefilter"] = protectedTrace
+		selectionTrace["holder_prefilter"] = holderTrace
+		for _, memory := range selection.Relevant {
+			if !selectedTurns[memory.TurnIndex] {
+				pair, ok := readPair(memory.TurnIndex, "relevant_memory_source_turn")
+				if !ok {
+					continue
+				}
+				contextMessages = append(contextMessages, pair...)
+				selectedTurns[memory.TurnIndex] = true
+			}
+			relevantMemories = append(relevantMemories, map[string]any{
+				"source": "mariadb_memory", "id": memory.ID, "turn_index": memory.TurnIndex,
+				"summary": prepareTurnMemorySummary(memory), "support_only": true,
+			})
+		}
+	}
+	trace := map[string]any{
+		"mode":                    "canonical_previous_plus_relevant_memory_sources",
+		"host_messages_received":  hostMessageCount,
+		"host_messages_used":      0,
+		"previous_turn":           previousTurn,
+		"previous_turn_chars":     previousTurnChars,
+		"query_chars":             len([]rune(query)),
+		"query_includes_previous": previousTurnChars > 0,
+		"context_message_count":   len(contextMessages),
+		"relevant_memory_count":   len(relevantMemories),
+		"memory_selection":        selectionTrace,
+		"warnings":                warnings,
+	}
+	return contextMessages, relevantMemories, trace
+}
+
+func applyCompleteTurnCriticAuxiliaryBudget(
+	contextMessages []map[string]any,
+	relevantMemories []map[string]any,
+	archiveLedger map[string]any,
+	activeWorldRules []map[string]any,
+	query string,
+	policy completeTurnCriticInputPolicy,
+) ([]map[string]any, map[string]any, map[string]any) {
+	mandatoryContext := []map[string]any{}
+	sourcePairs := map[int][]map[string]any{}
+	selectionQuery := strings.TrimSpace(query)
+	for _, message := range contextMessages {
+		source := stringFromMap(message, "source")
+		if source == "previous_canonical_turn" {
+			mandatoryContext = append(mandatoryContext, message)
+			selectionQuery = strings.TrimSpace(selectionQuery + "\n" + stringFromMap(message, "content"))
+			continue
+		}
+		if source == "relevant_memory_source_turn" {
+			turn := intFromAny(message["turn_index"], 0)
+			if turn > 0 {
+				sourcePairs[turn] = append(sourcePairs[turn], message)
+			}
+		}
+	}
+
+	ledgerBase := cloneMapAny(archiveLedger)
+	if ledgerBase == nil {
+		ledgerBase = map[string]any{}
+	}
+	ledgerItems := []map[string]any{}
+	if typedItems, ok := ledgerBase["items"].([]map[string]any); ok {
+		ledgerItems = append(ledgerItems, typedItems...)
+	} else {
+		for _, raw := range sliceFromAny(ledgerBase["items"]) {
+			if item := mapFromAny(raw); len(item) > 0 {
+				ledgerItems = append(ledgerItems, item)
+			}
+		}
+	}
+	delete(ledgerBase, "items")
+	delete(ledgerBase, "relevant_turn_memories")
+	delete(ledgerBase, "active_world_rules")
+
+	candidates := []completeTurnCriticAuxiliaryCandidate{}
+	excluded := []map[string]any{}
+	order := 0
+	pairAdded := map[int]bool{}
+	for _, memory := range relevantMemories {
+		turn := intFromAny(memory["turn_index"], 0)
+		summary := stringFromMap(memory, "summary")
+		relevance := simpleTokenSimilarity(selectionQuery, summary)
+		memoryID := fmt.Sprint(memory["id"])
+		candidates = append(candidates, completeTurnCriticAuxiliaryCandidate{
+			Kind: "relevant_memory", ID: memoryID, Order: order,
+			Relevance: relevance, TurnIndex: turn, Value: memory,
+		})
+		order++
+		if !pairAdded[turn] && len(sourcePairs[turn]) > 0 {
+			candidates = append(candidates, completeTurnCriticAuxiliaryCandidate{
+				Kind: "relevant_memory_source_turn", ID: fmt.Sprint(turn), Order: order,
+				Relevance: relevance, TurnIndex: turn, Messages: sourcePairs[turn],
+			})
+			order++
+			pairAdded[turn] = true
+		}
+	}
+	for _, item := range ledgerItems {
+		summary := stringFromMap(item, "summary")
+		lane := stringFromMap(item, "lane")
+		id := extractionFirstNonEmpty(stringFromMap(item, "id"), fmt.Sprint(order))
+		related := prepareTurnRequestFirstRelevant(selectionQuery, selectionQuery, summary, lane)
+		if !related {
+			excluded = append(excluded, map[string]any{
+				"kind": "critic_archive_ledger", "id": id, "reason": "not_related_to_current_or_previous_turn",
+			})
+			continue
+		}
+		candidates = append(candidates, completeTurnCriticAuxiliaryCandidate{
+			Kind: "critic_archive_ledger", ID: id, Order: order,
+			Relevance: simpleTokenSimilarity(selectionQuery, summary), Value: item,
+		})
+		order++
+	}
+	for _, rule := range activeWorldRules {
+		scope := strings.ToLower(strings.TrimSpace(stringFromMap(rule, "scope")))
+		persistent := scope == "root" || scope == "global"
+		encoded, _ := json.Marshal(rule)
+		text := string(encoded)
+		id := extractionFirstNonEmpty(stringFromMap(rule, "key"), fmt.Sprint(order))
+		related := persistent || prepareTurnRequestFirstRelevant(
+			selectionQuery, selectionQuery, text, stringFromMap(rule, "scope_name"), stringFromMap(rule, "key"),
+		)
+		if !related {
+			excluded = append(excluded, map[string]any{
+				"kind": "active_world_rule", "id": id, "reason": "not_related_to_current_or_previous_turn",
+			})
+			continue
+		}
+		candidates = append(candidates, completeTurnCriticAuxiliaryCandidate{
+			Kind: "active_world_rule", ID: id, Order: order,
+			Relevance: simpleTokenSimilarity(selectionQuery, text), Persistent: persistent, Value: rule,
+		})
+		order++
+	}
+
+	slices.SortStableFunc(candidates, func(a, b completeTurnCriticAuxiliaryCandidate) int {
+		aRelevant := a.Relevance > 0
+		bRelevant := b.Relevance > 0
+		if aRelevant != bRelevant {
+			if aRelevant {
+				return -1
+			}
+			return 1
+		}
+		if a.Relevance != b.Relevance {
+			if a.Relevance > b.Relevance {
+				return -1
+			}
+			return 1
+		}
+		if a.Persistent != b.Persistent {
+			if a.Persistent {
+				return -1
+			}
+			return 1
+		}
+		if a.Order < b.Order {
+			return -1
+		}
+		if a.Order > b.Order {
+			return 1
+		}
+		return 0
+	})
+
+	selectedContext := append([]map[string]any(nil), mandatoryContext...)
+	selectedAuxiliaryContext := []map[string]any{}
+	selectedMemories := []map[string]any{}
+	selectedLedgerItems := []any{}
+	selectedWorldRules := []map[string]any{}
+	selectedMemoryTurns := map[int]bool{}
+	selected := []map[string]any{}
+	truncated := []map[string]any{}
+	buildLedger := func() map[string]any {
+		if len(selectedLedgerItems) == 0 && len(selectedMemories) == 0 && len(selectedWorldRules) == 0 {
+			return nil
+		}
+		out := cloneMapAny(ledgerBase)
+		if out == nil {
+			out = map[string]any{}
+		}
+		out["items"] = append([]any(nil), selectedLedgerItems...)
+		if len(selectedMemories) > 0 {
+			items := make([]any, 0, len(selectedMemories))
+			for _, item := range selectedMemories {
+				items = append(items, item)
+			}
+			out["relevant_turn_memories"] = items
+		}
+		if len(selectedWorldRules) > 0 {
+			items := make([]any, 0, len(selectedWorldRules))
+			for _, item := range selectedWorldRules {
+				items = append(items, item)
+			}
+			out["active_world_rules"] = items
+		}
+		return out
+	}
+	measure := func() int {
+		empty, _ := json.Marshal(map[string]any{"context_messages": []map[string]any{}, "archive_ledger": nil})
+		payload, _ := json.Marshal(map[string]any{
+			"context_messages": selectedAuxiliaryContext,
+			"archive_ledger":   buildLedger(),
+		})
+		chars := len([]rune(string(payload))) - len([]rune(string(empty)))
+		if chars < 0 {
+			return 0
+		}
+		return chars
+	}
+	budget := policy.AuxiliaryMaxChars
+	if budget < 0 {
+		budget = 0
+	}
+	used := measure()
+	baseChars := used
+	for _, candidate := range candidates {
+		if candidate.Kind == "relevant_memory_source_turn" && !selectedMemoryTurns[candidate.TurnIndex] {
+			excluded = append(excluded, map[string]any{
+				"kind": candidate.Kind, "id": candidate.ID, "reason": "related_memory_not_selected",
+			})
+			continue
+		}
+		before := used
+		switch candidate.Kind {
+		case "relevant_memory":
+			selectedMemories = append(selectedMemories, candidate.Value)
+		case "relevant_memory_source_turn":
+			selectedAuxiliaryContext = append(selectedAuxiliaryContext, candidate.Messages...)
+		case "critic_archive_ledger":
+			selectedLedgerItems = append(selectedLedgerItems, candidate.Value)
+		case "active_world_rule":
+			selectedWorldRules = append(selectedWorldRules, candidate.Value)
+		}
+		used = measure()
+		if used > budget {
+			attemptedChars := used - before
+			switch candidate.Kind {
+			case "relevant_memory":
+				selectedMemories = selectedMemories[:len(selectedMemories)-1]
+			case "relevant_memory_source_turn":
+				selectedAuxiliaryContext = selectedAuxiliaryContext[:len(selectedAuxiliaryContext)-len(candidate.Messages)]
+			case "critic_archive_ledger":
+				selectedLedgerItems = selectedLedgerItems[:len(selectedLedgerItems)-1]
+			case "active_world_rule":
+				selectedWorldRules = selectedWorldRules[:len(selectedWorldRules)-1]
+			}
+			used = before
+			excluded = append(excluded, map[string]any{
+				"kind": candidate.Kind, "id": candidate.ID, "reason": "auxiliary_input_budget_exhausted",
+				"candidate_chars": maxInt(attemptedChars, 0),
+			})
+			continue
+		}
+		if candidate.Kind == "relevant_memory" {
+			selectedMemoryTurns[candidate.TurnIndex] = true
+		}
+		selected = append(selected, map[string]any{
+			"kind": candidate.Kind, "id": candidate.ID, "chars": used - before,
+			"relevance": candidate.Relevance,
+		})
+	}
+	selectedContext = append(selectedContext, selectedAuxiliaryContext...)
+	trace := map[string]any{
+		"contract_version":                       "critic_input_selection.v1",
+		"budget_source":                          policy.Source,
+		"configured_context_chars":               policy.ConfiguredChars,
+		"ledger_budget_chars":                    policy.LedgerChars,
+		"auxiliary_budget_chars":                 budget,
+		"auxiliary_base_chars":                   baseChars,
+		"auxiliary_selected_chars":               used,
+		"auxiliary_remaining_chars":              maxInt(budget-used, 0),
+		"selected":                               selected,
+		"excluded":                               excluded,
+		"truncated":                              truncated,
+		"selected_count":                         len(selected),
+		"excluded_count":                         len(excluded),
+		"truncated_count":                        len(truncated),
+		"partial_item_truncation":                false,
+		"current_turn_bounded":                   false,
+		"previous_turn_bounded":                  false,
+		"selection_query_includes_previous_turn": len(mandatoryContext) > 0,
+	}
+	return selectedContext, buildLedger(), trace
+}
+
+func (s *Server) buildCompleteTurnActiveWorldRuleInput(ctx context.Context, sid string) ([]map[string]any, map[string]any) {
+	trace := map[string]any{"status": "unavailable", "included_count": 0}
+	if s == nil || s.Store == nil {
+		return nil, trace
+	}
+	rows, err := s.Store.ListWorldRules(ctx, sid)
+	if err != nil {
+		trace["status"] = "read_failed"
+		trace["error"] = err.Error()
+		return nil, trace
+	}
+	out := []map[string]any{}
+	for _, row := range rows {
+		if row.Suppressed || strings.TrimSpace(row.Key) == "" {
+			continue
+		}
+		var value any = strings.TrimSpace(row.ValueJSON)
+		if strings.TrimSpace(row.ValueJSON) != "" {
+			var decoded any
+			if json.Unmarshal([]byte(row.ValueJSON), &decoded) == nil {
+				value = decoded
+			}
+		}
+		out = append(out, map[string]any{
+			"scope":       row.Scope,
+			"scope_name":  row.ScopeName,
+			"category":    row.Category,
+			"key":         row.Key,
+			"value":       value,
+			"source_turn": row.SourceTurn,
+		})
+	}
+	trace["status"] = "ok"
+	trace["included_count"] = len(out)
+	return out, trace
 }
 
 func completeTurnAssistantFinalLanguage(outputLanguageOverride *map[string]any) string {
@@ -444,7 +1382,6 @@ func criticArchiveLedgerPromptInput(resp criticArchiveLedgerPreviewResponse) map
 		"language":                 resp.Language,
 		"limits":                   resp.Limits,
 		"counts":                   resp.Counts,
-		"safety":                   resp.Safety,
 		"degraded":                 resp.Degraded,
 		"warnings":                 resp.Warnings,
 		"items":                    items,
@@ -493,7 +1430,7 @@ func readSupervisorSystemPrompt(configuredDir string) (string, string) {
 			return string(data), path
 		}
 	}
-	return "You are Archive Center's memory fidelity reviewer. Use guide_focus only as an optional rudder for supported memory emphasis. Every item must cite at least one exact response_execution_contract.source_refs.memory reference; current-input or native-system references cannot support an item alone. Never prescribe story structure, pacing, scenes, transitions, endings, or next actions. Return only valid JSON matching supervisor_scene_proposal with fidelity_warnings and portrayal_notes.", "fallback_builtin"
+	return "You are Archive Center's source-backed narrative support reviewer. Return only valid JSON matching supervisor_scene_proposal.v3 with fidelity_warnings and typed expression_hints. Fidelity warnings and callbacks require delivered-memory support; portrayal, pacing, scene emphasis, and reversible options require current-input or delivered-memory support. Every item is optional, proposal-only, non-canonical, and cannot decide user actions, new facts or knowledge, relationship changes, event closure, or scene jumps.", "fallback_builtin"
 }
 
 func buildCompleteTurnCriticPrompt(sid string, turnIndex int, userInput string, assistantContent string, contextMessages []map[string]any, outputLanguageOverride *map[string]any, previewPass map[string]any, archiveLedger ...map[string]any) string {
@@ -511,79 +1448,6 @@ func buildCompleteTurnCriticPromptWithLanguageContext(sid string, turnIndex int,
 	}
 	ledger, _ := json.Marshal(ledgerInput)
 	return strings.Join([]string{
-		"Extract durable Archive Center memory data from the completed turn.",
-		"Return ONLY JSON. Do not use markdown fences.",
-		"Use this JSON shape. Omit unknown facts instead of inventing placeholders:",
-		`{"turn_summary":"","importance_score":5,"evidence_excerpts":[],"kg_triples":[],"entities":{"characters":[],"locations":[],"items":[]},"relationship_memory":{},"state_deltas":{},"character_deltas":[],"physical_conditions":[],"entity_conditions":[],"pending_threads":[],"world_rule_audit":{"durable_rule_found":false,"reason":""},"world_rules":[],"world_state":{"version":"world_state.v1","confidence":0,"verification":"","rules":[]},"subjective_entity_memories":[],"protected_secrets":[],"character_identity_accuracy":[],"persona_capsule_candidates":[],"narrative_events":[],"state_claims":[],"belief_updates":[],"archive_hint":{}}`,
-		"Rules:",
-		"- Sensitivity policy: if the latest turn contains concrete in-story action, decision, relationship shift, promise, threat, injury, plan/resource, location movement, authority change, world constraint, or unresolved tension, extract it. Empty arrays are valid only for pure OOC/meta, repetition, or no new in-story information.",
-		"- Prefer several small focused records over one vague memory. Aim to cover the user's intent, the assistant's visible outcome, affected named actors, and durable consequences without inventing anything beyond the latest turn and safe context.",
-		"- evidence_excerpts must be short exact excerpts from the latest user/assistant turn, not the whole turn.",
-		"- Language contract: use Language_Context_JSON as the memory-write contract. If summary_language/session_output_language is ko, en, or ja, generated natural-language memory fields must use that language. Do not default to English just because these instructions are English. Raw evidence excerpts must stay exact source text and must not be translated or rewritten.",
-		"- Apply the same language contract to all generated support fields, including turn_summary, pending_threads titles/details, world_rules key/value/display text, world_state rule values, subjective_entity_memories, protected_secrets summaries, physical/entity condition labels, and storyline/continuity-hook style text. Proper nouns and exact evidence quotes may remain in their original language.",
-		"- If the latest user input language differs from session_output_language, do not follow the user input language for generated summaries or support records. Follow session_output_language and preserve user text only inside exact raw evidence excerpts.",
-		"- Keep internal enum/category/predicate keys stable. Do not translate system keys per turn just because the output language changes.",
-		"- For ordinary narrative turns with new information, include 1-3 evidence_excerpts that ground the most important user intent and assistant outcome.",
-		"- kg_triples must use real in-story names only. Never use char_*, cid_*, turn_*, user, assistant, system, prompt, or has_turn edges.",
-		"- For ordinary narrative turns with named actors, emit kg_triples for durable relations, assignments, locations, ownership, promises, threats, injuries, permissions, commands, faction links, or plan participation.",
-		"- entities.characters/locations/items should contain only concrete in-story people, places, or objects observed in this turn.",
-		"- Separate location/time fact classes. A current scene location or current scene time belongs in state_deltas.scene_state; a durable residence, hometown, birthplace, workplace, or affiliation belongs in character_deltas.status and/or kg_triples with predicates such as residence, hometown, lives_in, or based_in.",
-		"- Do not treat 'X lives in London' as 'the current scene is London'. Do not treat a temporary visit as a durable residence unless the latest turn says it directly.",
-		"- Story calendar facts such as 'summer vacation has started' belong in world_state/time_state or state_deltas.scene_state.time_state when they anchor the current scene. Do not infer an immediate return to school, a season change, or a day jump without direct evidence.",
-		"- relationship_memory may include target_name or pair when trust changes. If no target exists, leave it empty.",
-		"- character_deltas should capture named character status, location, emotional posture, relationship changes, injuries, intentions, or role/authority changes seen in the latest turn.",
-		"- Separate narrative_events (what happened), state_claims (objective current facts), and belief_updates (one character's current perception). Do not promote beliefs to objective truth.",
-		"- state_claims and belief_updates use stable state_slot keys and transition=set|reaffirm|change|reversal|recovery|correction|reveal|resolve|uncertain|clear|defer|abandon|complete|supersede|reopen|resume. Turn is audit order, not semantic authority.",
-		"- For goal or thread lifecycle state_claims, use the exact goal or thread title as subject, subject_type=entity, and state_slot=goal_status. Do not use goal_status for another entity-state dimension.",
-		"- When that goal or thread is also emitted in pending_threads or state_deltas unresolved_threads.opened, include the same exact title and subject plus state_slot=goal_status in that open record.",
-		"- Use reopen or resume only when the latest completed turn explicitly reactivates a state previously deferred, abandoned, completed, superseded, resolved, or cleared. Use reversal only for a directly evidenced state inversion. A suggestion, condition, possibility, or proposal is uncertain and must not replace an existing current value.",
-		"- Every narrative_events/state_claims/belief_updates item requires a short exact evidence_excerpt from the latest completed turn. Omit unsupported items.",
-		"- Also repeat each accepted event/state/belief evidence_excerpt in top-level evidence_excerpts so current values and change events can link to direct evidence.",
-		"- physical_conditions is for evidence-bound body/health continuity that can affect roleplay: illness, fever, cold, pregnancy, menstruation, poisoning, fracture, accident/fall injury, body damage, impairment, missing body part, recovery, worsening, or cleared condition.",
-		"- Each physical_conditions item should include owner_entity_name or owner_entity_key, condition_label, effect_kind when obvious (temporary_effect or injury), evidence_excerpt, source_turn_index, and may include severity_text, body_area, onset_story_clock_json, duration_json, expires_at_clock_json, prognosis_text, age_or_vulnerability_note, uncertainty_note, and authority_hint.",
-		"- Do not invent medical calendars, fixed cycles, healing times, or numeric severity values. If duration is not explicit in the latest turn or safe context, use duration_policy=unknown_until_updated and keep prognosis_text/age_or_vulnerability_note descriptive.",
-		"- Do not hardcode rules such as menstruation lasting a fixed number of days or a cold always resolving quickly. Let later evidence update, clear, worsen, or extend the condition.",
-		"- If LUA, a character sheet, or another chat runtime owns exact health/stat values, set authority_hint=external_runtime and record only the narrative evidence; do not override that runtime's numeric state.",
-		"- entity_conditions is for evidence-bound continuity of important non-character entities, especially named items, equipment, locations, or artifacts whose changed state should persist: broken, repaired, sealed, unlocked, activated, depleted, contaminated, lost, inaccessible, transformed, or cleared.",
-		"- Each entity_conditions item should include owner_entity_name or owner_entity_key, owner_entity_type when known, condition_label, evidence_excerpt, source_turn_index, and may include effect_kind, onset_story_clock_json, duration_json, expires_at_clock_json, uncertainty_note, and authority_hint.",
-		"- Do not emit entity_conditions for ordinary props or unchanged descriptions. Use it only when the changed entity state would create a continuity error if forgotten later.",
-		"- world_rules must describe durable world facts, not prompt instructions or style rules. You are responsible for judging them; backend code will not infer rules from keyword lists.",
-		"- Emit world_rules and world_state.rules when the latest turn establishes a durable constraint that should affect future turns: natural/physical laws, magic/technology mechanics, apocalypse survival norms, unspoken social law, institutional policy, school/academy custom, workplace procedure, family/household rule, contract, rank/authority, faction/group norm, location access, schedule/calendar, economy/resource constraint, logistics doctrine, or other world-law equivalent.",
-		"- The category list is non-exhaustive. If the story establishes a stable law of the setting, social order, organization, environment, or genre logic, capture it even when it does not literally use words like rule, law, policy, or protocol.",
-		"- Use the canonical world-rule scope vocabulary exactly: root, region, location, faction, system, session.",
-		"- Scope guidance: root=universal cosmology or setting-wide law; region=named country/city/territory/large area; location=concrete place/base/building/dungeon/site; faction=organization/church/guild/government/gang/party/team; system=magic/technology/progression/economy/combat/reward mechanics; session=temporary session-only plan or rule without a more specific stable scope.",
-		"- Do not put named regions, named locations, named factions, or progression mechanics under root just because they are important. Use their specific scope and scope_name.",
-		"- In system/progression stories, judge durable mechanics as world_rules when confirmed: randomized or conditional acquisition, base/home/environment constraints, challenge entry/clear/reward loops, exchange/cost economy, upgrade or unlock rules, item acquisition/crafting rules, stat growth, group/party limits, cooldowns, ranks, quests, or other recurring progression mechanics.",
-		"- Mandatory world-rule audit: before returning JSON, check whether the latest turn established or confirmed any stable setting constraint, repeated system mechanic, progression mechanic, acquisition method, challenge/reward loop, exchange/cost rule, growth/unlock rule, access condition, social order, faction norm, institution rule, resource/logistics rule, environment constraint, magic/technology law, rank/authority rule, schedule/calendar rule, contract, taboo, or unspoken norm.",
-		"- Always fill world_rule_audit. If that audit is positive, set world_rule_audit.durable_rule_found=true and world_rules must not be empty. Emit at least one compact evidence-bound rule with scope, category, key, and value; mirror it in world_state.rules when it shapes current setting state.",
-		"- If you detect a durable rule but cannot fit the final rule list, still set world_rule_audit.durable_rule_found=true and explain the missing rule in world_rule_audit.reason. A focused follow-up audit may repair the omission.",
-		"- Early-session setup counts. Do not wait for many turns: a 1-7 turn session can already establish foundational world rules such as randomized acquisition, progression currency exchange, challenge reward loops, environment/base constraints, access gates, or upgrade/item progression.",
-		"- Extract the abstract invariant behind the session's surface nouns. Do not copy these instruction examples as setting facts; use the session's own evidence and names.",
-		"- Do not leave world_rules empty for confirmed public facts, institutional rules, class/company policies, social obligations, access permissions, hierarchy/authority rules, special-world mechanics, supernatural/technology rules, recurring resource constraints, or implicit norms that remain true beyond this single exchange.",
-		"- A proposal, temporary strategy, one-off plan, implementation method, named operation, or unresolved objective is not a world_rule merely because characters accept or intend it. Keep it in pending_threads or goal_status.",
-		"- Emit a world_rule only when the latest completed turn establishes an enacted, continuing institutional or setting constraint beyond the current objective. A procedure or tactical doctrine qualifies only when evidence shows that it is a recurring durable rule rather than a one-off objective.",
-		"- Each world rule must include key and value; prefer scope, scope_name, category, confidence, and verification/evidence when available. Use world_state.rules for the same durable rules when they shape the current world state.",
-		"- subjective_entity_memories is for each named in-story entity's subjective recollection or interpretation of the latest turn. It is not canonical truth.",
-		"- Each subjective_entity_memories item must include owner_entity_key or owner_entity_name, memory_text, and may include owner_entity_role, owner_visibility, source_turn_index, importance_10, emotional_weight, evidence_excerpt, secret_guard, target_reveal_policy, tags, and portability.",
-		"- When a named character clearly feels, fears, trusts, suspects, misunderstands, decides, resents, or privately interprets the event, include a subjective_entity_memories item for that owner. Keep it evidence-bound and support-only.",
-		"- Use owner_entity_role=protagonist for the player/persona and owner_entity_role=npc with owner_visibility=owner_private for private NPC recollections. Keep NPC-only memories out of persona_capsule_candidates.",
-		"- subjective_entity_memories must remain support-only: never use it to overwrite current-world truth, canonical memory, direct evidence, KG triples, character state, or world rules.",
-		"- NPC/private subjective_entity_memories are interpretations, suspicions, misunderstandings, or private bias unless current direct evidence states otherwise; never promote them to objective fact or narrator-revealed truth.",
-		"- Conflict or misunderstanding memories should stay owner-private and may only influence that owner entity's behavior, subtext, hesitation, avoidance, or selective silence until explicit current-session reveal.",
-		"- protected_secrets is for any information that should not become public narration or impossible character knowledge: private affection, guilt, shame, mistakes, lies, fears, debts, hidden plans, hidden identity, hidden role, hidden allegiance, lineage, succession, protected power inheritance, or similar private knowledge.",
-		"- Each protected_secrets item may include secret_kind, owner, subject, summary, sensitivity, evidence_strength, disclosure_policy, knowledge_scope, and evidence_excerpt. Keep the text evidence-bound and do not invent secrets.",
-		"- If a protected secret exists, set secret_guard=true on the matching subjective_entity_memories item and use target_reveal_policy such as owner_private_until_revealed, explicit_reveal_event_required, or user_directed_reveal_only.",
-		"- Stored secret truth is not permission for spontaneous confession, public narration, or unrelated-character discovery. Preserve it as owner-scoped support until current evidence reveals it.",
-		"- character_identity_accuracy is for evidence-bound identity/role/allegiance mappings such as cover identity, disguise, hidden role, hidden allegiance, secret successor, hidden lineage, or protected power inheritance. Include same_entity, surface_identity_name, true_identity_name, identity_kind, reveal_policy, and knowledge_scope when supported.",
-		"- Do not use character-specific hardcoded aliases. Identity/protected-secret candidates must come from the latest turn or safe context evidence only.",
-		"- persona_capsule_candidates is optional and proposal-only. Use it only for protagonist/player subjective recollections that may be carried to another session, loop, regression, reincarnation, isekai, or same-character continuation.",
-		"- persona_capsule_candidates must never be used to write current-world truth, canonical memory, direct evidence, KG triples, character state, or world rules. It is support_only_persona_recollection and requires later user/operator approval.",
-		"- Each persona_capsule_candidates item may include memory_text, source_turn_index, importance_10, emotional_weight, portability, mode, secret_guard, tags, evidence_excerpt, and injection_policy.",
-		"- Mark secret_guard true when the recollection reveals regression, loop, reincarnation, possession/rebirth, isekai transfer, or identity-carryover that should remain protagonist-private until explicitly revealed by current user input.",
-		"- Critic_Archive_Ledger_JSON is a bounded read-only support ledger. Use it to avoid duplicate memories, stale residue, and contradiction drift.",
-		"- Never copy Critic_Archive_Ledger_JSON item summaries as new evidence unless the latest user/assistant turn also supports the fact.",
-		"- If Critic_Archive_Ledger_JSON is null, empty, or degraded, continue extracting only from the latest turn and safe context.",
-		"",
 		fmt.Sprintf("chat_session_id: %s", sid),
 		fmt.Sprintf("turn_index: %d", turnIndex),
 		"",
@@ -685,10 +1549,32 @@ func (s *Server) buildCompleteTurnCriticPreviewPass(ctx context.Context, sid str
 
 func parseJSONFromLLMContent(content string) (map[string]any, error) {
 	candidate, err := extractJSONCandidateFromLLMContent(content)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		if out, parseErr := unmarshalJSONCandidate(candidate); parseErr == nil {
+			return out, nil
+		}
+		if out, repairErr := unmarshalJSONCandidate(repairJSONCandidate(candidate)); repairErr == nil {
+			return out, nil
+		}
 	}
-	candidate = repairJSONCandidate(candidate)
+
+	structuralRepair := repairStructuralJSONQuotes(normalizeLLMJSONText(content))
+	repairedCandidate, repairExtractErr := extractJSONCandidateFromLLMContent(structuralRepair)
+	if repairExtractErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, repairExtractErr
+	}
+	repairedCandidate = repairJSONCandidate(repairedCandidate)
+	out, repairErr := unmarshalJSONCandidate(repairedCandidate)
+	if repairErr != nil {
+		return nil, repairErr
+	}
+	return out, nil
+}
+
+func unmarshalJSONCandidate(candidate string) (map[string]any, error) {
 	var out map[string]any
 	if err := json.Unmarshal([]byte(candidate), &out); err != nil {
 		return nil, err
@@ -746,16 +1632,6 @@ func extractJSONCandidateFromLLMContent(content string) (string, error) {
 
 func normalizeLLMJSONText(content string) string {
 	cleaned := strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
-	replacer := strings.NewReplacer(
-		"\u201c", `"`,
-		"\u201d", `"`,
-		"\u201e", `"`,
-		"\u201f", `"`,
-		"\u2018", `'`,
-		"\u2019", `'`,
-	)
-	cleaned = replacer.Replace(cleaned)
-	cleaned = strings.TrimSpace(cleaned)
 	cleaned = strings.TrimPrefix(cleaned, "```json")
 	cleaned = strings.TrimPrefix(cleaned, "```JSON")
 	cleaned = strings.TrimPrefix(cleaned, "```")
@@ -766,8 +1642,137 @@ func normalizeLLMJSONText(content string) string {
 func repairJSONCandidate(candidate string) string {
 	repaired := replaceJSONLiteralsOutsideStrings(candidate)
 	repaired = repairMissingJSONValuesOutsideStrings(repaired)
-	repaired = jsonTrailingCommaPattern.ReplaceAllString(repaired, "$1")
+	repaired = removeJSONTrailingCommasOutsideStrings(repaired)
 	return strings.TrimSpace(repaired)
+}
+
+func repairStructuralJSONQuotes(input string) string {
+	runes := []rune(input)
+	var b strings.Builder
+	b.Grow(len(input))
+	inASCIIString := false
+	inCurlyString := false
+	escaped := false
+	var previousSignificant rune
+	for i, current := range runes {
+		if inASCIIString {
+			b.WriteRune(current)
+			if escaped {
+				escaped = false
+			} else if current == '\\' {
+				escaped = true
+			} else if current == '"' {
+				inASCIIString = false
+			}
+			continue
+		}
+		if inCurlyString {
+			if isCurlyJSONQuote(current) && curlyJSONQuoteClosesToken(runes, i) {
+				b.WriteByte('"')
+				inCurlyString = false
+				previousSignificant = '"'
+			} else {
+				b.WriteRune(current)
+			}
+			continue
+		}
+		if current == '"' {
+			b.WriteRune(current)
+			inASCIIString = true
+			escaped = false
+			continue
+		}
+		if isCurlyJSONQuote(current) && curlyJSONQuoteCanOpenToken(previousSignificant) {
+			b.WriteByte('"')
+			inCurlyString = true
+			escaped = false
+			continue
+		}
+		b.WriteRune(current)
+		if !isJSONWhitespaceRune(current) {
+			previousSignificant = current
+		}
+	}
+	return b.String()
+}
+
+func isCurlyJSONQuote(value rune) bool {
+	switch value {
+	case '\u2018', '\u2019', '\u201c', '\u201d', '\u201e', '\u201f':
+		return true
+	default:
+		return false
+	}
+}
+
+func curlyJSONQuoteCanOpenToken(previous rune) bool {
+	switch previous {
+	case 0, '{', '[', ',', ':':
+		return true
+	default:
+		return false
+	}
+}
+
+func curlyJSONQuoteClosesToken(input []rune, index int) bool {
+	for i := index + 1; i < len(input); i++ {
+		if isJSONWhitespaceRune(input[i]) {
+			continue
+		}
+		switch input[i] {
+		case ':', ',', '}', ']':
+			return true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isJSONWhitespaceRune(value rune) bool {
+	switch value {
+	case ' ', '\t', '\r', '\n':
+		return true
+	default:
+		return false
+	}
+}
+
+func removeJSONTrailingCommasOutsideStrings(input string) string {
+	var b strings.Builder
+	b.Grow(len(input))
+	inString := false
+	escaped := false
+	for i := 0; i < len(input); i++ {
+		current := input[i]
+		if inString {
+			b.WriteByte(current)
+			if escaped {
+				escaped = false
+			} else if current == '\\' {
+				escaped = true
+			} else if current == '"' {
+				inString = false
+			}
+			continue
+		}
+		if current == '"' {
+			inString = true
+			b.WriteByte(current)
+			continue
+		}
+		if current == ',' {
+			next := i + 1
+			for next < len(input) && (input[next] == ' ' || input[next] == '\t' || input[next] == '\r' || input[next] == '\n') {
+				next++
+			}
+			if next < len(input) && (input[next] == '}' || input[next] == ']') {
+				continue
+			}
+		}
+		b.WriteByte(current)
+	}
+	return b.String()
 }
 
 func closeTruncatedJSONCandidate(candidate string, stack []byte, inString bool, escaped bool) (string, error) {
@@ -900,6 +1905,647 @@ func isJSONLiteralChar(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'
 }
 
+func validateCriticExtractionSchema(raw map[string]any) error {
+	if raw == nil || len(raw) == 0 {
+		return errors.New("critic schema requires a non-empty JSON object")
+	}
+	recognizedPayload := false
+	stringFields := []string{"turn_summary"}
+	numberFields := []string{"importance_score", "emotional_intensity", "narrative_significance"}
+	arrayFields := []string{
+		"evidence_excerpts", "kg_triples", "character_deltas", "pending_threads",
+		"speaker_attributions", "world_rules", "reversible_states",
+		"narrative_events", "state_claims", "belief_updates",
+		"subjective_entity_memories", "protected_secrets",
+		"character_identity_accuracy", "persona_capsule_candidates",
+		"interaction_events", "relationship_observations", "interaction_boundaries", "habit_observations",
+		"character_profile_observations", "voice_observations",
+		"user_interaction_profile", "rp_character_profile",
+	}
+	objectFields := []string{
+		"entities", "relationship_memory", "state_deltas", "world_rule_audit",
+		"world_state", "archive_hint", "story_clock",
+	}
+	for _, field := range stringFields {
+		value, exists := raw[field]
+		if !exists {
+			continue
+		}
+		recognizedPayload = true
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("critic schema field %s must be a string", field)
+		}
+	}
+	for _, field := range numberFields {
+		value, exists := raw[field]
+		if !exists {
+			continue
+		}
+		switch value.(type) {
+		case float64, float32, int, int32, int64, json.Number:
+		default:
+			return fmt.Errorf("critic schema field %s must be a number", field)
+		}
+	}
+	for _, field := range arrayFields {
+		value, exists := raw[field]
+		if !exists {
+			continue
+		}
+		recognizedPayload = true
+		if _, ok := value.([]any); !ok {
+			return fmt.Errorf("critic schema field %s must be an array", field)
+		}
+	}
+	for _, field := range objectFields {
+		value, exists := raw[field]
+		if !exists {
+			continue
+		}
+		recognizedPayload = true
+		if value == nil {
+			continue
+		}
+		if _, ok := value.(map[string]any); !ok {
+			return fmt.Errorf("critic schema field %s must be an object", field)
+		}
+	}
+	if excerpts, ok := raw["evidence_excerpts"].([]any); ok {
+		for index, excerpt := range excerpts {
+			if _, ok := excerpt.(string); !ok {
+				return fmt.Errorf("critic schema field evidence_excerpts[%d] must be a string", index)
+			}
+		}
+	}
+	if !recognizedPayload {
+		return errors.New("critic schema has no recognized extraction payload")
+	}
+	return nil
+}
+
+func quarantineCriticProtectedCandidates(raw map[string]any, userInput, assistantContent string) (map[string]any, map[string]any) {
+	if raw == nil {
+		return raw, nil
+	}
+	out := make(map[string]any, len(raw))
+	for key, value := range raw {
+		out[key] = value
+	}
+	// Collect perspective-scoped claims before structural validation. A private
+	// claim must not be projected as an objective event, state, or KG fact.
+	perspectiveClaims := criticPerspectiveClaims(raw)
+	reasons := map[string]int{}
+	total := 0
+	kept := 0
+	subjectiveLaneObserved := false
+	subjectiveCandidateCount := 0
+	subjectiveKeptCount := 0
+	quarantine := func(reason string) {
+		reasons[reason]++
+	}
+
+	if values, ok := raw["protected_secrets"].([]any); ok {
+		keptItems := make([]any, 0, len(values))
+		for _, value := range values {
+			total++
+			item, itemOK := value.(map[string]any)
+			if !itemOK || item == nil {
+				quarantine("protected_secret_not_object")
+				continue
+			}
+			owner := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "owner"),
+				stringFromMap(item, "owner_entity_name"),
+				stringFromMap(item, "character_name"),
+			))
+			summary := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "summary"),
+				stringFromMap(item, "memory_text"),
+				stringFromMap(item, "secret_summary"),
+				stringFromMap(item, "text"),
+			))
+			if owner == "" || summary == "" {
+				quarantine("protected_secret_identity_or_summary_missing")
+				continue
+			}
+			keptItems = append(keptItems, item)
+			kept++
+		}
+		out["protected_secrets"] = keptItems
+	}
+
+	if values, ok := raw["subjective_entity_memories"].([]any); ok {
+		subjectiveLaneObserved = true
+		subjectiveCandidateCount = len(values)
+		keptItems := make([]any, 0, len(values))
+		for _, value := range values {
+			total++
+			item, itemOK := value.(map[string]any)
+			if !itemOK || item == nil {
+				quarantine("subjective_memory_not_object")
+				continue
+			}
+			normalizeSubjectiveEntityMemoryProtection(item)
+			owner := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "owner_entity_name"),
+				stringFromMap(item, "owner_entity_key"),
+				stringFromMap(item, "entity_name"),
+				stringFromMap(item, "name"),
+			))
+			text := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "memory_text"),
+				stringFromMap(item, "subjective_memory"),
+				stringFromMap(item, "recollection"),
+				stringFromMap(item, "interpretation"),
+				stringFromMap(item, "summary"),
+			))
+			if owner == "" || text == "" {
+				quarantine("protected_subjective_identity_or_text_missing")
+				continue
+			}
+			keptItems = append(keptItems, item)
+			kept++
+			subjectiveKeptCount++
+		}
+		out["subjective_entity_memories"] = keptItems
+	}
+
+	if values, ok := raw["character_identity_accuracy"].([]any); ok {
+		keptItems := make([]any, 0, len(values))
+		for _, value := range values {
+			total++
+			item, itemOK := value.(map[string]any)
+			if !itemOK || item == nil {
+				quarantine("protected_identity_not_object")
+				continue
+			}
+			surface := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "surface_identity_name"),
+				stringFromMap(item, "public_identity_name"),
+				stringFromMap(item, "alias_name"),
+			))
+			trueName := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "true_identity_name"),
+				stringFromMap(item, "canonical_entity_name"),
+				stringFromMap(item, "real_identity_name"),
+			))
+			if surface == "" || trueName == "" {
+				quarantine("protected_identity_mapping_incomplete")
+				continue
+			}
+			keptItems = append(keptItems, item)
+			kept++
+		}
+		out["character_identity_accuracy"] = keptItems
+	}
+
+	perspectiveClaims = excludeValidatedPublicCriticPerspectiveClaims(
+		perspectiveClaims,
+		out,
+		strings.TrimSpace(userInput+"\n"+assistantContent),
+	)
+	objectiveQuarantined := quarantineCriticPerspectiveClaimsFromObjectiveLanesUsingClaims(out, perspectiveClaims)
+	if objectiveQuarantined > 0 {
+		reasons["perspective_claim_copied_to_objective_lane"] += objectiveQuarantined
+	}
+
+	if total == 0 && objectiveQuarantined == 0 && !subjectiveLaneObserved {
+		return out, nil
+	}
+	reasonPayload := map[string]any{}
+	for reason, count := range reasons {
+		reasonPayload[reason] = count
+	}
+	trace := map[string]any{
+		"contract_version":                 "critic_protected_candidate_quarantine.v1",
+		"policy":                           "structural_collection_then_prepare_turn_selection",
+		"candidate_count":                  total,
+		"kept_count":                       kept,
+		"quarantined_count":                total - kept,
+		"objective_lane_quarantined_count": objectiveQuarantined,
+		"reasons":                          reasonPayload,
+	}
+	if subjectiveLaneObserved {
+		coverageStatus := "candidate_kept"
+		switch {
+		case subjectiveCandidateCount == 0:
+			coverageStatus = "zero_unclassified_no_candidate"
+		case subjectiveKeptCount == 0:
+			coverageStatus = "all_candidates_rejected"
+		}
+		trace["subjective_memory_coverage"] = map[string]any{
+			"candidate_count": subjectiveCandidateCount,
+			"kept_count":      subjectiveKeptCount,
+			"status":          coverageStatus,
+			"zero_policy":     "valid_only_when_no_distinct_source_grounded_perspective_evidence",
+			"npc_policy":      "evidence_eligible_not_required",
+		}
+	}
+	return out, trace
+}
+
+type criticPerspectiveClaim struct {
+	evidence              string
+	claim                 string
+	owner                 string
+	subject               string
+	kind                  string
+	anchors               []string
+	identityRoleProtected bool
+}
+
+func quarantineCriticPerspectiveClaimsFromObjectiveLanes(extraction map[string]any) int {
+	claims := excludeValidatedPublicCriticPerspectiveClaims(criticPerspectiveClaims(extraction), extraction)
+	return quarantineCriticPerspectiveClaimsFromObjectiveLanesUsingClaims(extraction, claims)
+}
+
+func quarantineCriticPerspectiveClaimsFromObjectiveLanesUsingClaims(
+	extraction map[string]any,
+	claims []criticPerspectiveClaim,
+) int {
+	if len(claims) == 0 {
+		return 0
+	}
+	quarantined := 0
+	for _, lane := range []string{"narrative_events", "state_claims", "kg_triples"} {
+		items := sliceFromAny(extraction[lane])
+		keptItems := make([]any, 0, len(items))
+		for _, raw := range items {
+			item := mapFromAny(raw)
+			if criticObjectiveItemConflictsWithPerspectiveClaim(item, claims) {
+				quarantined++
+				continue
+			}
+			keptItems = append(keptItems, raw)
+		}
+		extraction[lane] = keptItems
+	}
+	return quarantined
+}
+
+func criticPerspectiveClaims(extraction map[string]any) []criticPerspectiveClaim {
+	out := []criticPerspectiveClaim{}
+	add := func(kind string, item map[string]any, ownerKeys, claimKeys []string) {
+		evidence := strings.TrimSpace(extractionFirstNonEmpty(
+			stringFromMap(item, "evidence_excerpt"),
+			stringFromMap(item, "evidence"),
+			stringFromMap(item, "source_excerpt"),
+		))
+		claimValues := make([]string, 0, len(claimKeys))
+		for _, key := range claimKeys {
+			if value := strings.TrimSpace(extractionStringFromAny(item[key])); value != "" {
+				claimValues = append(claimValues, value)
+			}
+		}
+		ownerValues := make([]string, 0, len(ownerKeys))
+		for _, key := range ownerKeys {
+			ownerValues = append(ownerValues, stringsFromAny(item[key])...)
+			if value := strings.TrimSpace(extractionStringFromAny(item[key])); value != "" {
+				ownerValues = append(ownerValues, value)
+			}
+		}
+		claim := strings.TrimSpace(strings.Join(claimValues, " "))
+		owner := strings.TrimSpace(strings.Join(ownerValues, " "))
+		subject := strings.TrimSpace(extractionFirstNonEmpty(
+			stringFromMap(item, "subject"),
+			stringFromMap(item, "subject_name"),
+			stringFromMap(item, "target"),
+			stringFromMap(item, "entity_name"),
+			stringFromMap(item, "canonical_entity_name"),
+			stringFromMap(item, "true_identity_name"),
+			stringFromMap(item, "surface_identity_name"),
+			extractionFirstNonEmpty(ownerValues...),
+		))
+		if evidence == "" && claim == "" {
+			return
+		}
+		anchors := []string{}
+		if kind == "identity" {
+			for _, value := range []string{
+				extractionFirstNonEmpty(
+					stringFromMap(item, "surface_identity_name"),
+					stringFromMap(item, "public_identity_name"),
+					stringFromMap(item, "alias_name"),
+				),
+				extractionFirstNonEmpty(
+					stringFromMap(item, "true_identity_name"),
+					stringFromMap(item, "canonical_entity_name"),
+					stringFromMap(item, "real_identity_name"),
+				),
+			} {
+				value = strings.TrimSpace(value)
+				if value == "" || slices.Contains(anchors, value) {
+					continue
+				}
+				anchors = append(anchors, value)
+			}
+		} else if subject != "" {
+			anchors = append(anchors, subject)
+		}
+		out = append(out, criticPerspectiveClaim{
+			evidence: evidence,
+			claim:    claim,
+			owner:    owner,
+			subject:  subject,
+			kind:     kind,
+			anchors:  anchors,
+			identityRoleProtected: kind == "identity" && strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "true_role"),
+				stringFromMap(item, "true_allegiance"),
+			)) != "",
+		})
+	}
+	for _, raw := range sliceFromAny(extraction["belief_updates"]) {
+		add("belief", mapFromAny(raw),
+			[]string{"perspective_owner", "knower", "believer", "listener_names", "knowledge_holders"},
+			[]string{"value", "state_value", "belief", "claim"},
+		)
+	}
+	for _, raw := range sliceFromAny(extraction["protected_secrets"]) {
+		item := mapFromAny(raw)
+		add("secret", item, []string{"owner", "subject"}, []string{"summary", "secret_summary", "text"})
+	}
+	for _, raw := range sliceFromAny(extraction["character_identity_accuracy"]) {
+		item := mapFromAny(raw)
+		add("identity", item,
+			[]string{"canonical_entity_name", "true_identity_name", "surface_identity_name"},
+			[]string{"true_identity_name", "surface_identity_name", "identity_kind", "true_role", "true_allegiance"},
+		)
+	}
+	for _, raw := range sliceFromAny(extraction["subjective_entity_memories"]) {
+		item := mapFromAny(raw)
+		visibility := strings.ToLower(strings.TrimSpace(stringFromMap(item, "owner_visibility")))
+		if !boolFromAny(item["secret_guard"]) &&
+			visibility != "owner_private" &&
+			strings.ToLower(strings.TrimSpace(stringFromMap(item, "portability"))) != "npc_private_recollection" {
+			continue
+		}
+		add("subjective", item,
+			[]string{"owner_entity_name", "owner_entity_key", "entity_name"},
+			[]string{"memory_text", "subjective_memory", "recollection", "interpretation", "summary"},
+		)
+	}
+	return out
+}
+
+func excludeValidatedPublicCriticPerspectiveClaims(
+	claims []criticPerspectiveClaim,
+	validatedExtraction map[string]any,
+	acceptedSource ...string,
+) []criticPerspectiveClaim {
+	source := strings.TrimSpace(strings.Join(acceptedSource, "\n"))
+	publicExtraction := map[string]any{}
+	for _, lane := range []string{"protected_secrets", "character_identity_accuracy"} {
+		publicItems := []any{}
+		for _, raw := range sliceFromAny(validatedExtraction[lane]) {
+			item := mapFromAny(raw)
+			publiclyRevealed := boolFromAny(mapFromAny(item["knowledge_scope"])["publicly_revealed"])
+			if publiclyRevealed && source != "" {
+				evidence := strings.TrimSpace(extractionFirstNonEmpty(
+					stringFromMap(item, "evidence_excerpt"),
+					stringFromMap(item, "evidence"),
+					stringFromMap(item, "source_excerpt"),
+				))
+				publiclyRevealed = evidence != "" && criticEvidenceOccursInSource(evidence, source)
+			}
+			if publiclyRevealed {
+				publicItems = append(publicItems, raw)
+			}
+		}
+		if len(publicItems) > 0 {
+			publicExtraction[lane] = publicItems
+		}
+	}
+	publicClaims := criticPerspectiveClaims(publicExtraction)
+	if len(publicClaims) == 0 {
+		return claims
+	}
+	privateClaims := make([]criticPerspectiveClaim, 0, len(claims))
+	for _, claim := range claims {
+		public := false
+		for _, candidate := range publicClaims {
+			if criticPerspectiveClaimsEquivalent(claim, candidate) {
+				public = true
+				break
+			}
+		}
+		if !public {
+			privateClaims = append(privateClaims, claim)
+		}
+	}
+	return privateClaims
+}
+
+func criticPerspectiveClaimsEquivalent(left, right criticPerspectiveClaim) bool {
+	if left.kind != right.kind {
+		return false
+	}
+	if left.kind == "identity" {
+		if len(left.anchors) != len(right.anchors) {
+			return false
+		}
+		for index := range left.anchors {
+			if normalizeArtifactDedupeText(left.anchors[index]) != normalizeArtifactDedupeText(right.anchors[index]) {
+				return false
+			}
+		}
+		return len(left.anchors) > 0
+	}
+	return normalizeArtifactDedupeText(left.subject) == normalizeArtifactDedupeText(right.subject) &&
+		normalizeArtifactDedupeText(left.claim) == normalizeArtifactDedupeText(right.claim)
+}
+
+func criticObjectiveItemConflictsWithPerspectiveClaim(item map[string]any, claims []criticPerspectiveClaim) bool {
+	if len(item) == 0 {
+		return false
+	}
+	evidence := strings.TrimSpace(extractionFirstNonEmpty(
+		stringFromMap(item, "evidence_excerpt"),
+		stringFromMap(item, "evidence"),
+		stringFromMap(item, "source_excerpt"),
+	))
+	encoded, _ := json.Marshal(item)
+	text := strings.TrimSpace(string(encoded))
+	for _, protected := range claims {
+		if evidence != "" && protected.evidence != "" &&
+			normalizeArtifactDedupeText(evidence) == normalizeArtifactDedupeText(protected.evidence) {
+			return true
+		}
+		if protected.claim != "" &&
+			criticProtectedClaimSupported(protected.claim, text, protected.owner) {
+			return true
+		}
+		if evidence == "" && criticObjectiveItemCarriesPerspectiveClaimSignal(item, protected) {
+			return true
+		}
+	}
+	return false
+}
+
+func criticObjectiveItemCarriesPerspectiveClaimSignal(item map[string]any, claim criticPerspectiveClaim) bool {
+	if claim.kind == "identity" {
+		if len(claim.anchors) >= 2 {
+			encoded, _ := json.Marshal(item)
+			text := strings.ToLower(string(encoded))
+			for _, anchor := range claim.anchors {
+				if !strings.Contains(text, strings.ToLower(strings.TrimSpace(anchor))) {
+					return false
+				}
+			}
+			return true
+		}
+		if len(claim.anchors) == 1 && claim.identityRoleProtected {
+			return criticObjectiveItemHasExactPerspectiveAnchor(item, claim.anchors[0])
+		}
+		return false
+	}
+
+	anchor := normalizeArtifactDedupeText(claim.subject)
+	if anchor == "" {
+		return false
+	}
+	anchorMatched := criticObjectiveItemHasExactPerspectiveAnchor(item, anchor)
+	if !anchorMatched {
+		return false
+	}
+
+	itemJSON, _ := json.Marshal(item)
+	itemTokens := criticSubstantiveTokens(string(itemJSON))
+	claimTokens := criticSubstantiveTokens(claim.claim)
+	for token := range criticSubstantiveTokens(claim.owner + " " + claim.subject) {
+		delete(claimTokens, token)
+	}
+	overlap := 0
+	for token := range claimTokens {
+		if _, matched := itemTokens[token]; matched {
+			overlap++
+		}
+	}
+	if overlap >= 2 || (claim.kind == "belief" && overlap >= 1) {
+		return true
+	}
+	if overlap == 0 {
+		return false
+	}
+	predicateTokens := map[string]struct{}{}
+	for _, key := range []string{"predicate", "relation", "relationship_type", "state_slot", "slot", "state_key"} {
+		for token := range criticSubstantiveTokens(extractionStringFromAny(item[key])) {
+			predicateTokens[token] = struct{}{}
+		}
+	}
+	for token := range claimTokens {
+		if _, matched := predicateTokens[token]; matched {
+			return true
+		}
+	}
+	return false
+}
+
+func criticObjectiveItemHasExactPerspectiveAnchor(item map[string]any, anchor string) bool {
+	anchor = normalizeArtifactDedupeText(anchor)
+	if anchor == "" {
+		return false
+	}
+	for _, key := range []string{
+		"subject", "subject_name", "target", "target_name",
+		"entity", "entity_name", "character", "character_name",
+		"actor", "actor_name", "owner", "owner_entity_name",
+		"object", "object_name",
+	} {
+		if normalizeArtifactDedupeText(extractionStringFromAny(item[key])) == anchor {
+			return true
+		}
+	}
+	return false
+}
+
+func criticEvidenceOccursInSource(evidence, source string) bool {
+	evidence = strings.TrimSpace(evidence)
+	source = strings.TrimSpace(source)
+	return evidence != "" && source != "" && strings.Contains(source, evidence)
+}
+
+func criticOwnerOccursInSource(owner, source string) bool {
+	owner = strings.ToLower(strings.TrimSpace(owner))
+	source = strings.ToLower(strings.TrimSpace(source))
+	return owner != "" && source != "" && strings.Contains(source, owner)
+}
+
+func criticProtectedIdentitySupported(surface, trueName, evidence, source string) bool {
+	surface = strings.ToLower(strings.TrimSpace(surface))
+	trueName = strings.ToLower(strings.TrimSpace(trueName))
+	evidence = strings.ToLower(strings.TrimSpace(evidence))
+	source = strings.ToLower(strings.TrimSpace(source))
+	if surface == "" || trueName == "" || evidence == "" || source == "" {
+		return false
+	}
+	return criticTextContainsDistinctIdentityPair(source, surface, trueName) &&
+		criticTextContainsDistinctIdentityPair(evidence, surface, trueName)
+}
+
+func criticTextContainsDistinctIdentityPair(text, surface, trueName string) bool {
+	if !strings.Contains(text, surface) || !strings.Contains(text, trueName) {
+		return false
+	}
+	if surface == trueName {
+		return true
+	}
+	if strings.Contains(surface, trueName) {
+		return strings.Contains(strings.ReplaceAll(text, surface, " "), trueName)
+	}
+	if strings.Contains(trueName, surface) {
+		return strings.Contains(strings.ReplaceAll(text, trueName, " "), surface)
+	}
+	return true
+}
+
+func criticProtectedClaimSupported(claim, evidence, owner string) bool {
+	claim = strings.ToLower(strings.TrimSpace(claim))
+	evidence = strings.ToLower(strings.TrimSpace(evidence))
+	if claim == "" || evidence == "" {
+		return false
+	}
+	if strings.Contains(claim, evidence) || strings.Contains(evidence, claim) {
+		return true
+	}
+	ownerTokens := criticSubstantiveTokens(owner)
+	claimTokens := criticSubstantiveTokens(claim)
+	evidenceTokens := criticSubstantiveTokens(evidence)
+	overlap := 0
+	for token := range claimTokens {
+		if _, ownerToken := ownerTokens[token]; ownerToken {
+			continue
+		}
+		if _, supported := evidenceTokens[token]; supported {
+			overlap++
+			if overlap >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func criticSubstantiveTokens(value string) map[string]struct{} {
+	tokens := map[string]struct{}{}
+	var current []rune
+	flush := func() {
+		if len(current) > 0 {
+			tokens[string(current)] = struct{}{}
+		}
+		current = current[:0]
+	}
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			current = append(current, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
 func normalizeCriticExtraction(raw map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range raw {
@@ -910,21 +2556,37 @@ func normalizeCriticExtraction(raw map[string]any) map[string]any {
 	out["emotional_intensity"] = clampFloat(extractionFloatFromAny(raw["emotional_intensity"], 0), 0, 1)
 	out["narrative_significance"] = clampFloat(extractionFloatFromAny(raw["narrative_significance"], 0), 0, 1)
 	out["evidence_excerpts"] = stringsFromAny(raw["evidence_excerpts"])
+	if storyClock := normalizeStoryClockProposal(raw["story_clock"]); len(storyClock) > 0 {
+		out["story_clock"] = storyClock
+	} else {
+		delete(out, "story_clock")
+	}
 	out["kg_triples"] = sliceFromAny(raw["kg_triples"])
 	out["character_deltas"] = sliceFromAny(raw["character_deltas"])
-	out["pending_threads"] = sliceFromAny(raw["pending_threads"])
+	out["pending_threads"] = normalizeCriticPendingThreads(raw["pending_threads"])
 	out["entities"] = mapFromAny(raw["entities"])
+	out["speaker_attributions"] = normalizeSpeakerAttributionCandidates(raw["speaker_attributions"])
 	out["relationship_memory"] = mapFromAny(raw["relationship_memory"])
+	out["interaction_events"] = sliceFromAny(raw["interaction_events"])
+	out["relationship_observations"] = sliceFromAny(raw["relationship_observations"])
+	out["interaction_boundaries"] = sliceFromAny(raw["interaction_boundaries"])
+	out["habit_observations"] = sliceFromAny(raw["habit_observations"])
+	out["character_profile_observations"] = sliceFromAny(raw["character_profile_observations"])
+	out["voice_observations"] = sliceFromAny(raw["voice_observations"])
+	out["user_interaction_profile"] = sliceFromAny(raw["user_interaction_profile"])
+	out["rp_character_profile"] = sliceFromAny(raw["rp_character_profile"])
 	out["state_deltas"] = mapFromAny(raw["state_deltas"])
 	out["world_rules"] = sliceFromAny(raw["world_rules"])
+	out["reversible_states"] = sliceFromAny(raw["reversible_states"])
 	out["physical_conditions"] = sliceFromAny(raw["physical_conditions"])
 	out["entity_conditions"] = sliceFromAny(raw["entity_conditions"])
 	out["narrative_events"] = sliceFromAny(raw["narrative_events"])
 	out["state_claims"] = sliceFromAny(raw["state_claims"])
-	out["belief_updates"] = sliceFromAny(raw["belief_updates"])
+	out["belief_updates"] = normalizeCriticBeliefUpdates(raw["belief_updates"])
 	protectedSecrets := normalizeProtectedSecrets(raw["protected_secrets"])
 	characterIdentityAccuracy := normalizeCharacterIdentityAccuracy(raw["character_identity_accuracy"])
 	subjectiveMemories := normalizeSubjectiveEntityMemories(raw["subjective_entity_memories"])
+	subjectiveMemories = appendBeliefUpdateSubjectiveMemories(subjectiveMemories, out["belief_updates"])
 	subjectiveMemories = appendProtectedSecretSubjectiveMemories(subjectiveMemories, protectedSecrets)
 	subjectiveMemories = appendIdentityAccuracySubjectiveMemories(subjectiveMemories, characterIdentityAccuracy)
 	out["protected_secrets"] = protectedSecrets
@@ -944,6 +2606,7 @@ func enrichNormalizedCriticExtractionForFocusedRecall(extraction map[string]any,
 			extraction["turn_summary"] = summary
 		}
 	}
+	extraction["evidence_excerpts"] = criticDirectEvidenceExcerpts(extraction, userInput, assistantContent)
 	if len(stringsFromAny(extraction["evidence_excerpts"])) == 0 {
 		if excerpts := focusedRecallFallbackEvidenceExcerpts(userInput, assistantContent); len(excerpts) > 0 {
 			extraction["evidence_excerpts"] = excerpts
@@ -956,6 +2619,117 @@ func enrichNormalizedCriticExtractionForFocusedRecall(extraction map[string]any,
 		}
 	}
 	return extraction
+}
+
+func normalizeCriticPendingThreads(raw any) []any {
+	out := []any{}
+	for _, candidate := range sliceFromAny(raw) {
+		thread := mapFromAny(candidate)
+		if len(thread) == 0 {
+			continue
+		}
+		if threadType := normalizeCriticPendingThreadType(stringFromMap(thread, "thread_type")); threadType != "" {
+			thread["thread_type"] = threadType
+		}
+		out = append(out, thread)
+	}
+	return out
+}
+
+func normalizeCriticPendingThreadType(raw string) string {
+	var token []rune
+	separator := false
+	for _, r := range strings.ToLower(strings.TrimSpace(raw)) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsNumber(r):
+			if separator && len(token) > 0 {
+				token = append(token, '_')
+			}
+			token = append(token, r)
+			separator = false
+		default:
+			separator = true
+		}
+	}
+	switch strings.Trim(string(token), "_") {
+	case "promise", "promises", "commitment", "commitments":
+		return "promise"
+	case "unresolved_goal", "unresolved_goals", "open_goal", "open_goals", "goal", "goals":
+		return "unresolved_goal"
+	case "open_question", "open_questions", "unresolved_question", "unresolved_questions", "question", "questions":
+		return "open_question"
+	case "risk", "risks", "threat", "threats":
+		return "risk"
+	case "emotional_debt", "emotional_debts", "emotional_obligation", "emotional_obligations":
+		return "emotional_debt"
+	default:
+		return ""
+	}
+}
+
+func normalizeCriticBeliefUpdates(raw any) []any {
+	out := []any{}
+	for _, candidate := range sliceFromAny(raw) {
+		item := mapFromAny(candidate)
+		if len(item) == 0 {
+			continue
+		}
+		if strings.TrimSpace(stringFromMap(item, "subject")) == "" {
+			item["subject"] = extractionFirstNonEmpty(stringFromMap(item, "topic"), stringFromMap(item, "fact_subject"))
+		}
+		if strings.TrimSpace(stringFromMap(item, "state_slot")) == "" {
+			item["state_slot"] = extractionFirstNonEmpty(stringFromMap(item, "slot"), stringFromMap(item, "relation_dimension"))
+		}
+		if strings.TrimSpace(stringFromMap(item, "value")) == "" {
+			item["value"] = extractionFirstNonEmpty(stringFromMap(item, "claim"), stringFromMap(item, "fact"), stringFromMap(item, "belief"))
+		}
+		if strings.TrimSpace(stringFromMap(item, "speaker_name")) == "" {
+			item["speaker_name"] = extractionFirstNonEmpty(stringFromMap(item, "speaker"), stringFromMap(item, "actor"))
+		}
+		if strings.TrimSpace(stringFromMap(item, "evidence_excerpt")) == "" {
+			item["evidence_excerpt"] = extractionFirstNonEmpty(stringFromMap(item, "evidence"), stringFromMap(item, "source_excerpt"))
+		}
+		listeners := append([]string{}, stringsFromAny(item["listener_names"])...)
+		for _, listener := range []string{
+			stringFromMap(item, "listener_name"),
+			stringFromMap(item, "knowledge_holder"),
+		} {
+			listener = strings.TrimSpace(listener)
+			if listener != "" && !slices.Contains(listeners, listener) {
+				listeners = append(listeners, listener)
+			}
+		}
+		if len(listeners) > 0 {
+			item["listener_names"] = listeners
+		}
+		if strings.TrimSpace(stringFromMap(item, "perspective_owner")) == "" && len(listeners) == 1 {
+			item["perspective_owner"] = listeners[0]
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func criticDirectEvidenceExcerpts(extraction map[string]any, userInput, assistantContent string) []string {
+	source := strings.TrimSpace(strings.Join([]string{userInput, assistantContent}, "\n"))
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(candidate string) {
+		excerpt := sanitizeEvidenceExcerptForTurn(candidate, source)
+		key := normalizeArtifactDedupeText(excerpt)
+		if excerpt == "" || key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, excerpt)
+	}
+	for _, excerpt := range stringsFromAny(extraction["evidence_excerpts"]) {
+		add(excerpt)
+	}
+	if clock := mapFromAny(extraction["story_clock"]); len(clock) > 0 {
+		add(stringFromMap(clock, "evidence_excerpt"))
+	}
+	return out
 }
 
 func normalizeCriticTurnSummary(value any) string {
@@ -991,12 +2765,14 @@ func looksLikeStructuredCriticPayloadText(text string) bool {
 	for _, marker := range []string{
 		"archive_hint",
 		"character_deltas",
-		"entity_conditions",
+		"reversible_states",
 		"evidence_excerpts",
 		"kg_triples",
 		"pending_threads",
-		"physical_conditions",
 		"relationship_memory",
+		"habit_observations",
+		"character_profile_observations",
+		"voice_observations",
 		"narrative_events",
 		"state_claims",
 		"belief_updates",
@@ -1013,8 +2789,8 @@ func looksLikeStructuredCriticPayloadText(text string) bool {
 }
 
 func focusedRecallFallbackSummary(userInput, assistantContent string) string {
-	user := focusedRecallFirstExcerpt(userInput, 220)
-	assistant := focusedRecallFirstExcerpt(assistantContent, 360)
+	user := strings.TrimSpace(sanitizeCriticStorageText(userInput))
+	assistant := strings.TrimSpace(sanitizeCriticStorageText(assistantContent))
 	parts := []string{}
 	if user != "" {
 		parts = append(parts, "user: "+user)
@@ -1022,7 +2798,7 @@ func focusedRecallFallbackSummary(userInput, assistantContent string) string {
 	if assistant != "" {
 		parts = append(parts, "assistant: "+assistant)
 	}
-	return truncateRunes(strings.Join(parts, " / "), 700)
+	return strings.Join(parts, " / ")
 }
 
 func focusedRecallFallbackEvidenceExcerpts(userInput, assistantContent string) []string {
@@ -1033,23 +2809,11 @@ func focusedRecallFallbackEvidenceExcerpts(userInput, assistantContent string) [
 				continue
 			}
 			out = append(out, excerpt)
-			if len(out) >= 3 {
-				return
-			}
 		}
 	}
 	add(userInput)
-	if len(out) < 3 {
-		add(assistantContent)
-	}
+	add(assistantContent)
 	return out
-}
-
-func focusedRecallFirstExcerpt(text string, limit int) string {
-	for _, item := range focusedRecallExcerptCandidates(text) {
-		return truncateRunes(item, limit)
-	}
-	return ""
 }
 
 func focusedRecallExcerptCandidates(text string) []string {
@@ -1068,14 +2832,11 @@ func focusedRecallExcerptCandidates(text string) []string {
 			if !looksLikeFocusedRecallExcerpt(piece) {
 				continue
 			}
-			candidates = append(candidates, truncateRunes(piece, 240))
-			if len(candidates) >= 4 {
-				return candidates
-			}
+			candidates = append(candidates, piece)
 		}
 	}
 	if len(candidates) == 0 && looksLikeFocusedRecallExcerpt(text) {
-		candidates = append(candidates, truncateRunes(text, 240))
+		candidates = append(candidates, text)
 	}
 	return candidates
 }

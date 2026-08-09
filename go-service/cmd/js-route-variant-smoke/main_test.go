@@ -78,7 +78,7 @@ func TestArchiveCenterJSCanonPackAndDiscoveryUIMarkers(t *testing.T) {
 		`["community_wiki"]`,
 		`body.work_id = state.selectedWorkId;`,
 		`body.continuity_id = state.selectedContinuityId;`,
-		`timeoutMs: getSourceDiscoveryRequestTimeoutMs()`,
+		`const data = await bridgeFetch("/source-discovery/jobs/v1", {`,
 		`/admit/v1`,
 		`confirm_evidence_validated_batch: true`,
 		`max_completion_tokens: getSubLlmMaxCompletionTokensSetting(settings.subLlmMaxCompletionTokens)`,
@@ -299,6 +299,8 @@ const settings = {auxiliaryInjectionPlacement:"before_latest_user",auxiliaryInje
 const runtimeUpdates = [];
 function updateRuntimeState(key,status,detail) { runtimeUpdates.push({key,status,detail}); }
 function warnLog() { throw new Error("unexpected production warning"); }
+const RECOMPOSER_BRIDGE_CONTRACT = "archive_center_recomposer_bridge.v1";
+function publishArchiveCenterRecomposerBridge() { return false; }
 const memoryDeliveryPlan = {
   contract_version: "memory_delivery_plan.v1",
   classes: [{key: "event_recent", text: "MEMORY"}]
@@ -486,11 +488,6 @@ func TestArchiveCenterJSRerollRollbackPath(t *testing.T) {
 		"single_assistant_msg_removed",
 		"msg_decrease_and_tail_change",
 		"duplicate_rollback_blocked",
-		"ROLLBACK_PROMOTED_ASSISTANT_SYNC_GRACE_MS",
-		"function assessPromotedAssistantSyncRollbackGuard",
-		"recent_completed_turn_waiting_active_chat_sync",
-		"pending_active_chat_confirmation",
-		"skipSnapshotUpdate",
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -524,12 +521,76 @@ func TestArchiveCenterJSProjectConfigGUIRuntimeMarkers(t *testing.T) {
 		`<select id="mo-narrativeGuideStrength"`,
 		`<option value="none"`,
 		`guide_strength: settings.narrativeGuideStrength || "weak"`,
-		`Strength: weak. Keep this nearly invisible`,
-		`Strength: strong. Be more active about pacing`,
+		`Weak proposes response focus`,
+		`Strong adds an arc anchor and preferred frontier`,
+		`coreObjectiveMemoryMaxItems: 5`,
+		`core_objective_memory_max_items: sanitizeTopKSetting(`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing project config GUI/runtime marker %q", needle)
+		}
+	}
+}
+
+func TestArchiveCenterJSOpenAICompatibleGatewayAndServiceTierMarkers(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	required := []string{
+		`"openrouter", "llmgateway", "vercel", "vertex"`,
+		`<option value="llmgateway"${s.pluginMainProvider === "llmgateway" ? " selected" : ""}>LLM Gateway</option>`,
+		`<option value="llmgateway"${s.subLlmProvider === "llmgateway" ? " selected" : ""}>LLM Gateway</option>`,
+		`<option value="vercel"${s.pluginMainProvider === "vercel" ? " selected" : ""}>Vercel AI Gateway</option>`,
+		`<option value="vercel"${s.subLlmProvider === "vercel" ? " selected" : ""}>Vercel AI Gateway</option>`,
+		`pluginMainLlmGatewayServiceTier: "standard"`,
+		`subLlmLlmGatewayServiceTier: "standard"`,
+		`function normalizeLlmGatewayServiceTierSetting(value)`,
+		`if (serviceTier !== "standard")`,
+		`payload.llm_gateway_service_tier = serviceTier`,
+		`mainLlmGatewayServiceTier: mainOverrides.llmGatewayServiceTier`,
+		`criticLlmGatewayServiceTier: criticOverrides.llmGatewayServiceTier`,
+		`supervisorLlmGatewayServiceTier: mainOverrides.llmGatewayServiceTier`,
+		`llm_gateway_service_tier: criticOverrides.llmGatewayServiceTier`,
+		`id="mo-pluginMainLlmGatewayServiceTier"`,
+		`id="mo-subLlmLlmGatewayServiceTier"`,
+		`https://api.llmgateway.io/v1`,
+		`https://ai-gateway.vercel.sh/v1`,
+		`OpenAI-Compatible Service Tier`,
+		`testBody.llm_gateway_service_tier = testLlmGatewayServiceTier`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js missing LLM Gateway marker %q", needle)
+		}
+	}
+}
+
+func TestArchiveCenterJSClaudePromptCacheMarkers(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	required := []string{
+		`const CLAUDE_PROMPT_CACHE_MODE_OPTIONS = Object.freeze(["off", "ephemeral_5m", "ephemeral_1h"])`,
+		`pluginMainClaudePromptCacheMode: "off"`,
+		`subLlmClaudePromptCacheMode: "off"`,
+		`function normalizeClaudePromptCacheModeSetting(value)`,
+		`payload.claude_prompt_cache_mode = normalizeClaudePromptCacheModeSetting(`,
+		`mainClaudePromptCacheMode: mainOverrides.claudePromptCacheMode`,
+		`criticClaudePromptCacheMode: criticOverrides.claudePromptCacheMode`,
+		`supervisorClaudePromptCacheMode: mainOverrides.claudePromptCacheMode`,
+		`claude_prompt_cache_mode: criticOverrides.claudePromptCacheMode`,
+		`id="mo-pluginMainClaudePromptCacheMode"`,
+		`id="mo-subLlmClaudePromptCacheMode"`,
+		`>Automatic 5 min</option>`,
+		`>Automatic 1 hour</option>`,
+		`syncProviderSpecificRow("mo-pluginMainProvider", "mo-pluginMainClaudePromptCacheModeRow", "claude")`,
+		`syncProviderSpecificRow("mo-subLlmProvider", "mo-subLlmClaudePromptCacheModeRow", "claude")`,
+		`testBody.claude_prompt_cache_mode = testClaudePromptCacheMode`,
+		`extraBodyJson: sanitizeProviderOverrideJsonSetting(`,
+		`if (extraBody) payload.extra_body_json = extraBody;`,
+		`const BUILD_NOTES = "Archive Center 3.9.9"`,
+		`비용: 5분 캐시 쓰기 1.25배, 1시간 쓰기 2배, 캐시 읽기 0.1배`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js missing Claude prompt cache marker %q", needle)
 		}
 	}
 }
@@ -552,7 +613,7 @@ func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndNoStaleBudgetPreview(t
 		`${t('settings.option.auxiliaryInjectionPlacement.auto')}`,
 		`${t('settings.hint.auxiliaryInjectionAnchorMarker')}`,
 		`const prepareInjectionBudget = estimateAdaptiveInjectionBudgetParts(settings, prepareOptions.runtimeTokenInfo || null);`,
-		`max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.budgetLimit,`,
+		`max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.configuredBudgetChars,`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -578,7 +639,8 @@ func TestArchiveCenterJSAuxiliaryInjectionPlacementI18nAndNoStaleBudgetPreview(t
 func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		`"settings.section.common.desc": "Backend supervisor, critic, embedding, and input support settings. Input support adds auxiliary context only; the latest user input is not rewritten in 2.4 RC2 default mode."`,
+		`"settings.section.common.desc": "The previous completed turn is included as continuity context by default. The optional input-improvement LLM is independent from narrative guidance."`,
+		`"settings.label.pluginMainApplyMode": "Input Improvement LLM (Optional)"`,
 		`merged.dbEnabled = true;`,
 		`merged.supervisorEnabled = true;`,
 		`settings.pluginMainApplyMode`,
@@ -596,6 +658,10 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 		`id="mo-dbEnabled"`,
 		`id="mo-supervisorEnabled"`,
 		`mo-injection-budget-preview`,
+		`<select id="mo-narrativeGuideStrength"${s.pluginMainApplyMode === "off"`,
+		`const syncInputImprovementDependentControls =`,
+		`if (_narrativeGuideOff) return Promise.resolve(null);`,
+		`reasoningSummary: "guide_off"`,
 	}
 	for _, needle := range forbidden {
 		if strings.Contains(src, needle) {
@@ -604,24 +670,23 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 	}
 }
 
-func TestSeq01NarrativeStanceLabelsAndResumeTriggerCustomUIRemoved(t *testing.T) {
+func TestSeq01DeadNarrativeStanceAndResumeTriggerCustomUIRemoved(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		`storyNarrativeStance: "balanced"`,
-		`"settings.label.storyNarrativeStance": "Story Direction Style"`,
-		`<select id="mo-storyNarrativeStance"`,
-		`<option value="reactive"`,
-		`<option value="balanced"`,
-		`<option value="proactive"`,
-		`storyNarrativeStance: $("mo-storyNarrativeStance").value`,
+		`<select id="mo-narrativeGuideStrength">`,
 		`pluginMainApplyMode: $("mo-pluginMainApplyMode").value`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
-			t.Fatalf("Archive Center.js missing SEQ-01 narrative stance marker %q", needle)
+			t.Fatalf("Archive Center.js missing SEQ-01 narrative guide marker %q", needle)
 		}
 	}
 	forbidden := []string{
+		`storyNarrativeStance`,
+		`mo-storyNarrativeStance`,
+		`NARRATIVE_STANCE_MODES`,
+		`buildInitiativeModeSuffix`,
+		`buildInitiativeModeBounds`,
 		`resumeTrigger`,
 		`customResumeTrigger`,
 		`mo-resumeTrigger`,
@@ -637,8 +702,9 @@ func TestSeq01NarrativeGuideAutoTraceDashboardAndLegacyCleanupMarkers(t *testing
 	src := readArchiveCenterJS(t)
 	required := []string{
 		`narrativeGuideMode: "auto"`,
-		`"settings.label.narrativeGuideMode.help": "Auto mode combines recent input, scene pressure, emotional intensity, combat, and relationship signals, then exposes the resolved mode in trace and dashboard."`,
-		`let _guideModeRuntimeCache = { lastMode: null, lastProbe: "", consecutiveSame: 0 };`,
+		`"settings.label.narrativeGuideMode.help": "Auto does not infer genre from story keywords; it uses Standard. Genre-specific modes apply only when selected explicitly."`,
+		`<select id="mo-narrativeGuideMode">`,
+		`guide_mode: requestedGuideMode`,
 		`const supervisorResult = (preparedBundle && preparedBundle.supervisorResult)`,
 		`guideModeBasis: (supervisorResult && supervisorResult._guideModeBasis) || "manual"`,
 		`const guideModeDashboardState = lastGuideSupervisor && lastGuideSupervisor.guideMode`,
@@ -654,6 +720,16 @@ func TestSeq01NarrativeGuideAutoTraceDashboardAndLegacyCleanupMarkers(t *testing
 			t.Fatalf("Archive Center.js missing SEQ-01 narrative guide/legacy cleanup marker %q", needle)
 		}
 	}
+	forbidden := []string{
+		`let _guideModeRuntimeCache =`,
+		`function resolveNarrativeGuideMode(`,
+		`function inferNarrativeGuideModeFromText(`,
+	}
+	for _, needle := range forbidden {
+		if strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js still contains removed JavaScript narrative guide policy %q", needle)
+		}
+	}
 }
 
 func TestSeq01SettingsSaveResetAndBridgeConfigMarkers(t *testing.T) {
@@ -661,12 +737,13 @@ func TestSeq01SettingsSaveResetAndBridgeConfigMarkers(t *testing.T) {
 	required := []string{
 		`async function saveSettings()`,
 		`await persistentSet(SETTINGS_KEY, json)`,
-		`await syncConfigToBackend(settings);`,
+		`const syncAck = await syncConfigToBackend(settings);`,
 		`warnLog("Settings save failed:", err.message);`,
 		`return false;`,
 		`function attachSettingsEvents()`,
 		`$("mo-save-btn").addEventListener("click", async () => {`,
 		`$("mo-reset-btn").addEventListener("click", async () => {`,
+		`!confirm(t("settings.confirm.resetDefaults"))`,
 		`settings = { ...DEFAULT_SETTINGS };`,
 		`await saveSettings();`,
 		`<input type="text" id="mo-bridgeUrl"`,
@@ -675,6 +752,7 @@ func TestSeq01SettingsSaveResetAndBridgeConfigMarkers(t *testing.T) {
 		`settings.bridgeUrl = sanitizeBridgeUrl(`,
 		`settings.requestTimeoutMs = getCurrentUiRequestTimeoutMs();`,
 		`topK: $("mo-topK").value`,
+		`failedQueueMaxAttempts: failedQueueMaxAttempts(),`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -700,6 +778,20 @@ func TestSeq01RuntimeStateNarrativeTypeAndSearchCallMarkers(t *testing.T) {
 	}
 }
 
+func TestSeq01BridgeTimeoutAppliesToNativeAndFallbackFetch(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	required := []string{
+		`fetchPromise = R.nativeFetch(url, fetchInit);`,
+		`fetchPromise = fetch(url, fetchInit);`,
+		`response = timeoutPromise ? await Promise.race([fetchPromise, timeoutPromise]) : await fetchPromise;`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js missing optional bridge timeout path %q", needle)
+		}
+	}
+}
+
 func TestSeq02SessionAwareExplorerSyncMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
@@ -717,6 +809,24 @@ func TestSeq02SessionAwareExplorerSyncMarkers(t *testing.T) {
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing SEQ-02 session-aware explorer sync marker %q", needle)
+		}
+	}
+}
+
+func TestExplorerChatLogsRenderLogicalTurnsWithTwoRawPanes(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	required := []string{
+		`const userRow = item.user && typeof item.user === "object" ? item.user : null;`,
+		`const assistantRow = item.assistant && typeof item.assistant === "object" ? item.assistant : null;`,
+		`t('explorer.chatLogs.userInput')`,
+		`t('explorer.chatLogs.assistantOutput')`,
+		`mo-chat-turn-panes`,
+		`if (assistantRow && item.turn_index != null && sessionMatch)`,
+		`if (row && (row.user || row.assistant))`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js missing logical chat turn marker %q", needle)
 		}
 	}
 }
@@ -755,6 +865,10 @@ func TestArchiveCenterJSPluginMainRuntimeWiringMarkers(t *testing.T) {
 		"supervisorEndpoint: typeof s.pluginMainEndpoint === \"string\" ? s.pluginMainEndpoint : \"\"",
 		"supervisorModel: typeof s.pluginMainModel === \"string\" ? s.pluginMainModel : \"\"",
 		"mainTimeout: Math.ceil(getPluginMainTimeoutSettingMs(s.pluginMainTimeoutMs) / 1000)",
+		"const runtimeSynced = !!(trace && trace.synced === true);",
+		"async function ensureBackendRuntimeConfigBinding(backendInstanceId)",
+		"settings_runtime_bound_to_backend_instance",
+		`client_meta: buildAdminRuntimeClientMeta({ source: "hypamemory_import" })`,
 		"function pluginMainHasConfig()",
 		"settings.pluginMainApiKey.trim()",
 		"settings.pluginMainEndpoint.trim()",
@@ -776,6 +890,50 @@ func TestArchiveCenterJSPluginMainRuntimeWiringMarkers(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigBindsOncePerBackendInstanceBeforeFullPrepare(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	beforeRequest := extractJSFunctionBlockForTest(t, src, "async function onBeforeRequest(payload, type)")
+	sourceDecision := strings.Index(beforeRequest, "const sourceDecisionResult = await tryPrepareTurn(")
+	runtimeBinding := strings.Index(beforeRequest, "const runtimeConfigBinding = await ensureBackendRuntimeConfigBinding(")
+	fullPrepare := strings.Index(beforeRequest, "const preparedTurnResult = await tryPrepareTurn(")
+	if sourceDecision < 0 || runtimeBinding < 0 || fullPrepare < 0 {
+		t.Fatalf("runtime config binding markers missing: source=%d binding=%d full=%d", sourceDecision, runtimeBinding, fullPrepare)
+	}
+	if !(sourceDecision < runtimeBinding && runtimeBinding < fullPrepare) {
+		t.Fatalf("runtime config must bind after backend reachability and before full prepare: source=%d binding=%d full=%d", sourceDecision, runtimeBinding, fullPrepare)
+	}
+	if strings.Contains(beforeRequest, "await syncConfigToBackend(settings)") {
+		t.Fatal("normal turn path still performs an unconditional runtime config update")
+	}
+}
+
+func TestResetDefaultsRequiresConfirmationBeforeMutation(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	start := strings.Index(src, `$("mo-reset-btn").addEventListener("click", async () => {`)
+	if start < 0 {
+		t.Fatal("reset handler missing")
+	}
+	handler := src[start:]
+	confirmIndex := strings.Index(handler, `!confirm(t("settings.confirm.resetDefaults"))`)
+	mutationIndex := strings.Index(handler, `settings = { ...DEFAULT_SETTINGS };`)
+	if confirmIndex < 0 || mutationIndex < 0 || confirmIndex > mutationIndex {
+		t.Fatalf("reset confirmation must precede settings mutation: confirm=%d mutation=%d", confirmIndex, mutationIndex)
+	}
+}
+
+func TestNormalTurnPayloadDoesNotRepeatRuntimeCredentials(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	prepare := extractJSFunctionBlockForTest(t, src, "async function tryPrepareTurn(")
+	complete := extractJSFunctionBlockForTest(t, src, "async function buildCompleteTurnRequestBody(")
+	for name, block := range map[string]string{"prepare-turn": prepare, "complete-turn": complete} {
+		for _, forbidden := range []string{"client_meta.embedding", "client_meta.critic", "api_key: effectiveCritic", "api_key: embeddingApiKey"} {
+			if strings.Contains(block, forbidden) {
+				t.Fatalf("%s repeats runtime credentials through %q", name, forbidden)
+			}
+		}
+	}
+}
+
 func TestArchiveCenterJSSessionIsolationMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
@@ -783,7 +941,7 @@ func TestArchiveCenterJSSessionIsolationMarkers(t *testing.T) {
 		"function isCidSessionId(sessionId)",
 		"function isIndexSessionId(sessionId)",
 		"`char_${charIdx}_cid_${chatUniqueId}`",
-		"savePinnedSessionId(charIdx, chatIdx, sessionId, chatUniqueId)",
+		"savePinnedSessionId(charIdx, chatIdx, sessionId, chatUniqueId, stableCharacterId)",
 		"cacheRawInputForSession(sessionId, rawInput)",
 		"peekRawInputForSession(sessionId)",
 		"async function resolveCanonicalWriteSessionId(rawSessionId",
@@ -828,14 +986,15 @@ func TestArchiveCenterJSSeq03RMG03SessionKeyHotfixMarkers(t *testing.T) {
 		"(cidSessionId && isIndexSessionId(pinnedSessionId)) ? cidSessionId : pinnedSessionId",
 		"else if (isIndexSessionId(pinnedSessionId))",
 		"sessionId = cidSessionId || pinnedSessionId",
-		"savePinnedSessionId(charIdx, chatIdx, sessionId, chatUniqueId)",
+		"savePinnedSessionId(charIdx, chatIdx, sessionId, chatUniqueId, stableCharacterId)",
 		"observedChatUniqueId: String(observedChatUniqueId || \"\").trim()",
 		"function buildRawInputSessionKeys(sessionId)",
 		"primary.match(/^(char_\\d+)_(?:cid_.+|chat_\\d+)$/)",
 		"addRawInputSessionKey(keys, seen, charAliasMatch[1])",
 		"addRawInputSessionKey(keys, seen, SESSION_FALLBACK)",
-		"const maxAge = key === SESSION_FALLBACK",
-		"RAW_INPUT_FALLBACK_MAX_AGE_MS",
+		"function bindRawInputObservationToRequest(sessionId, requestId)",
+		"observation.boundRequestId = String(requestId)",
+		"if (candidate === observation) _rawInputBySession.delete(key)",
 		"const _sessionTurnIndices = new Map()",
 		"const SESSION_TURN_MAP_MAX = 50",
 		"function getSessionTurnIndex(sessionId)",
@@ -1052,7 +1211,8 @@ func TestArchiveCenterJSI18nRuntimeSwitchAndPersistenceBehavior(t *testing.T) {
 	if i18nStart < 0 || i18nEnd < 0 || i18nEnd <= i18nStart {
 		t.Fatalf("Archive Center.js missing i18n dictionary block")
 	}
-	script := src[i18nStart:i18nEnd] + "\n" +
+	script := `const VERSION = "3.7.0-dev";` + "\n" +
+		src[i18nStart:i18nEnd] + "\n" +
 		extractJSFunctionBlockForTest(t, src, "function t(key, overrideLang)") + "\n" +
 		extractJSFunctionBlockForTest(t, src, "async function applyUiLanguageChange(nextLang)") + `
 const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
@@ -1086,6 +1246,7 @@ async function renderSettingsPanel() { renderCount++; }
 (async () => {
   assert(t("settings.title", "ko").includes("설정"), "ko settings title missing");
   assert(t("settings.title", "en").includes("Settings"), "en settings title missing");
+  assert(t("settings.title", "en").includes(VERSION), "settings title is not synchronized with VERSION");
   assert(t("settings.title", "ja").includes("設定"), "ja settings title missing");
   assert(t("missing.seq05.key", "ja") === "missing.seq05.key", "missing key fallback regressed");
   await applyUiLanguageChange("ja");

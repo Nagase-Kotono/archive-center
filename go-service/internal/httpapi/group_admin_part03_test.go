@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/risulongmemory/archive-center-go/internal/config"
+	"github.com/risulongmemory/archive-center-go/internal/dto"
 	"github.com/risulongmemory/archive-center-go/internal/store"
 	"github.com/risulongmemory/archive-center-go/internal/vector"
 )
@@ -118,6 +121,38 @@ func TestAdminReindexSkipsAlreadyCurrentIndexWithoutForce(t *testing.T) {
 	}
 	if len(vec.docs) != 1 {
 		t.Fatalf("already-current reindex must not upsert duplicates: %#v", vec.docs)
+	}
+}
+
+func TestAdminReindexZeroLimitProcessesWholeCandidateSet(t *testing.T) {
+	const candidateCount = 250
+	memories := make([]store.Memory, 0, candidateCount)
+	for index := 1; index <= candidateCount; index++ {
+		memories = append(memories, store.Memory{
+			ID:             int64(index),
+			ChatSessionID:  "sess-reindex-unlimited",
+			TurnIndex:      index,
+			SummaryJSON:    fmt.Sprintf(`{"summary":"memory %d"}`, index),
+			Embedding:      `[0.1,0.2,0.3]`,
+			EmbeddingModel: "test-embedding",
+		})
+	}
+	srv := NewServer(config.Default())
+	srv.Store = &turnRecordingStore{returnMemories: memories}
+	srv.StoreOpenError = nil
+
+	result, err := srv.runAdminReindexJob(
+		context.Background(),
+		"sess-reindex-unlimited",
+		map[string]any{"max_items": 0, "dry_run": true},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("runAdminReindexJob: %v", err)
+	}
+	if intFromAny(result["max_items"], -1) != 0 ||
+		intFromAny(result["candidates"], 0) != candidateCount {
+		t.Fatalf("result=%#v", result)
 	}
 }
 
@@ -467,5 +502,314 @@ func TestAdminSessionNormalizePreservesExplicitForceOptions(t *testing.T) {
 	resume := false
 	if !adminSessionNormalizeForceReindex(adminSessionNormalizeRequest{ForceReindex: &force, ResumeExisting: &resume}) {
 		t.Fatal("explicit force_reindex=true must remain available")
+	}
+}
+
+func TestAdminSessionNormalizeHasNoHistoricalHostSourceSynthesisContract(t *testing.T) {
+	meta := adminSessionNormalizeClientMeta(map[string]any{
+		"source": "explorer_session_normalize",
+	})
+	if _, exists := meta["session_normalize_inline_reprocessing"]; exists {
+		t.Fatalf("Session Normalize retained inline Critic control: %#v", meta)
+	}
+	request := adminSessionNormalizeJobRequest(
+		"sess-normalize-canonical-only",
+		adminSessionNormalizeRequest{},
+		nil,
+	)
+	if _, exists := request["source_observation_count"]; exists {
+		t.Fatalf("Session Normalize retained historical host-source metadata: %#v", request)
+	}
+}
+
+type canonicalRawReplaySessionNormalizeStore struct {
+	*memoryAdmissionWorkerStore
+	sources map[string]*store.MemorySourceRevision
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) SaveCriticInputSnapshot(
+	_ context.Context,
+	_ string,
+	revision string,
+	snapshotJSON string,
+	snapshotHash string,
+	_ time.Time,
+) error {
+	source := f.sources[revision]
+	if source == nil {
+		return store.ErrNotFound
+	}
+	source.CriticInputSnapshotJSON = snapshotJSON
+	source.CriticInputSnapshotHash = snapshotHash
+	return nil
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) RegisterAcceptedSourceRevision(
+	_ context.Context,
+	source *store.MemorySourceRevision,
+) (store.SourceRevisionRegistration, error) {
+	if source == nil {
+		return store.SourceRevisionRegistration{}, errors.New("source is required")
+	}
+	if f.sources == nil {
+		f.sources = map[string]*store.MemorySourceRevision{}
+	}
+	if existing := f.sources[source.SourceRevision]; existing != nil {
+		return store.SourceRevisionRegistration{Idempotent: true}, nil
+	}
+	copySource := *source
+	f.sources[source.SourceRevision] = &copySource
+	return store.SourceRevisionRegistration{Inserted: true}, nil
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) GetSourceRevision(
+	_ context.Context,
+	_ string,
+	sourceRevision string,
+) (*store.MemorySourceRevision, error) {
+	source := f.sources[sourceRevision]
+	if source == nil {
+		return nil, store.ErrNotFound
+	}
+	copySource := *source
+	return &copySource, nil
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) IsSourceRevisionActive(
+	ctx context.Context,
+	sid string,
+	sourceRevision string,
+) (bool, error) {
+	source, err := f.GetSourceRevision(ctx, sid, sourceRevision)
+	if err != nil {
+		return false, err
+	}
+	return source.LifecycleState == "active", nil
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) ListActiveSourceRevisions(
+	_ context.Context,
+	sid string,
+	fromTurn int,
+	toTurn int,
+) ([]store.MemorySourceRevision, error) {
+	out := []store.MemorySourceRevision{}
+	for _, source := range f.sources {
+		if source == nil ||
+			source.ChatSessionID != sid ||
+			source.LifecycleState != "active" ||
+			(fromTurn > 0 && source.TurnIndex < fromTurn) ||
+			(toTurn > 0 && source.TurnIndex > toTurn) {
+			continue
+		}
+		out = append(out, *source)
+	}
+	return out, nil
+}
+
+func (f *canonicalRawReplaySessionNormalizeStore) CommitMemoryAdmission(
+	ctx context.Context,
+	item *store.MemoryAdmission,
+) (store.MemoryAdmissionResult, error) {
+	result, err := f.memoryAdmissionWorkerStore.CommitMemoryAdmission(ctx, item)
+	if err == nil && item != nil && item.Memory != nil {
+		f.memories = append(f.memories, *item.Memory)
+	}
+	return result, err
+}
+
+func TestAdminSessionNormalizeReplaysCanonicalRawLogsThroughSharedDerivationOwner(t *testing.T) {
+	const sid = "sess-normalize-canonical-raw-replay"
+	logs := []store.ChatLog{
+		{ChatSessionID: sid, TurnIndex: 1, Role: "user", Content: "The traveler reaches the gate."},
+		{ChatSessionID: sid, TurnIndex: 1, Role: "assistant", Content: "The guard refuses entry until dawn."},
+	}
+	fake := &canonicalRawReplaySessionNormalizeStore{
+		memoryAdmissionWorkerStore: &memoryAdmissionWorkerStore{
+			Store: store.NewNoopStore(),
+			logs:  logs,
+			memories: []store.Memory{{
+				ChatSessionID: sid,
+				TurnIndex:     1,
+				SummaryJSON:   `{"turn_summary":"preexisting partial memory"}`,
+			}},
+		},
+		sources: map[string]*store.MemorySourceRevision{},
+	}
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	srv := NewServer(cfg)
+	srv.Store = fake
+	srv.StoreOpenError = nil
+
+	oldClient := proxyHTTPClient
+	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{
+					"content": `{"turn_summary":"The guard refused entry until dawn.","importance_score":6}`,
+				},
+			}},
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+		}, nil
+	})}
+	defer func() { proxyHTTPClient = oldClient }()
+
+	request := adminSessionNormalizeRequest{
+		SkipRepair:  true,
+		SkipReindex: true,
+		ClientMeta: map[string]any{
+			"critic": map[string]any{
+				"api_key":    "test-key",
+				"endpoint":   "https://api.example.com/v1",
+				"model":      "critic",
+				"provider":   "openai",
+				"timeout_ms": 45000,
+			},
+		},
+	}
+	result, err := srv.runAdminSessionNormalize(context.Background(), sid, request, nil)
+	if err != nil {
+		t.Fatalf("runAdminSessionNormalize: %v", err)
+	}
+	rescan := mapFromAny(result["rescan"])
+	if result["status"] != "ok" ||
+		intFromAny(rescan["candidate_count"], 0) != len(logs)/2 ||
+		intFromAny(rescan["succeeded"], 0) != len(logs)/2 ||
+		intFromAny(rescan["failed"], -1) != 0 ||
+		len(fake.admissions) != len(logs)/2 ||
+		len(fake.enqueuedJobs) != 0 {
+		t.Fatalf(
+			"status=%v rescan=%#v admissions=%d queued=%d",
+			result["status"], rescan, len(fake.admissions), len(fake.enqueuedJobs),
+		)
+	}
+	if _, exists := result["source_revisions"]; exists {
+		t.Fatalf("removed historical source stage leaked into result: %#v", result)
+	}
+	if len(fake.sources) != len(logs)/2 {
+		t.Fatalf("canonical replay sources=%d, want=%d", len(fake.sources), len(logs)/2)
+	}
+	for _, source := range fake.sources {
+		if !strings.HasPrefix(source.SourceRevision, "sar_") ||
+			!strings.HasPrefix(source.LogicalTurnID, "canonical_turn_") {
+			t.Fatalf("canonical raw replay synthesized a live host source: %#v", source)
+		}
+	}
+}
+
+func TestAdminSessionNormalizeDefersReindexForQueuedCanonicalReplay(t *testing.T) {
+	reasons := adminSessionNormalizeReindexDeferredReasons(map[string]any{
+		"status":   "deferred",
+		"deferred": 2,
+		"queued":   2,
+	})
+	joined := strings.Join(reasons, ",")
+	if !strings.Contains(joined, "rescan:deferred") ||
+		!strings.Contains(joined, "rescan:pending_reprocessing") {
+		t.Fatalf("queued canonical replay did not defer reindex: %#v", reasons)
+	}
+	if strings.Contains(joined, "source_revisions") {
+		t.Fatalf("removed historical source stage still controls reindex: %#v", reasons)
+	}
+}
+
+type blockingSessionNormalizeStore struct {
+	*memoryFakeStore
+	entered chan struct{}
+}
+
+func (f *blockingSessionNormalizeStore) ListChatLogs(ctx context.Context, sid string, from, to int) ([]store.ChatLog, error) {
+	if from == 1 && to == 1 {
+		close(f.entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return f.memoryFakeStore.ListChatLogs(ctx, sid, from, to)
+}
+
+func TestAdminSessionNormalizeRawRepairReportsRealCandidateCountAndCompletes(t *testing.T) {
+	userText := "The traveler reaches the old gate."
+	assistantText := "The guard refuses entry until dawn."
+	srv := NewServer(config.Default())
+	srv.Store = &memoryFakeStore{}
+	srv.StoreOpenError = nil
+
+	updates := []map[string]any{}
+	result, err := srv.runAdminSessionNormalize(context.Background(), "sess-normalize-complete", adminSessionNormalizeRequest{
+		RepairEntries: []dto.ChatLogRepairEntryRequest{{
+			TurnIndex:        1,
+			UserContent:      &userText,
+			AssistantContent: &assistantText,
+		}},
+		SkipRescan:  true,
+		SkipReindex: true,
+	}, func(progress map[string]any) {
+		updates = append(updates, cloneMapAny(progress))
+	})
+	if err != nil {
+		t.Fatalf("runAdminSessionNormalize: %v", err)
+	}
+	if result["status"] != "ok" {
+		t.Fatalf("result = %#v, want ok", result)
+	}
+	sawRawRepair := false
+	for _, update := range updates {
+		if update["stage"] != "raw_repair_replay" {
+			continue
+		}
+		sawRawRepair = true
+		if got := intFromAny(update["candidate_count"], 0); got != 1 {
+			t.Fatalf("raw repair candidate_count = %d, want 1: %#v", got, update)
+		}
+	}
+	if !sawRawRepair {
+		t.Fatalf("raw_repair_replay progress missing: %#v", updates)
+	}
+}
+
+func TestAdminSessionNormalizeCancellationReachesBlockedRawChatQuery(t *testing.T) {
+	userText := "The traveler reaches the old gate."
+	assistantText := "The guard refuses entry until dawn."
+	fake := &blockingSessionNormalizeStore{
+		memoryFakeStore: &memoryFakeStore{},
+		entered:         make(chan struct{}),
+	}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	srv.StoreOpenError = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := srv.runAdminSessionNormalize(ctx, "sess-normalize-cancel", adminSessionNormalizeRequest{
+			RepairEntries: []dto.ChatLogRepairEntryRequest{{
+				TurnIndex:        1,
+				UserContent:      &userText,
+				AssistantContent: &assistantText,
+			}},
+			SkipRescan:  true,
+			SkipReindex: true,
+		}, nil)
+		resultCh <- err
+	}()
+
+	select {
+	case <-fake.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session normalize did not reach raw chat query")
+	}
+	cancel()
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runAdminSessionNormalize error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session normalize did not stop after caller cancellation")
 	}
 }

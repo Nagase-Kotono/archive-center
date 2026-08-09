@@ -10,11 +10,11 @@ and the packaged license inventory must be regenerated and reviewed.
 
 ## Bundled runtimes
 
-### MariaDB Community Server 11.4.10
+### MariaDB Community Server 12.3.2
 
 - Project: https://mariadb.org/
 - License: GNU General Public License version 2 only
-- Corresponding source archive: https://archive.mariadb.org/mariadb-11.4.10/source/
+- Corresponding source archive: https://archive.mariadb.org/mariadb-12.3.2/source/
 - Archive Center package distribution: not bundled
 - Windows installation: downloaded directly from MariaDB's official
   distribution service and installed into the user's separate runtime
@@ -28,10 +28,12 @@ and `CREDITS` files remain inside the separately installed official runtime.
 
 - Project: https://github.com/chroma-core/chroma/tree/1.5.9
 - License: Apache License 2.0
-- License retained at:
+- Internal full-package license retained at:
   `runtime/ChromaDB/Lib/site-packages/chromadb-1.5.9.dist-info/licenses/LICENSE`
+- Windows managed-install license retained under:
+  `%LOCALAPPDATA%\ArchiveCenter\runtime\ChromaDB\1.5.9\Lib\site-packages\chromadb-1.5.9.dist-info\licenses`
 
-The bundled ChromaDB environment also contains CPython and Python packages.
+The bundled or managed ChromaDB environment also contains CPython and Python packages.
 Their license texts and notices are retained in the Python runtime and the
 respective `*.dist-info/licenses` directories. The audited 3.0.1 Windows
 runtime contained 79 `*.dist-info` package records and 109 package-level
@@ -42,7 +44,7 @@ The audited upstream runtime omitted package-local license files for
 `flatbuffers` 25.12.19 and `tokenizers` 0.23.1 even though their installed
 metadata identifies the Apache License 2.0. Archive Center retains the
 unmodified Apache License 2.0 text at `licenses/Apache-2.0.txt`. The Windows
-package builder copies that text into both exact `*.dist-info/licenses`
+internal full-package builder copies that text into both exact `*.dist-info/licenses`
 directories and stops the build if either dependency metadata directory or
 the license text is missing.
 
@@ -51,7 +53,9 @@ the license text is missing.
 - Project: https://www.python.org/
 - License: Python Software Foundation License Version 2 and the additional
   historical licenses included with CPython
-- License retained at: `runtime/ChromaDB/LICENSE.txt`
+- Internal full-package license retained at: `runtime/ChromaDB/LICENSE.txt`
+- Windows managed-install license retained at:
+  `%LOCALAPPDATA%\ArchiveCenter\runtime\Python\3.11.9\LICENSE.txt`
 
 ## Go modules used by Archive Center source and release tools
 
@@ -63,7 +67,7 @@ The standard Windows package executables audited for this release
 (`archive-center-go`, `archive-center-updater`, and `mariadb-schema`) use the
 following external modules: `filippo.io/edwards25519`,
 `github.com/go-ole/go-ole`, `github.com/go-sql-driver/mysql`,
-`github.com/shirou/gopsutil/v3`, `github.com/yusufpapurcu/wmi`, and
+`github.com/shirou/gopsutil/v4`, `github.com/yusufpapurcu/wmi`, and
 `golang.org/x/sys`. Their upstream license files were present in the Go module
 cache used for the audit. Other entries below are used by tests, transitive
 source dependencies, or optional migration tools and may not be present in a
@@ -72,30 +76,27 @@ standard release binary.
 | Module | Version | License |
 | --- | --- | --- |
 | `github.com/DATA-DOG/go-sqlmock` | v1.5.2 | BSD 3-Clause |
-| `github.com/go-sql-driver/mysql` | v1.8.1 | MPL-2.0 |
-| `github.com/shirou/gopsutil/v3` | v3.23.12 | BSD 3-Clause |
-| `modernc.org/sqlite` | v1.29.10 | BSD-style 3-Clause |
-| `filippo.io/edwards25519` | v1.1.0 | BSD 3-Clause |
+| `github.com/go-sql-driver/mysql` | v1.10.0 | MPL-2.0 |
+| `github.com/shirou/gopsutil/v4` | v4.26.6 | BSD 3-Clause |
+| `modernc.org/sqlite` | v1.54.0 | BSD-style 3-Clause |
+| `filippo.io/edwards25519` | v1.2.0 | BSD 3-Clause |
 | `github.com/dustin/go-humanize` | v1.0.1 | MIT |
-| `github.com/go-ole/go-ole` | v1.2.6 | MIT |
-| `github.com/google/pprof` | d1b30febd7db | Apache-2.0 |
+| `github.com/ebitengine/purego` | v0.10.2 | Apache-2.0 |
+| `github.com/go-ole/go-ole` | v1.3.0 | MIT |
+| `github.com/google/pprof` | b9395ee17fa0 | Apache-2.0 |
 | `github.com/google/uuid` | v1.6.0 | BSD 3-Clause |
-| `github.com/hashicorp/golang-lru/v2` | v2.0.7 | MPL-2.0 |
-| `github.com/mattn/go-isatty` | v0.0.20 | MIT |
-| `github.com/ncruces/go-strftime` | v0.1.9 | MIT |
+| `github.com/mattn/go-isatty` | v0.0.24 | MIT |
+| `github.com/ncruces/go-strftime` | v1.0.0 | MIT |
 | `github.com/pmezard/go-difflib` | 5d4384ee4fb2 | BSD 3-Clause |
-| `github.com/power-devops/perfstat` | 5aafc221ea8c | MIT |
+| `github.com/power-devops/perfstat` | 82ca36839d55 | MIT |
 | `github.com/remyoudompheng/bigfft` | 24d4a6f8daec | BSD 3-Clause |
-| `github.com/yusufpapurcu/wmi` | v1.2.3 | MIT |
-| `golang.org/x/sync` | v0.19.0 | BSD 3-Clause |
-| `golang.org/x/sys` | v0.40.0 | BSD 3-Clause |
-| `golang.org/x/tools` | v0.39.0 | BSD 3-Clause |
-| `modernc.org/gc/v3` | 573471604cb6 | BSD-style 3-Clause |
-| `modernc.org/libc` | v1.49.3 | BSD-style 3-Clause |
-| `modernc.org/mathutil` | v1.6.0 | BSD-style 3-Clause |
-| `modernc.org/memory` | v1.8.0 | BSD-style 3-Clause |
-| `modernc.org/strutil` | v1.2.0 | BSD-style 3-Clause |
-| `modernc.org/token` | v1.1.0 | BSD-style 3-Clause |
+| `github.com/yusufpapurcu/wmi` | v1.2.4 | MIT |
+| `golang.org/x/sys` | v0.47.0 | BSD 3-Clause |
+| `golang.org/x/tools` | v0.48.0 | BSD 3-Clause |
+| `modernc.org/gc/v3` | v3.1.5 | BSD-style 3-Clause |
+| `modernc.org/libc` | v1.74.4 | BSD-style 3-Clause |
+| `modernc.org/mathutil` | v1.7.1 | BSD-style 3-Clause |
+| `modernc.org/memory` | v1.11.0 | BSD-style 3-Clause |
 
 The MPL-2.0 modules remain available in Source Code form at their module
 repositories and through the Go module proxy using the exact versions listed

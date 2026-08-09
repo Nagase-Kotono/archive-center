@@ -18,6 +18,46 @@ import (
 	"github.com/risulongmemory/archive-center-go/internal/vector"
 )
 
+func (r *rollbackRecordingStore) SaveChapterSummary(context.Context, *store.ChapterSummary) error {
+	return nil
+}
+
+func (r *rollbackRecordingStore) SearchChapterSummaries(context.Context, string, string, int, int, int) ([]store.ChapterSummary, error) {
+	return r.chapterSummaries, nil
+}
+
+func (r *rollbackRecordingStore) SaveArcSummary(context.Context, string, *store.ArcSummary) error {
+	return nil
+}
+
+func (r *rollbackRecordingStore) GetLatestArcSummary(context.Context, string) (*store.ArcSummary, error) {
+	return nil, store.ErrNotFound
+}
+
+func (r *rollbackRecordingStore) ListArcSummaries(context.Context, string, string, int) ([]store.ArcSummary, error) {
+	return r.arcSummaries, nil
+}
+
+func (r *rollbackRecordingStore) SearchArcSummaries(context.Context, string, string, int, int, int) ([]store.ArcSummary, error) {
+	return r.arcSummaries, nil
+}
+
+func (r *rollbackRecordingStore) SaveSagaDigest(context.Context, string, *store.SagaDigest) error {
+	return nil
+}
+
+func (r *rollbackRecordingStore) GetLatestSagaDigest(context.Context, string) (*store.SagaDigest, error) {
+	return nil, store.ErrNotFound
+}
+
+func (r *rollbackRecordingStore) ListSagaDigests(context.Context, string, int) ([]store.SagaDigest, error) {
+	return r.sagaDigests, nil
+}
+
+func (r *rollbackRecordingStore) SearchSagaDigests(context.Context, string, string, int, int, int) ([]store.SagaDigest, error) {
+	return r.sagaDigests, nil
+}
+
 func (r *rollbackRecordingStore) DeleteTrustStates(ctx context.Context, sid string, fromTurn int) error {
 	if r.deleteErr != nil {
 		return r.deleteErr
@@ -199,15 +239,145 @@ func (r *rollbackRecordingStore) SaveAuditLog(ctx context.Context, a *store.Audi
 	return nil
 }
 
+type rollbackLifecycleStore struct {
+	*rollbackRecordingStore
+	invalidationErr    error
+	outboxOperation    string
+	outbox             *store.MemoryVectorOutboxItem
+	lastRollback       store.LogicalTurnRollback
+	lastLifecycleState string
+}
+
+func (r *rollbackLifecycleStore) MemoryDerivationLifecycleEnabled() bool {
+	return true
+}
+
+func (r *rollbackLifecycleStore) RegisterAcceptedSourceRevision(context.Context, *store.MemorySourceRevision) (store.SourceRevisionRegistration, error) {
+	return store.SourceRevisionRegistration{}, store.ErrNotEnabled
+}
+
+func (r *rollbackLifecycleStore) GetSourceRevision(context.Context, string, string) (*store.MemorySourceRevision, error) {
+	return nil, store.ErrNotFound
+}
+
+func (r *rollbackLifecycleStore) IsSourceRevisionActive(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (r *rollbackLifecycleStore) InvalidateSourceRevisions(_ context.Context, sid string, fromTurn int, lifecycleState, reason string, now time.Time) error {
+	r.lastLifecycleState = lifecycleState
+	if r.invalidationErr != nil {
+		return r.invalidationErr
+	}
+	operation := r.outboxOperation
+	if operation == "" {
+		operation = "delete"
+	}
+	r.outbox = &store.MemoryVectorOutboxItem{
+		ID: 1, Operation: operation, OperationKey: "rollback-delete",
+		ChatSessionID: sid, SourceRevision: "old-revision",
+		DocumentID: "memory:" + sid + ":41", EmbeddingReady: true,
+		RequiredSourceState: "inactive", Status: "pending",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	return nil
+}
+
+func (r *rollbackLifecycleStore) RollbackCanonicalTail(ctx context.Context, rollback store.LogicalTurnRollback) error {
+	r.lastRollback = rollback
+	return r.InvalidateSourceRevisions(ctx, rollback.ChatSessionID, rollback.TurnIndex, rollback.LifecycleAction, rollback.Reason, rollback.CreatedAt)
+}
+
+func (r *rollbackLifecycleStore) DeleteSession(_ context.Context, sid string) error {
+	if r.invalidationErr != nil {
+		return r.invalidationErr
+	}
+	r.deletes = append(r.deletes, "session:"+sid)
+	now := time.Now().UTC()
+	r.outbox = &store.MemoryVectorOutboxItem{
+		ID: 2, Operation: "delete", OperationKey: "session-delete",
+		ChatSessionID: sid, SourceRevision: "deleted-revision",
+		DocumentID: "memory:" + sid + ":all", EmbeddingReady: true,
+		RequiredSourceState: "inactive", Status: "pending",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	return nil
+}
+
+func (r *rollbackLifecycleStore) EnqueueMemoryVectorOperation(_ context.Context, item *store.MemoryVectorOutboxItem) (bool, error) {
+	r.outbox = item
+	return true, nil
+}
+
+func (r *rollbackLifecycleStore) ClaimMemoryVectorOperation(_ context.Context, owner string, now time.Time, lease time.Duration) (*store.MemoryVectorOutboxItem, error) {
+	if r.outbox == nil || (r.outbox.Status != "pending" && r.outbox.Status != "retryable") {
+		return nil, store.ErrNotFound
+	}
+	if !r.outbox.RetryAfter.IsZero() && !r.outbox.RetryAfter.Before(now) {
+		return nil, store.ErrNotFound
+	}
+	copy := *r.outbox
+	copy.Status = "leased"
+	copy.LeaseOwner = owner
+	copy.LeaseUntil = now.Add(lease)
+	r.outbox = &copy
+	return &copy, nil
+}
+
+func (r *rollbackLifecycleStore) CompleteMemoryVectorOperation(_ context.Context, _ int64, owner string, now time.Time) error {
+	if r.outbox == nil || r.outbox.LeaseOwner != owner {
+		return store.ErrLeaseExpired
+	}
+	r.outbox.Status = "completed"
+	r.outbox.UpdatedAt = now
+	return nil
+}
+
+func (r *rollbackLifecycleStore) FailMemoryVectorOperation(_ context.Context, _ int64, owner string, now, retryAfter time.Time, permanent bool, failure string) error {
+	if r.outbox == nil || r.outbox.LeaseOwner != owner {
+		return store.ErrLeaseExpired
+	}
+	r.outbox.Status = "retryable"
+	if permanent {
+		r.outbox.Status = "permanent"
+	}
+	r.outbox.RetryAfter = retryAfter
+	r.outbox.LastError = failure
+	r.outbox.LeaseOwner = ""
+	r.outbox.LeaseUntil = time.Time{}
+	r.outbox.UpdatedAt = now
+	return nil
+}
+
 func TestRollbackLiveWriteExecutesDeletions(t *testing.T) {
 	cfg := config.Default()
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
 
 	vec := &turnRecordingVectorStore{}
-	rec := &rollbackRecordingStore{Store: &turnRecordingStore{returnMemories: []store.Memory{
-		{ID: 41, ChatSessionID: "sess-live", TurnIndex: 5},
-		{ID: 42, ChatSessionID: "sess-live", TurnIndex: 6},
-	}}}
+	rec := &rollbackRecordingStore{
+		Store: &turnRecordingStore{
+			returnMemories: []store.Memory{
+				{ID: 41, ChatSessionID: "sess-live", TurnIndex: 5},
+				{ID: 42, ChatSessionID: "sess-live", TurnIndex: 6},
+			},
+			returnEpisodeSums: []store.EpisodeSummary{
+				{ID: 51, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 4},
+				{ID: 52, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 5},
+			},
+		},
+		chapterSummaries: []store.ChapterSummary{
+			{ID: 61, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 4},
+			{ID: 62, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 5},
+		},
+		arcSummaries: []store.ArcSummary{
+			{ID: 71, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 4},
+			{ID: 72, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 5},
+		},
+		sagaDigests: []store.SagaDigest{
+			{ID: 81, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 4},
+			{ID: 82, ChatSessionID: "sess-live", FromTurn: 1, ToTurn: 5},
+		},
+	}
 	srv := &Server{
 		Cfg:            cfg,
 		Store:          rec,
@@ -260,6 +430,30 @@ func TestRollbackLiveWriteExecutesDeletions(t *testing.T) {
 	if rb["step23_invalidation"] != "delete_turn_scoped_support_records_from_from_turn" {
 		t.Errorf("rollback_plan.step23_invalidation = %v", rb["step23_invalidation"])
 	}
+	hud, ok := resp["turn_workflow_hud"].(map[string]any)
+	if !ok {
+		t.Fatalf("turn_workflow_hud missing from executed rollback: %+v", resp)
+	}
+	if hud["display_mode"] != "notice" || hud["status"] != "completed" {
+		t.Fatalf("delete HUD status = %+v", hud)
+	}
+	if hud["title_key"] != "turn_hud.notice.delete_confirmed" || hud["notice_code"] != "ASSISTANT_OUTPUT_DELETE_CONFIRMED" {
+		t.Fatalf("delete HUD presentation = %+v", hud)
+	}
+	if hud["request_id"] != "rollback:sess-live:5:auto_rollback" {
+		t.Fatalf("delete HUD request_id = %v", hud["request_id"])
+	}
+	hudFacts := map[string]map[string]any{}
+	for _, rawFact := range hud["facts"].([]any) {
+		fact := rawFact.(map[string]any)
+		hudFacts[fact["key"].(string)] = fact
+	}
+	if hudFacts["raw_persistence"]["status"] != "deleted" ||
+		hudFacts["derived_memory"]["status"] != "deleted" ||
+		hudFacts["vector_index"]["status"] != "deleted" ||
+		hudFacts["vector_index"]["count"] != float64(12) {
+		t.Fatalf("delete HUD facts = %+v", hudFacts)
+	}
 
 	wantDeletes := []string{
 		"chat_logs:sess-live:5",
@@ -303,7 +497,13 @@ func TestRollbackLiveWriteExecutesDeletions(t *testing.T) {
 			t.Errorf("delete[%d] = %s, want %s", i, rec.deletes[i], want)
 		}
 	}
-	wantVectorIDs := []string{"memory:sess-live:41", "memory:41", "memory:sess-live:42", "memory:42"}
+	wantVectorIDs := []string{
+		"memory:sess-live:41", "memory:41", "memory:sess-live:42", "memory:42",
+		"episode:sess-live:52", "episode:52",
+		"chapter:sess-live:62", "chapter:62",
+		"arc:sess-live:72", "arc:72",
+		"saga:sess-live:82", "saga:82",
+	}
 	if len(vec.deletedDocumentIDs) != len(wantVectorIDs) {
 		t.Fatalf("deleted vector ids = %#v, want %#v", vec.deletedDocumentIDs, wantVectorIDs)
 	}
@@ -317,6 +517,202 @@ func TestRollbackLiveWriteExecutesDeletions(t *testing.T) {
 	}
 	if rec.audits[0].Source != "auto_rollback" {
 		t.Fatalf("audit source = %q, want auto_rollback", rec.audits[0].Source)
+	}
+}
+
+func TestRollbackLifecycleUsesDurableOutboxAndProviderFailureStaysRetryable(t *testing.T) {
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	base := &rollbackRecordingStore{Store: &turnRecordingStore{}}
+	lifecycle := &rollbackLifecycleStore{rollbackRecordingStore: base}
+	vec := &turnRecordingVectorStore{deleteErr: errors.New("chroma unavailable")}
+	srv := &Server{
+		Cfg: cfg, Store: lifecycle, Vector: vec,
+		RuntimeConfig: RuntimeConfig{
+			Synced: true, EmbeddingTimeoutSec: 30, FailedQueueMaxAttempts: 4,
+		},
+	}
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	request := httptest.NewRequest(http.MethodDelete, "/rollback/5?chat_session_id=sess-outbox&req_source=manual", nil)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "ok" {
+		t.Fatalf("response=%+v", response)
+	}
+	deletions := response["deletions"].(map[string]any)
+	vectors := deletions["vectors"].(map[string]any)
+	if vectors["mode"] != "durable_outbox" || vectors["retryable_queued"] != float64(1) {
+		t.Fatalf("vectors=%+v", vectors)
+	}
+	if lifecycle.outbox == nil || lifecycle.outbox.Status != "retryable" {
+		t.Fatalf("outbox=%+v", lifecycle.outbox)
+	}
+	if lifecycle.lastLifecycleState != store.LogicalTurnLifecycleDeleted {
+		t.Fatalf("typed delete lifecycle was not applied: %q", lifecycle.lastLifecycleState)
+	}
+	if len(base.deletes) == 0 {
+		t.Fatal("canonical rollback did not run")
+	}
+	hud := response["turn_workflow_hud"].(map[string]any)
+	facts := map[string]map[string]any{}
+	for _, rawFact := range hud["facts"].([]any) {
+		fact := rawFact.(map[string]any)
+		facts[fact["key"].(string)] = fact
+	}
+	if facts["vector_index"]["status"] != "queued" ||
+		facts["vector_index"]["disposition"] != "deferred" ||
+		facts["vector_index"]["count"] != float64(1) {
+		t.Fatalf("outbox rollback HUD facts=%+v", facts)
+	}
+}
+
+func TestRollbackLifecyclePermanentVectorFailureIsPartialError(t *testing.T) {
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	base := &rollbackRecordingStore{Store: &turnRecordingStore{}}
+	lifecycle := &rollbackLifecycleStore{
+		rollbackRecordingStore: base,
+		outboxOperation:        "unsupported",
+	}
+	srv := &Server{
+		Cfg: cfg, Store: lifecycle, Vector: &turnRecordingVectorStore{},
+		RuntimeConfig: RuntimeConfig{
+			Synced: true, EmbeddingTimeoutSec: 30, FailedQueueMaxAttempts: 4,
+		},
+	}
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	request := httptest.NewRequest(http.MethodDelete, "/rollback/5?chat_session_id=sess-permanent&req_source=manual", nil)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "partial_error" {
+		t.Fatalf("response status=%v body=%s", response["status"], recorder.Body.String())
+	}
+	deletions := response["deletions"].(map[string]any)
+	vectors := deletions["vectors"].(map[string]any)
+	if vectors["ok"] != false ||
+		vectors["canonical_committed"] != true ||
+		vectors["permanent"] != float64(1) ||
+		vectors["canonical_note"] != "MariaDB invalidation is committed; vector cleanup has a permanent provider failure" {
+		t.Fatalf("permanent vector result=%+v", vectors)
+	}
+	hud := response["turn_workflow_hud"].(map[string]any)
+	if hud["status"] != "failed" ||
+		hud["severity"] != "error" ||
+		hud["dismissal_policy"] != "x_only" ||
+		hud["notice_code"] != "ASSISTANT_OUTPUT_DELETE_SYNC_PARTIAL" {
+		t.Fatalf("permanent vector HUD=%+v", hud)
+	}
+	facts := map[string]map[string]any{}
+	for _, rawFact := range hud["facts"].([]any) {
+		fact := rawFact.(map[string]any)
+		facts[fact["key"].(string)] = fact
+	}
+	if facts["vector_index"]["status"] != "partial_error" ||
+		facts["vector_index"]["severity"] != "error" ||
+		facts["vector_index"]["count"] != float64(1) {
+		t.Fatalf("permanent vector HUD fact=%+v", facts["vector_index"])
+	}
+}
+
+func TestRollbackStopsBeforeCanonicalDeletionWhenSourceInvalidationFails(t *testing.T) {
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	base := &rollbackRecordingStore{Store: &turnRecordingStore{}}
+	lifecycle := &rollbackLifecycleStore{
+		rollbackRecordingStore: base,
+		invalidationErr:        errors.New("source lock failed"),
+	}
+	srv := &Server{Cfg: cfg, Store: lifecycle, Vector: &turnRecordingVectorStore{}}
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	request := httptest.NewRequest(http.MethodDelete, "/rollback/5?chat_session_id=sess-stop&req_source=manual", nil)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(base.deletes) != 0 {
+		t.Fatalf("canonical deletes ran after source invalidation failure: %+v", base.deletes)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	hud := response["turn_workflow_hud"].(map[string]any)
+	if hud["request_id"] != "rollback:sess-stop:5:manual" {
+		t.Fatalf("blocked rollback HUD request_id=%v", hud["request_id"])
+	}
+	facts := map[string]map[string]any{}
+	for _, rawFact := range hud["facts"].([]any) {
+		fact := rawFact.(map[string]any)
+		facts[fact["key"].(string)] = fact
+	}
+	for _, key := range []string{"raw_persistence", "derived_memory", "vector_index"} {
+		if facts[key]["status"] != "blocked" || facts[key]["severity"] != "error" {
+			t.Fatalf("blocked rollback fact %s=%+v", key, facts[key])
+		}
+	}
+	if facts["finality"]["status"] != "blocked" {
+		t.Fatalf("blocked rollback finality=%+v", facts["finality"])
+	}
+}
+
+func TestSessionDeleteLifecycleUsesOutboxInsteadOfDirectVectorSessionDelete(t *testing.T) {
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	base := &rollbackRecordingStore{Store: &turnRecordingStore{}}
+	lifecycle := &rollbackLifecycleStore{rollbackRecordingStore: base}
+	vec := &turnRecordingVectorStore{deleteErr: errors.New("chroma unavailable")}
+	srv := &Server{
+		Cfg: cfg, Store: lifecycle, Vector: vec,
+		RuntimeConfig: RuntimeConfig{
+			Synced: true, EmbeddingTimeoutSec: 30, FailedQueueMaxAttempts: 4,
+		},
+	}
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	request := httptest.NewRequest(http.MethodDelete, "/sessions/sess-session-outbox", nil)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "ok" || response["deleted"] != true {
+		t.Fatalf("response=%+v", response)
+	}
+	cleanup := response["vector_cleanup"].(map[string]any)
+	if cleanup["mode"] != "durable_outbox" || cleanup["retryable_queued"] != float64(1) {
+		t.Fatalf("cleanup=%+v", cleanup)
+	}
+	if vec.deleteSessionCalls != 0 {
+		t.Fatalf("direct vector session delete calls=%d", vec.deleteSessionCalls)
+	}
+	if lifecycle.outbox == nil || lifecycle.outbox.Status != "retryable" {
+		t.Fatalf("outbox=%+v", lifecycle.outbox)
 	}
 }
 
@@ -571,20 +967,31 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 	srv.VectorOpenError = nil
 
 	extraction := map[string]any{
-		"turn_summary":           "Alice decided to trust Bob after the rescue.",
-		"importance_score":       8,
-		"relationship_memory":    map[string]any{"bond_and_distance": "Alice trusts Bob more after he helped her.", "trust": 0.8},
-		"entities":               map[string]any{"characters": []any{map[string]any{"name": "Alicee", "role": "protagonist", "status_emotion": "relieved"}}},
-		"kg_triples":             []any{map[string]any{"subject": "Alicee", "predicate": "trusts", "object": "Bob", "valid_from": 2}},
+		"turn_summary":        "Alice decided to trust Bob after the rescue.",
+		"importance_score":    8,
+		"relationship_memory": map[string]any{"bond_and_distance": "Alice trusts Bob more after he helped her.", "trust": 0.8},
+		"entities": map[string]any{"characters": []any{map[string]any{
+			"name": "Alice", "aliases": []any{"I"}, "role": "protagonist", "status_emotion": "relieved",
+			"reference_contract": "critic_entity_reference.v1", "reference_scope": "session_stable", "name_expression": "Alice", "evidence_excerpt": "Alice relaxed after Bob helped her.",
+		}}},
+		"kg_triples": []any{},
+		"relationship_observations": []any{map[string]any{
+			"source_entity": "Alice", "source_entity_expression": "I", "target_entity": "Bob", "target_entity_expression": "Bob",
+			"domain": "trust", "domain_expression": "trust", "observation": "I trust Bob", "support_kind": "explicit_statement", "evidence_excerpt": "I trust Bob.",
+		}},
 		"archive_hint":           map[string]any{"wing": "wing_general", "room": "hall_relationships"},
 		"evidence_excerpts":      []any{"I trust Bob."},
 		"emotional_intensity":    0.7,
 		"narrative_significance": 0.9,
 		"state_deltas":           map[string]any{"scene_state": map[string]any{"mood": "warm"}},
 		"character_deltas": []any{map[string]any{
-			"name":   "Alicee",
-			"status": map[string]any{"emotion": "relieved"},
-			"events": []any{map[string]any{"type": "relationship_shift", "detail": "Alice's trust in Bob increased."}},
+			"name":               "Alice",
+			"reference_contract": "critic_entity_reference.v1",
+			"reference_scope":    "session_stable",
+			"name_expression":    "Alice",
+			"evidence_excerpt":   "Alice relaxed after Bob helped her.",
+			"status":             map[string]any{"emotion": "relieved"},
+			"events":             []any{map[string]any{"type": "relationship_shift", "detail": "Alice's trust in Bob increased."}},
 		}},
 		"pending_threads": []any{map[string]any{"thread_type": "promise", "title": "Alice thanks Bob later", "confidence": 0.85}},
 		"world_rules":     []any{map[string]any{"scope": "session", "category": "relationship", "key": "trust_changes_need_evidence", "value": "Trust shifts should be grounded in visible actions."}},
@@ -621,7 +1028,7 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 		"assistant_content": "Alice relaxed after Bob helped her.",
 		"context_messages":  []any{},
 		"improvement_trace": map[string]any{"score": 9},
-		"client_meta":       map[string]any{"critic": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "critic-model", "provider": "openai", "max_tokens": 1200}, "embedding": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "embed-model", "provider": "openai"}},
+		"client_meta":       map[string]any{"critic": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "critic-model", "provider": "openai", "max_tokens": 1200, "timeout_ms": 45000}, "embedding": map[string]any{"api_key": "sk-test", "endpoint": "https://api.example.com/v1", "model": "embed-model", "provider": "openai", "timeout_ms": 30000}},
 		"request_type":      "model",
 	}
 	raw, _ := json.Marshal(body)
@@ -646,17 +1053,17 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 	if len(fake.savedEvidence) != 1 {
 		t.Fatalf("expected one evidence, got %d", len(fake.savedEvidence))
 	}
-	if len(fake.savedKGTriples) != 1 {
-		t.Fatalf("expected one KG triple, got %d", len(fake.savedKGTriples))
+	if len(fake.savedKGTriples) != 0 {
+		t.Fatalf("directional relationship must not enter generic KG, got %d", len(fake.savedKGTriples))
 	}
 	if len(fake.savedEntities) != 1 {
 		t.Fatalf("expected one entity, got %d", len(fake.savedEntities))
 	}
-	if len(fake.savedTrusts) != 1 {
-		t.Fatalf("expected one trust state, got %d", len(fake.savedTrusts))
+	if len(fake.savedTrusts) != 0 {
+		t.Fatalf("legacy directionless trust state was persisted: %d", len(fake.savedTrusts))
 	}
-	if len(fake.savedCharacterEvents) != 1 {
-		t.Fatalf("expected one character event, got %d", len(fake.savedCharacterEvents))
+	if len(fake.savedCharacterEvents) != 0 {
+		t.Fatalf("legacy relationship shift event was persisted: %d", len(fake.savedCharacterEvents))
 	}
 	if len(fake.savedCharacterStates) != 1 {
 		t.Fatalf("expected one character state, got %d", len(fake.savedCharacterStates))
@@ -673,8 +1080,8 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 	if len(fake.savedStorylines) != 1 {
 		t.Fatalf("expected one storyline, got %d", len(fake.savedStorylines))
 	}
-	if len(vec.docs) != 3 {
-		t.Fatalf("expected memory/evidence/world-rule vector upserts, got %d", len(vec.docs))
+	if len(vec.docs) != 2 {
+		t.Fatalf("relationship-scoped memory must stay out of generic vector; expected evidence/world-rule, got %d", len(vec.docs))
 	}
 }
 

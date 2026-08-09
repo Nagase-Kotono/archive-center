@@ -10,12 +10,33 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeLookup struct {
 	paths map[string]string
+}
+
+func TestRouteSmokeCompleteTurnUsesAcceptedSourceObservation(t *testing.T) {
+	body := routeSmokeCompleteTurnBodyWithClientMeta(
+		"session", 3, "third", map[string]any{"critic": map[string]any{"model": "test"}}, false,
+	)
+	meta, ok := body["client_meta"].(map[string]any)
+	if !ok || meta["source_acceptance_required"] != true || meta["critic"] == nil {
+		t.Fatalf("client_meta=%+v", body["client_meta"])
+	}
+	observation, ok := meta["source_acceptance_observation"].(map[string]any)
+	if !ok ||
+		observation["contract_version"] != "source_acceptance_observation.v1" ||
+		observation["active_message_count"] != 6 ||
+		observation["user_message_index"] != 4 ||
+		observation["message_index"] != 5 ||
+		observation["user_persistence_content_hash"] != routeSmokeOR1CHash("route smoke third user input") ||
+		observation["persistence_content_hash"] != routeSmokeOR1CHash("route smoke third assistant content") {
+		t.Fatalf("observation=%+v", observation)
+	}
 }
 
 func (f *fakeLookup) lookup(name string) (string, bool) {
@@ -129,6 +150,44 @@ func TestRunMissingSource(t *testing.T) {
 	}
 	if len(r.Errors) == 0 || !strings.Contains(r.Errors[0], "missing source") {
 		t.Fatalf("expected missing source error, got %v", r.Errors)
+	}
+}
+
+func TestDirectProviderConfigStandaloneSmokeSkipsDefaultReadShadow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  directProviderConfig
+		want bool
+	}{
+		{
+			name: "route write smoke",
+			cfg:  directProviderConfig{RouteWriteSmoke: true},
+			want: true,
+		},
+		{
+			name: "session isolation smoke",
+			cfg:  directProviderConfig{SessionIsolationSmoke: true},
+			want: true,
+		},
+		{
+			name: "ordinary migration",
+			cfg:  directProviderConfig{},
+			want: false,
+		},
+		{
+			name: "route smoke plus product read proof",
+			cfg: directProviderConfig{
+				RouteWriteSmoke:  true,
+				ProductReadProof: true,
+			},
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.skipDefaultReadShadow(); got != tc.want {
+				t.Fatalf("skipDefaultReadShadow() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -869,7 +928,7 @@ func TestWaitGoReadySuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	step := waitGoReady(ctx, port)
+	step := waitGoReady(ctx, port, time.Millisecond)
 	if step.Status != "ok" {
 		t.Fatalf("status = %q, want ok: %s", step.Status, step.Error)
 	}
@@ -878,12 +937,72 @@ func TestWaitGoReadySuccess(t *testing.T) {
 func TestWaitGoReadyTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	step := waitGoReady(ctx, 59999) // unlikely used port
+	step := waitGoReady(ctx, 59999, time.Millisecond) // unlikely used port
 	if step.Status != "failed" {
 		t.Fatalf("status = %q, want failed", step.Status)
 	}
 	if !strings.Contains(step.Error, "not ready") {
 		t.Fatalf("expected timeout error, got %q", step.Error)
+	}
+}
+
+func TestWaitGoReadyZeroIntervalDoesNotRetry(t *testing.T) {
+	var attempts atomic.Int64
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ln.Close()
+
+	step := waitGoReady(context.Background(), port, 0)
+	if step.Status != "failed" || !strings.Contains(step.Error, "polling is disabled") {
+		t.Fatalf("step = %+v, want polling-disabled failure", step)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want exactly one probe", got)
+	}
+}
+
+func TestWaitPythonFallbackReadyZeroIntervalDoesNotRetry(t *testing.T) {
+	var attempts atomic.Int64
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ln.Close()
+
+	step := waitPythonFallbackReady(context.Background(), port, 0)
+	if step.Status != "failed" || !strings.Contains(step.Error, "polling is disabled") {
+		t.Fatalf("step = %+v, want polling-disabled failure", step)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want exactly one probe", got)
+	}
+}
+
+func TestWaitForServerReadyZeroIntervalFailsWithoutPolling(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	err = waitForServerReady(context.Background(), port, 0)
+	if err == nil || !strings.Contains(err.Error(), "polling is disabled") {
+		t.Fatalf("error = %v, want polling-disabled failure", err)
 	}
 }
 

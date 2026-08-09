@@ -508,6 +508,50 @@ func (r *readOnlyStore) SaveStatusChangeEvent(ctx context.Context, event StatusC
 	return event, ErrNotEnabled
 }
 
+func (r *readOnlyStore) GetStatusChangeEventBySourceRevision(ctx context.Context, chatSessionID, statusKey, sourceRevision string, sourceTurn int) (StatusChangeEvent, error) {
+	store, ok := r.delegate.(StatusChangeEventSourceLookupStore)
+	if !ok {
+		return StatusChangeEvent{}, ErrNotEnabled
+	}
+	return store.GetStatusChangeEventBySourceRevision(ctx, chatSessionID, statusKey, sourceRevision, sourceTurn)
+}
+
+func (r *readOnlyStore) GetLatestCurrentProjectionStatusChangeEvent(ctx context.Context, chatSessionID, statusKey string) (StatusChangeEvent, error) {
+	store, ok := r.delegate.(StatusChangeEventSourceLookupStore)
+	if !ok {
+		return StatusChangeEvent{}, ErrNotEnabled
+	}
+	return store.GetLatestCurrentProjectionStatusChangeEvent(ctx, chatSessionID, statusKey)
+}
+
+func (r *readOnlyStore) ApplyReversibleStatusTransition(ctx context.Context, transition ReversibleStatusTransition) (ReversibleStatusTransitionResult, error) {
+	return ReversibleStatusTransitionResult{}, ErrNotEnabled
+}
+
+func (r *readOnlyStore) GetReversibleStatusEventBySourceUnit(ctx context.Context, chatSessionID, sourceRevision, sourceUnitID string) (StatusChangeEvent, error) {
+	store, ok := r.delegate.(ReversibleStatusTransitionStore)
+	if !ok {
+		return StatusChangeEvent{}, ErrNotEnabled
+	}
+	return store.GetReversibleStatusEventBySourceUnit(ctx, chatSessionID, sourceRevision, sourceUnitID)
+}
+
+func (r *readOnlyStore) ListReversibleStatusCurrentValues(ctx context.Context, chatSessionID, ownerScope string, statusKeys []string) ([]StatusCurrentValue, error) {
+	store, ok := r.delegate.(ReversibleStatusTransitionStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return store.ListReversibleStatusCurrentValues(ctx, chatSessionID, ownerScope, statusKeys)
+}
+
+func (r *readOnlyStore) ListLatestReversibleCurrentProjectionEvents(ctx context.Context, chatSessionID string, statusKeys []string) ([]StatusChangeEvent, error) {
+	store, ok := r.delegate.(ReversibleStatusTransitionStore)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return store.ListLatestReversibleCurrentProjectionEvents(ctx, chatSessionID, statusKeys)
+}
+
 func (r *readOnlyStore) ListStatusEffects(ctx context.Context, chatSessionID, ownerScope, ownerID, effectState string, limit int) ([]StatusEffect, error) {
 	store, ok := r.delegate.(StatusLifecycleStore)
 	if !ok {
@@ -522,6 +566,46 @@ func (r *readOnlyStore) SaveStatusEffect(ctx context.Context, effect StatusEffec
 
 func (r *readOnlyStore) UpdateStatusEffectState(ctx context.Context, id int64, effectState, clearedEvidenceJSON string, clearedTurn int) error {
 	return ErrNotEnabled
+}
+
+func (r *readOnlyStore) ResolveReviewedCanonicalEntityID(ctx context.Context, chatSessionID, sourceEntityID string) (string, error) {
+	resolver, ok := r.delegate.(ReviewedEntityIdentityResolver)
+	if !ok {
+		return "", ErrNotEnabled
+	}
+	return resolver.ResolveReviewedCanonicalEntityID(ctx, chatSessionID, sourceEntityID)
+}
+
+func (r *readOnlyStore) ResolveUniqueActiveEntityIDBySurface(ctx context.Context, chatSessionID, normalizedSurface string) (string, error) {
+	resolver, ok := r.delegate.(UniqueActiveEntitySurfaceResolver)
+	if !ok {
+		return "", ErrNotEnabled
+	}
+	return resolver.ResolveUniqueActiveEntityIDBySurface(ctx, chatSessionID, normalizedSurface)
+}
+
+func (r *readOnlyStore) ResolveUniqueActiveEntityIdentityBySurface(ctx context.Context, chatSessionID, normalizedSurface string) (ResolvedEntityIdentity, error) {
+	resolver, ok := r.delegate.(UniqueActiveEntitySurfaceIdentityResolver)
+	if !ok {
+		return ResolvedEntityIdentity{}, ErrNotEnabled
+	}
+	return resolver.ResolveUniqueActiveEntityIdentityBySurface(ctx, chatSessionID, normalizedSurface)
+}
+
+func (r *readOnlyStore) ListCharacterPerspectiveMemoryUnits(ctx context.Context, chatSessionID, knowledgeHolderEntityID string) ([]PreciseMemoryUnit, error) {
+	reader, ok := r.delegate.(CharacterPerspectiveMemoryReader)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListCharacterPerspectiveMemoryUnits(ctx, chatSessionID, knowledgeHolderEntityID)
+}
+
+func (r *readOnlyStore) ListActiveInteractionMemoryUnits(ctx context.Context, chatSessionID string) ([]PreciseMemoryUnit, error) {
+	reader, ok := r.delegate.(ActiveInteractionMemoryReader)
+	if !ok {
+		return nil, ErrNotEnabled
+	}
+	return reader.ListActiveInteractionMemoryUnits(ctx, chatSessionID)
 }
 
 // Ping delegates to the underlying store if it implements Pinger.

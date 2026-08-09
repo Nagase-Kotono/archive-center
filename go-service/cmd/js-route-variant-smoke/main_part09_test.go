@@ -743,7 +743,14 @@ func TestArchiveCenterJSCompleteTurnQueueUsesLiveEndpointMarkers(t *testing.T) {
 		`rollbackParams.set("host_observed_at_ms", String(Date.now()))`,
 		"serializeCompleteTurnRecoveryPayload",
 		"complete_turn_raw_recovery_v1",
-		"complete_turn_write_ahead_recovery_v1",
+		"queuePendingCompleteTurnPayload",
+		`state: "retryable"`,
+		"settings.failedQueueMaxAttempts",
+		"commitFailedQueueTransitionIntent",
+		"markFailedQueueItemTerminalDurably",
+		"failed_queue_terminal_intent_persisted",
+		`res.queue_action === "discard" || res.retryable === false`,
+		"reconciliation_required === true",
 		"removeQueuedItem",
 		`return buildCompleteTurnQueuePayload(p);`,
 		"flushQueueSave().catch(function() {})",
@@ -756,6 +763,9 @@ func TestArchiveCenterJSCompleteTurnQueueUsesLiveEndpointMarkers(t *testing.T) {
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing complete-turn live queue marker %q", needle)
 		}
+	}
+	if strings.Contains(src, "complete_turn_write_ahead_recovery_v1") {
+		t.Fatal("pending/in-flight complete-turn payload must not be exposed as a failed write-ahead queue item")
 	}
 }
 
@@ -803,21 +813,26 @@ func TestArchiveCenterJSCIDSessionDeleteLifecycleMarkers(t *testing.T) {
 	}
 }
 
-func TestArchiveCenterJSFreshActiveCIDWriteRoutingMarkers(t *testing.T) {
+func TestArchiveCenterJSAfterRequestReusesCapturedCIDWithoutRoutingBlock(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"function resolveAfterRequestWriteSessionId",
-		"fresh_active_cid_after_request",
-		"sessionWriteRouting",
-		"Session Routing",
-		"async function resolveCurrentActiveChatObject",
-		`await R.getChatFromIndex(charIdx, chatIdx)`,
-		"orchResult._trace.chatSessionId = currentSessionId",
-		"const chatSessionId = await resolveAfterRequestWriteSessionId(lastOrchResult)",
+		"function onAfterRequest(content, type)",
+		"const capturedWriteSessionId = normalizeSessionId(",
+		"latestOrchResult && latestOrchResult._chatSessionId",
+		"const chatSessionId = capturedWriteSessionId || cachedWriteSessionId || SESSION_FALLBACK;",
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
-			t.Fatalf("Archive Center.js missing fresh active CID write routing marker %q", needle)
+			t.Fatalf("Archive Center.js missing captured CID afterRequest marker %q", needle)
+		}
+	}
+	for _, forbidden := range []string{
+		"function resolveAfterRequestWriteSessionId",
+		"fresh_active_cid_after_request",
+		"const chatSessionId = await resolveAfterRequestWriteSessionId(persistenceOrchResult)",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains blocking afterRequest routing marker %q", forbidden)
 		}
 	}
 }
@@ -938,7 +953,6 @@ func TestArchiveCenterJSActiveChatCompleteTurnBackfillMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
 		"ACTIVE_CHAT_BACKFILL_LEDGER_KEY",
-		"ACTIVE_CHAT_BACKFILL_MAX_PAIRS",
 		"function buildCompletedTurnPairsFromActiveChatMessages",
 		"function findActiveChatCompletedTurnPairForUserContent",
 		"function ensureActiveChatCompletedTurnsBackfilled",
@@ -957,7 +971,8 @@ func TestArchiveCenterJSActiveChatCompleteTurnBackfillMarkers(t *testing.T) {
 		"rawRepairStatus",
 		"setTurnCounterAtLeast",
 		`ensureActiveChatCompletedTurnsBackfilled(orchSessionId, { reason: "before_request"`,
-		`ensureActiveChatCompletedTurnsBackfilled(chatSessionId, { reason: "after_request"`,
+		`source: "risu_next_host_signal_active_chat"`,
+		"persistAcceptedHostFinalWithoutBlockingRequest",
 		`ensureActiveChatCompletedTurnsBackfilled(requestedSessionId, { reason: "timeline_refresh"`,
 		"lastActiveChatBackfill",
 		"Active Chat Backfill",
@@ -967,6 +982,15 @@ func TestArchiveCenterJSActiveChatCompleteTurnBackfillMarkers(t *testing.T) {
 			t.Fatalf("Archive Center.js missing active chat complete-turn backfill marker %q", needle)
 		}
 	}
+	for _, forbidden := range []string{
+		"ACTIVE_CHAT_BACKFILL_MAX_" + "PAIRS",
+		"ACTIVE_CHAT_BACKFILL_MAX_CONTEXT_" + "MESSAGES",
+		"max" + "Pairs:",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains hidden active-chat backfill limit %q", forbidden)
+		}
+	}
 }
 
 func TestArchiveCenterJSAutoContinueEmptyInputMarkers(t *testing.T) {
@@ -974,7 +998,8 @@ func TestArchiveCenterJSAutoContinueEmptyInputMarkers(t *testing.T) {
 	required := []string{
 		"AUTO_CONTINUE_USER_INPUT_MARKER",
 		"actualEmptyInput",
-		"function peekActualEmptyRawInputForSession",
+		"function bindRawInputObservationToRequest",
+		"const actualEmptyRawInput = rawInputObservationForRequest",
 		`current_user_input_backend_unavailable`,
 		"recoverCurrentUserInputFromActiveChatTail",
 		"function shouldAllowActiveChatAssistantPairUserReplace",
@@ -1001,8 +1026,13 @@ func TestArchiveCenterJSActiveChatInputPrecedesAutoContinueFallback(t *testing.T
 	if activePair < 0 || autoContinue < 0 || activePair >= autoContinue {
 		t.Fatalf("Active Chat user recovery must run before auto-continue fallback: active=%d auto=%d", activePair, autoContinue)
 	}
-	if !strings.Contains(src, `(Date.now() - (actualEmptyRawInput.capturedAt || 0)) <= RAW_INPUT_STRONG_MAX_AGE_MS`) {
-		t.Fatal("empty input fallback must require a fresh input-hook observation")
+	boundEmpty := strings.Index(src, `if (actualEmptyRawInput) {`)
+	activeRecovery := strings.Index(src, `const activeChatUserInput = await recoverUserInputFromActiveChatPair`)
+	if boundEmpty < 0 || activeRecovery < 0 || boundEmpty >= activeRecovery {
+		t.Fatal("request-bound empty input must become authoritative before Active Chat recovery")
+	}
+	if !strings.Contains(src, `if (!actualEmptyUserInput && shouldSkipUserInputPersistence(userInput)) {`) {
+		t.Fatal("Active Chat recovery must be blocked by a request-bound empty input")
 	}
 	if !strings.Contains(src, `let safeSavedUserInput = isCanonicalHostUserInputText(userInput) ? userInput : ""`) {
 		t.Fatal("save-layer user input must preserve verified host text without prompt-content classification")
@@ -1012,16 +1042,14 @@ func TestArchiveCenterJSActiveChatInputPrecedesAutoContinueFallback(t *testing.T
 func TestArchiveCenterJSActiveChatRescanDryRunMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"ACTIVE_CHAT_RESCAN_DRY_RUN_TIMELINE_PAGE_LIMIT",
-		"ACTIVE_CHAT_RESCAN_DRY_RUN_CHATLOG_PAGE_LIMIT",
 		"ACTIVE_CHAT_RECENT_REBUILD_DEFAULT_TURNS",
-		"ACTIVE_CHAT_RECENT_REBUILD_MAX_TURNS",
 		"ACTIVE_CHAT_REBUILD_DEFAULT_ORDER",
 		"function resolveCurrentActiveChatObject",
 		"function runActiveChatRescanDryRun",
 		"function runActiveChatRecentRebuild",
 		"function computeActiveChatRescanDryRunPlan",
 		"function explorerFetchTimelineItemsForSessionDryRun",
+		"const seenBeforeTurns = new Set()",
 		"function buildActiveChatRescanDryRunRows",
 		"function buildActiveChatRescanPairsFromDbRawFallback",
 		"function isLikelyRisuMemorySummaryRecord",
@@ -1153,7 +1181,7 @@ func TestArchiveCenterJSLegacyTableReadRemoved(t *testing.T) {
 	}
 }
 
-func TestArchiveCenterJSCompleteTurnQueueDoesNotTreatRawAsDerivedCompletion(t *testing.T) {
+func TestArchiveCenterJSCompleteTurnQueueSeparatesRawSaveFromDerivedRetry(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	if strings.Contains(src, "isCompleteTurnPayloadAlreadySaved") {
 		t.Fatal("complete-turn queue must not treat raw chat rows as full pipeline completion")
@@ -1161,8 +1189,16 @@ func TestArchiveCenterJSCompleteTurnQueueDoesNotTreatRawAsDerivedCompletion(t *t
 	if !strings.Contains(src, `"/complete-turn/request-status?idempotency_key="`) {
 		t.Fatal("complete-turn queue is missing backend idempotency status check")
 	}
-	if !strings.Contains(src, "res.derived_retry_required !== true") ||
-		!strings.Contains(src, "_ctResult.derived_retry_required === true") {
-		t.Fatal("complete-turn queue must retain raw-success responses that still require derived retry")
+	for _, marker := range []string{
+		"requestStatus.raw_saved === true",
+		"_ctResult.derived_retry_required === true",
+		"raw saved; derived retry owned by backend",
+	} {
+		if !strings.Contains(src, marker) {
+			t.Fatalf("complete-turn queue missing raw/derived split marker %q", marker)
+		}
+	}
+	if strings.Contains(src, "res.derived_retry_required !== true") {
+		t.Fatal("raw save must not stay in the full complete-turn retry queue only because derived retry is required")
 	}
 }

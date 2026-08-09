@@ -16,16 +16,29 @@ import (
 )
 
 const (
-	completeTurnSourceAcceptanceContract = "source_acceptance_observation.v1"
-	completeTurnSourceLifecycleContract  = "source_acceptance_lifecycle.v1"
-	sourceAcceptanceTransitionEvent      = "source_acceptance_transition"
-	sourceAcceptanceInvalidationEvent    = "source_acceptance_invalidation"
+	completeTurnSourceAcceptanceContract         = "source_acceptance_observation.v1"
+	completeTurnNextHostSignalAcceptanceContract = "source_acceptance_observation.v2"
+	completeTurnAfterRequestAcceptanceContract   = "source_acceptance_observation.v3"
+	completeTurnRisuHostLifecycleContract        = "risu_host_lifecycle_observation.v1"
+	completeTurnSourceLifecycleContract          = "source_acceptance_lifecycle.v1"
+	sourceAcceptanceTransitionEvent              = "source_acceptance_transition"
+	sourceAcceptanceInvalidationEvent            = "source_acceptance_invalidation"
 )
 
 type completeTurnSourceObservation struct {
 	ContractVersion               string `json:"contract_version"`
+	HostLifecycleContractVersion  string `json:"host_lifecycle_contract_version"`
 	ObservedAtMS                  int64  `json:"observed_at_ms"`
 	SessionID                     string `json:"session_id"`
+	FinalitySource                string `json:"finality_source"`
+	FinalityState                 string `json:"finality_state"`
+	HostSignalSource              string `json:"host_signal_source"`
+	ArchiveCenterCorrelationID    string `json:"archive_center_request_correlation_id"`
+	RequestIDProvenance           string `json:"request_id_provenance"`
+	RequestCorrelationState       string `json:"request_correlation_state"`
+	RequestType                   string `json:"request_type"`
+	ResponseRole                  string `json:"response_role"`
+	AfterRequestContentHash       string `json:"after_request_content_hash"`
 	HostChatID                    string `json:"host_chat_id"`
 	HostChatIDState               string `json:"host_chat_id_state"`
 	ChatStreamingState            string `json:"chat_streaming_state"`
@@ -36,6 +49,10 @@ type completeTurnSourceObservation struct {
 	MessageChatIDState            string `json:"message_chat_id_state"`
 	GenerationID                  string `json:"generation_id"`
 	GenerationIDState             string `json:"generation_id_state"`
+	BranchID                      string `json:"branch_id"`
+	BranchIDState                 string `json:"branch_id_state"`
+	MessageSwipeID                int    `json:"message_swipe_id"`
+	MessageSwipeIDState           string `json:"message_swipe_id_state"`
 	MessageTimeMS                 int64  `json:"message_time_ms"`
 	MessageTimeState              string `json:"message_time_state"`
 	UserMessageIndex              int    `json:"user_message_index"`
@@ -45,6 +62,7 @@ type completeTurnSourceObservation struct {
 	UserMessageTimeState          string `json:"user_message_time_state"`
 	UserObservedContentHash       string `json:"user_observed_content_hash"`
 	UserPersistenceContentHash    string `json:"user_persistence_content_hash"`
+	RequestMessageCount           int    `json:"request_message_count"`
 	ObservedContentHash           string `json:"observed_content_hash"`
 	PersistenceContentHash        string `json:"persistence_content_hash"`
 	HashAlgorithm                 string `json:"hash_algorithm"`
@@ -52,6 +70,9 @@ type completeTurnSourceObservation struct {
 	LaterActiveTurnMessageCount   int    `json:"later_active_turn_message_count"`
 	LaterDisabledTurnMessageCount int    `json:"later_disabled_turn_message_count"`
 	LaterNonTurnMessageCount      int    `json:"later_non_turn_message_count"`
+	NextSignalActiveRole          string `json:"next_signal_active_role"`
+	NextSignalUserIndex           int    `json:"next_signal_user_index"`
+	NextSignalUserContentHash     string `json:"next_signal_user_observed_content_hash"`
 	MessageDisabledState          string `json:"message_disabled_state"`
 	RevisionState                 string `json:"revision_state"`
 }
@@ -61,7 +82,12 @@ type completeTurnSourceAcceptanceState struct {
 	TurnIndex         int    `json:"turn_index"`
 	Revision          string `json:"revision"`
 	GenerationID      string `json:"generation_id,omitempty"`
+	MessageChatID     string `json:"message_chat_id,omitempty"`
 	HostChatID        string `json:"host_chat_id,omitempty"`
+	BranchID          string `json:"branch_id,omitempty"`
+	BranchIDState     string `json:"branch_id_state,omitempty"`
+	MessageSwipeID    int    `json:"message_swipe_id,omitempty"`
+	MessageSwipeState string `json:"message_swipe_id_state,omitempty"`
 	ContentHash       string `json:"content_hash"`
 	ObservedAtMS      int64  `json:"observed_at_ms"`
 	Lifecycle         string `json:"lifecycle"`
@@ -81,6 +107,7 @@ type completeTurnSourceAcceptanceDecision struct {
 	BoundTurn       int
 	LogicalTurnID   string
 	ReplaceExisting bool
+	ReplacementKind string
 	Observation     completeTurnSourceObservation
 }
 
@@ -92,20 +119,30 @@ type sourceAcceptanceInvalidation struct {
 type completeTurnSourceAcceptanceWorker struct {
 	revision string
 	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+type completeTurnSourceReprocessingWorker struct {
+	sessionID string
+	turnIndex int
+	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 type completeTurnSourceAcceptanceLedger struct {
-	mu            sync.Mutex
-	current       map[string]completeTurnSourceAcceptanceState
-	invalidations map[string]sourceAcceptanceInvalidation
-	workers       map[string]completeTurnSourceAcceptanceWorker
+	mu                  sync.Mutex
+	current             map[string]completeTurnSourceAcceptanceState
+	invalidations       map[string]sourceAcceptanceInvalidation
+	workers             map[string]completeTurnSourceAcceptanceWorker
+	reprocessingWorkers map[string]*completeTurnSourceReprocessingWorker
 }
 
 func newCompleteTurnSourceAcceptanceLedger() *completeTurnSourceAcceptanceLedger {
 	return &completeTurnSourceAcceptanceLedger{
-		current:       map[string]completeTurnSourceAcceptanceState{},
-		invalidations: map[string]sourceAcceptanceInvalidation{},
-		workers:       map[string]completeTurnSourceAcceptanceWorker{},
+		current:             map[string]completeTurnSourceAcceptanceState{},
+		invalidations:       map[string]sourceAcceptanceInvalidation{},
+		workers:             map[string]completeTurnSourceAcceptanceWorker{},
+		reprocessingWorkers: map[string]*completeTurnSourceReprocessingWorker{},
 	}
 }
 
@@ -130,12 +167,60 @@ func completeTurnSourceObservationFromMeta(meta map[string]any) (completeTurnSou
 }
 
 func completeTurnSourceRevision(sid string, turnIndex int, observation completeTurnSourceObservation) string {
+	if observation.ContractVersion == completeTurnAfterRequestAcceptanceContract {
+		seed := strings.Join([]string{
+			sid,
+			strconv.Itoa(turnIndex),
+			observation.ContractVersion,
+			observation.HostLifecycleContractVersion,
+			observation.FinalitySource,
+			observation.HostSignalSource,
+			observation.ArchiveCenterCorrelationID,
+			observation.RequestIDProvenance,
+			observation.RequestCorrelationState,
+			observation.HostChatID,
+			strconv.Itoa(observation.UserMessageIndex),
+			observation.UserMessageChatID,
+			strconv.FormatInt(observation.UserMessageTimeMS, 10),
+			observation.UserObservedContentHash,
+			observation.PersistenceContentHash,
+		}, "\x1f")
+		return "sar_" + strings.TrimPrefix(prepareOR1CHash(seed), "or1c_")
+	}
+	if observation.ContractVersion == completeTurnNextHostSignalAcceptanceContract {
+		seed := strings.Join([]string{
+			sid,
+			strconv.Itoa(turnIndex),
+			observation.ContractVersion,
+			observation.HostLifecycleContractVersion,
+			observation.FinalitySource,
+			observation.HostSignalSource,
+			observation.ArchiveCenterCorrelationID,
+			observation.RequestIDProvenance,
+			observation.RequestCorrelationState,
+			observation.HostChatID,
+			strconv.Itoa(observation.UserMessageIndex),
+			observation.UserMessageChatID,
+			strconv.FormatInt(observation.UserMessageTimeMS, 10),
+			observation.UserObservedContentHash,
+			observation.MessageChatID,
+			observation.GenerationID,
+			observedCompleteTurnBranchIdentity(observation),
+			observedCompleteTurnSwipeIdentity(observation),
+			strconv.FormatInt(observation.MessageTimeMS, 10),
+			strconv.Itoa(observation.MessageIndex),
+			observation.PersistenceContentHash,
+		}, "\x1f")
+		return "sar_" + strings.TrimPrefix(prepareOR1CHash(seed), "or1c_")
+	}
 	seed := strings.Join([]string{
 		sid,
 		strconv.Itoa(turnIndex),
 		observation.HostChatID,
 		observation.MessageChatID,
 		observation.GenerationID,
+		observedCompleteTurnBranchIdentity(observation),
+		observedCompleteTurnSwipeIdentity(observation),
 		strconv.FormatInt(observation.MessageTimeMS, 10),
 		strconv.Itoa(observation.MessageIndex),
 		observation.ObservedContentHash,
@@ -146,19 +231,83 @@ func completeTurnSourceRevision(sid string, turnIndex int, observation completeT
 
 func completeTurnLogicalTurnID(sid string, observation completeTurnSourceObservation) string {
 	chatIdentity := strings.TrimSpace(observation.HostChatID)
-	if observation.HostChatIDState != "observed" || chatIdentity == "" {
+	if (observation.HostChatIDState != "observed" && observation.HostChatIDState != "observed_before_request") || chatIdentity == "" {
 		chatIdentity = sid
 	}
 	userIdentity := strings.TrimSpace(observation.UserMessageChatID)
-	if observation.UserMessageChatIDState != "observed" || userIdentity == "" {
+	if (observation.UserMessageChatIDState != "observed" && observation.UserMessageChatIDState != "observed_before_request") || userIdentity == "" {
 		userIdentity = strings.Join([]string{
 			strconv.Itoa(observation.UserMessageIndex),
 			strconv.FormatInt(observation.UserMessageTimeMS, 10),
 			observation.UserObservedContentHash,
 		}, "\x1f")
 	}
-	seed := strings.Join([]string{sid, chatIdentity, userIdentity}, "\x1f")
+	seed := strings.Join([]string{sid, chatIdentity, observedCompleteTurnBranchIdentity(observation), userIdentity}, "\x1f")
 	return "lt_" + strings.TrimPrefix(prepareOR1CHash(seed), "or1c_")
+}
+
+func observedCompleteTurnBranchIdentity(observation completeTurnSourceObservation) string {
+	if observation.BranchIDState != "observed" {
+		return ""
+	}
+	return strings.TrimSpace(observation.BranchID)
+}
+
+func validateCompleteTurnBranchObservation(observation completeTurnSourceObservation) string {
+	state := strings.TrimSpace(observation.BranchIDState)
+	branchID := strings.TrimSpace(observation.BranchID)
+	switch state {
+	case "", "unobserved", "not_exposed_by_risuai":
+		if branchID != "" {
+			return "source_acceptance_branch_identity_state_invalid"
+		}
+	case "observed":
+		if branchID == "" {
+			return "source_acceptance_branch_identity_missing"
+		}
+	default:
+		return "source_acceptance_branch_identity_state_invalid"
+	}
+	return ""
+}
+
+func observedCompleteTurnSwipeIdentity(observation completeTurnSourceObservation) string {
+	if observation.MessageSwipeIDState != "observed" || observation.MessageSwipeID < 0 {
+		return ""
+	}
+	return "swipe:" + strconv.Itoa(observation.MessageSwipeID)
+}
+
+func validateCompleteTurnSwipeObservation(observation completeTurnSourceObservation) string {
+	switch strings.TrimSpace(observation.MessageSwipeIDState) {
+	case "", "unobserved":
+		return ""
+	case "not_present":
+		if observation.MessageSwipeID != -1 {
+			return "source_acceptance_swipe_identity_state_invalid"
+		}
+	case "observed":
+		if observation.MessageSwipeID < 0 {
+			return "source_acceptance_swipe_identity_missing"
+		}
+	default:
+		return "source_acceptance_swipe_identity_state_invalid"
+	}
+	return ""
+}
+
+func completeTurnObservedSwipeTransition(previous completeTurnSourceAcceptanceState, observation completeTurnSourceObservation) bool {
+	previousKnown := previous.MessageSwipeState == "observed" || previous.MessageSwipeState == "not_present"
+	currentKnown := observation.MessageSwipeIDState == "observed" || observation.MessageSwipeIDState == "not_present"
+	if !previousKnown || !currentKnown {
+		return false
+	}
+	previousObserved := previous.MessageSwipeState == "observed" && previous.MessageSwipeID >= 0
+	currentObserved := observation.MessageSwipeIDState == "observed" && observation.MessageSwipeID >= 0
+	if previousObserved && currentObserved {
+		return previous.MessageSwipeID != observation.MessageSwipeID
+	}
+	return previousObserved != currentObserved
 }
 
 func rejectedCompleteTurnSourceAcceptance(reason string, retryable bool, observation completeTurnSourceObservation) completeTurnSourceAcceptanceDecision {
@@ -184,11 +333,25 @@ func rejectedCompleteTurnSourceAcceptance(reason string, retryable bool, observa
 
 func validateCompleteTurnSourceObservation(req dto.M4CompleteTurnRequest, observation completeTurnSourceObservation) completeTurnSourceAcceptanceDecision {
 	sid := strings.TrimSpace(req.ChatSessionID)
-	if observation.ContractVersion != completeTurnSourceAcceptanceContract {
+	if observation.ContractVersion != completeTurnSourceAcceptanceContract &&
+		observation.ContractVersion != completeTurnNextHostSignalAcceptanceContract &&
+		observation.ContractVersion != completeTurnAfterRequestAcceptanceContract {
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_contract_incompatible", false, observation)
 	}
 	if observation.SessionID != sid || observation.ObservedAtMS <= 0 {
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_identity_missing_or_mismatch", false, observation)
+	}
+	if reason := validateCompleteTurnBranchObservation(observation); reason != "" {
+		return rejectedCompleteTurnSourceAcceptance(reason, false, observation)
+	}
+	if reason := validateCompleteTurnSwipeObservation(observation); reason != "" {
+		return rejectedCompleteTurnSourceAcceptance(reason, false, observation)
+	}
+	if observation.ContractVersion == completeTurnNextHostSignalAcceptanceContract {
+		return validateCompleteTurnNextHostSignalObservation(req, observation)
+	}
+	if observation.ContractVersion == completeTurnAfterRequestAcceptanceContract {
+		return validateCompleteTurnAfterRequestObservation(req, observation)
 	}
 	if observation.ChatStreamingState == "streaming" {
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_streaming_candidate", true, observation)
@@ -212,7 +375,7 @@ func validateCompleteTurnSourceObservation(req dto.M4CompleteTurnRequest, observ
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_not_assistant_message", false, observation)
 	}
 	if observation.MessageDisabledState == "disabled" {
-		return rejectedCompleteTurnSourceAcceptance("source_acceptance_assistant_message_disabled", true, observation)
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_assistant_message_disabled", false, observation)
 	}
 	if observation.MessageDisabledState != "" && observation.MessageDisabledState != "unobserved" && observation.MessageDisabledState != "not_disabled" {
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_message_visibility_observation_invalid", false, observation)
@@ -237,6 +400,214 @@ func validateCompleteTurnSourceObservation(req dto.M4CompleteTurnRequest, observ
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_persistence_content_mismatch", false, observation)
 	}
 	return completeTurnSourceAcceptanceDecision{Enabled: true, Accepted: true, Status: "accepted", Reason: "active_final_observation_accepted", QueueAction: "remove", Observation: observation}
+}
+
+func validateCompleteTurnAfterRequestObservation(req dto.M4CompleteTurnRequest, observation completeTurnSourceObservation) completeTurnSourceAcceptanceDecision {
+	if observation.HostLifecycleContractVersion != completeTurnRisuHostLifecycleContract ||
+		observation.FinalitySource != "risu_afterRequest" ||
+		observation.FinalityState != "received_final_response" ||
+		observation.HostSignalSource != "afterRequest" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_lifecycle_invalid", false, observation)
+	}
+	if observation.RequestIDProvenance != "archive_center_correlation" ||
+		observation.RequestCorrelationState != "matched_before_request_context" ||
+		observation.RequestType != "model" ||
+		observation.ResponseRole != "assistant" ||
+		strings.TrimSpace(observation.ArchiveCenterCorrelationID) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_correlation_invalid", false, observation)
+	}
+	metaCorrelation, _ := req.ClientMeta["archive_center_request_correlation_id"].(string)
+	if strings.TrimSpace(metaCorrelation) == "" ||
+		strings.TrimSpace(metaCorrelation) != strings.TrimSpace(observation.ArchiveCenterCorrelationID) {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_correlation_mismatch", false, observation)
+	}
+	if observation.HostChatIDState != "observed_before_request" ||
+		strings.TrimSpace(observation.HostChatID) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_chat_identity_missing", false, observation)
+	}
+	userMessageChatIDObserved := observation.UserMessageChatIDState == "observed_before_request" &&
+		strings.TrimSpace(observation.UserMessageChatID) != ""
+	userMessageChatIDUnobserved := observation.UserMessageChatIDState == "unobserved" &&
+		strings.TrimSpace(observation.UserMessageChatID) == ""
+	userMessageTimeObserved := observation.UserMessageTimeState == "observed_before_request" &&
+		observation.UserMessageTimeMS > 0
+	userMessageTimeUnobserved := observation.UserMessageTimeState == "unobserved" &&
+		observation.UserMessageTimeMS == 0
+	if observation.RequestMessageCount <= 0 ||
+		observation.UserMessageIndex < 0 ||
+		observation.UserMessageIndex >= observation.RequestMessageCount ||
+		(!userMessageChatIDObserved && !userMessageChatIDUnobserved) ||
+		(!userMessageTimeObserved && !userMessageTimeUnobserved) ||
+		strings.TrimSpace(observation.UserObservedContentHash) == "" ||
+		strings.TrimSpace(observation.UserPersistenceContentHash) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_user_anchor_missing", false, observation)
+	}
+	if req.UserInput == nil {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_missing", false, observation)
+	}
+	userHash := prepareOR1CHash(strings.TrimSpace(*req.UserInput))
+	if observation.UserObservedContentHash != userHash ||
+		observation.UserPersistenceContentHash != userHash {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_mismatch", false, observation)
+	}
+	if observation.ChatStreamingState != "not_exposed_by_risu_afterRequest" ||
+		observation.ActiveMessageCount != 0 ||
+		observation.MessageIndex != -1 ||
+		observation.MessageRole != "" ||
+		observation.MessageChatID != "" ||
+		observation.MessageChatIDState != "not_exposed_by_risu_afterRequest" ||
+		observation.GenerationID != "" ||
+		observation.GenerationIDState != "not_exposed_by_risu_afterRequest" ||
+		observation.BranchID != "" ||
+		observation.BranchIDState != "not_exposed_by_risuai" ||
+		observation.MessageSwipeID != -1 ||
+		observation.MessageSwipeIDState != "unobserved" ||
+		observation.MessageTimeMS != 0 ||
+		observation.MessageTimeState != "not_exposed_by_risu_afterRequest" ||
+		observation.PositionObservation != "not_exposed_by_risu_afterRequest" ||
+		observation.LaterActiveTurnMessageCount != 0 ||
+		observation.LaterDisabledTurnMessageCount != 0 ||
+		observation.LaterNonTurnMessageCount != 0 ||
+		observation.NextSignalActiveRole != "" ||
+		(observation.NextSignalUserIndex != 0 && observation.NextSignalUserIndex != -1) ||
+		observation.NextSignalUserContentHash != "" ||
+		observation.MessageDisabledState != "not_exposed_by_risu_afterRequest" ||
+		observation.RevisionState != "not_exposed_by_risuai" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_active_chat_facts_invalid", false, observation)
+	}
+	if observation.HashAlgorithm != "or1c_utf16_djb2.v1" ||
+		strings.TrimSpace(observation.AfterRequestContentHash) == "" ||
+		strings.TrimSpace(observation.ObservedContentHash) == "" ||
+		strings.TrimSpace(observation.PersistenceContentHash) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_content_observation_missing", false, observation)
+	}
+	if req.AssistantContent == nil {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_persistence_content_missing", false, observation)
+	}
+	assistantHash := prepareOR1CHash(sanitizeCriticStorageText(*req.AssistantContent))
+	if observation.AfterRequestContentHash != assistantHash {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_after_request_content_mismatch", false, observation)
+	}
+	if observation.ObservedContentHash != assistantHash ||
+		observation.PersistenceContentHash != assistantHash {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_persistence_content_mismatch", false, observation)
+	}
+	return completeTurnSourceAcceptanceDecision{
+		Enabled: true, Accepted: true, Status: "accepted",
+		Reason:      "after_request_final_response_observation_accepted",
+		QueueAction: "remove", Observation: observation,
+	}
+}
+
+func validateCompleteTurnNextHostSignalObservation(req dto.M4CompleteTurnRequest, observation completeTurnSourceObservation) completeTurnSourceAcceptanceDecision {
+	if observation.HostLifecycleContractVersion != completeTurnRisuHostLifecycleContract ||
+		observation.FinalitySource != "risu_next_host_signal_active_chat" ||
+		observation.FinalityState != "committed_assistant_observed" ||
+		(observation.HostSignalSource != "input" && observation.HostSignalSource != "beforeRequest") {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_lifecycle_invalid", false, observation)
+	}
+	if observation.RequestIDProvenance != "archive_center_correlation" ||
+		observation.RequestCorrelationState != "matched_before_request_context" ||
+		observation.RequestType != "model" ||
+		observation.ResponseRole != "assistant" ||
+		strings.TrimSpace(observation.ArchiveCenterCorrelationID) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_correlation_invalid", false, observation)
+	}
+	metaCorrelation, _ := req.ClientMeta["archive_center_request_correlation_id"].(string)
+	if strings.TrimSpace(metaCorrelation) == "" ||
+		strings.TrimSpace(metaCorrelation) != strings.TrimSpace(observation.ArchiveCenterCorrelationID) {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_correlation_mismatch", false, observation)
+	}
+	if observation.HostChatIDState != "observed" ||
+		strings.TrimSpace(observation.HostChatID) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_chat_identity_missing", false, observation)
+	}
+	if observation.ChatStreamingState == "streaming" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_streaming_candidate", true, observation)
+	}
+	if observation.ChatStreamingState != "not_streaming" && observation.ChatStreamingState != "unobserved" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_streaming_observation_invalid", false, observation)
+	}
+	if observation.PositionObservation != "committed_before_next_host_signal" ||
+		observation.ActiveMessageCount <= 0 ||
+		observation.MessageIndex < 0 ||
+		observation.MessageIndex >= observation.ActiveMessageCount ||
+		observation.MessageRole != "char" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_message_invalid", false, observation)
+	}
+	if observation.MessageDisabledState != "not_disabled" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_assistant_message_disabled", false, observation)
+	}
+	if observation.MessageChatIDState != "observed" && observation.MessageChatIDState != "unobserved" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_message_identity_invalid", false, observation)
+	}
+	if observation.MessageChatIDState == "observed" && strings.TrimSpace(observation.MessageChatID) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_message_identity_invalid", false, observation)
+	}
+	if observation.GenerationIDState != "observed" && observation.GenerationIDState != "unobserved" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_generation_invalid", false, observation)
+	}
+	if (observation.GenerationIDState == "observed") != (strings.TrimSpace(observation.GenerationID) != "") {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_generation_invalid", false, observation)
+	}
+	if observation.MessageTimeState != "observed" && observation.MessageTimeState != "unobserved" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_message_time_invalid", false, observation)
+	}
+	if (observation.MessageTimeState == "observed") != (observation.MessageTimeMS > 0) {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_message_time_invalid", false, observation)
+	}
+	if observation.LaterActiveTurnMessageCount < 0 || observation.LaterActiveTurnMessageCount > 1 {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_stale_or_superseded", false, observation)
+	}
+	if observation.LaterActiveTurnMessageCount == 1 {
+		if observation.NextSignalActiveRole != "user" ||
+			observation.NextSignalUserIndex <= observation.MessageIndex ||
+			observation.NextSignalUserIndex >= observation.ActiveMessageCount ||
+			strings.TrimSpace(observation.NextSignalUserContentHash) == "" {
+			return rejectedCompleteTurnSourceAcceptance("source_acceptance_stale_or_superseded", false, observation)
+		}
+	} else if observation.NextSignalActiveRole != "" ||
+		observation.NextSignalUserIndex != -1 ||
+		strings.TrimSpace(observation.NextSignalUserContentHash) != "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_signal_anchor_invalid", false, observation)
+	}
+	if observation.HashAlgorithm != "or1c_utf16_djb2.v1" ||
+		strings.TrimSpace(observation.ObservedContentHash) == "" ||
+		strings.TrimSpace(observation.PersistenceContentHash) == "" {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_next_host_signal_content_observation_missing", false, observation)
+	}
+	if req.AssistantContent == nil ||
+		prepareOR1CHash(sanitizeCriticStorageText(*req.AssistantContent)) != observation.PersistenceContentHash {
+		return rejectedCompleteTurnSourceAcceptance("source_acceptance_persistence_content_mismatch", false, observation)
+	}
+	userAnchorReported := observation.UserObservedContentHash != "" ||
+		observation.UserPersistenceContentHash != "" ||
+		observation.UserMessageChatID != ""
+	if userAnchorReported {
+		if observation.UserMessageIndex < 0 ||
+			observation.UserMessageIndex >= observation.RequestMessageCount ||
+			observation.UserObservedContentHash == "" ||
+			observation.UserPersistenceContentHash == "" {
+			return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_missing", false, observation)
+		}
+		if observation.UserMessageChatIDState != "observed_before_request" &&
+			observation.UserMessageChatIDState != "unobserved" {
+			return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_state_invalid", false, observation)
+		}
+		if observation.UserMessageTimeState != "observed_before_request" &&
+			observation.UserMessageTimeState != "unobserved" {
+			return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_state_invalid", false, observation)
+		}
+		if req.UserInput == nil ||
+			prepareOR1CHash(strings.TrimSpace(*req.UserInput)) != observation.UserPersistenceContentHash {
+			return rejectedCompleteTurnSourceAcceptance("source_acceptance_user_anchor_mismatch", false, observation)
+		}
+	}
+	return completeTurnSourceAcceptanceDecision{
+		Enabled: true, Accepted: true, Status: "accepted",
+		Reason:      "next_host_signal_finality_observation_accepted",
+		QueueAction: "remove", Observation: observation,
+	}
 }
 
 func sourceAcceptanceStateKey(sid string, turnIndex int) string {
@@ -269,7 +640,11 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 		s.SourceAcceptances = ledger
 	}
 	ledger.mu.Lock()
-	defer ledger.mu.Unlock()
+	var supersededWorkerDone []<-chan struct{}
+	defer func() {
+		ledger.mu.Unlock()
+		waitForCompleteTurnSourceWorkers(supersededWorkerDone)
+	}()
 	ledger.loadDurableStateLocked(ctx, s.Store, sid)
 	latestCanonicalTurn := 0
 	if s.Store != nil {
@@ -281,23 +656,7 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 			}
 		}
 	}
-	// A lower observed turn cannot belong to this canonical tail. Do not turn
-	// an active-chat turn 35 into backend turn 52: that would preserve the
-	// routing mistake and contaminate the wrong session. The host must resolve
-	// the active RisuAI chat identity again before retrying.
-	if latestCanonicalTurn > 0 && turnIndex < latestCanonicalTurn {
-		// 포크 추가: 어긋난 두 숫자를 찍어야 화면/DB 중 어느 쪽이 밀렸는지 판단할 수 있다.
-		slog.Warn("session tail conflict",
-			"session_id", sid,
-			"incoming_turn", turnIndex,
-			"latest_canonical_turn", latestCanonicalTurn,
-			"active_message_count", observation.ActiveMessageCount,
-		)
-		conflict := rejectedCompleteTurnSourceAcceptance("source_acceptance_session_tail_conflict", true, observation)
-		conflict.LogicalTurnID = decision.LogicalTurnID
-		conflict.BoundTurn = turnIndex
-		return conflict
-	}
+	logicalTurnResolved := false
 	for _, candidate := range ledger.current {
 		if decision.LogicalTurnID == "" {
 			break
@@ -307,21 +666,39 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 		}
 		if candidate.ObservedAtMS > 0 && (turnIndex <= 0 || candidate.ObservedAtMS >= ledger.current[sourceAcceptanceStateKey(sid, turnIndex)].ObservedAtMS) {
 			turnIndex = candidate.TurnIndex
+			logicalTurnResolved = true
 		}
+	}
+	legacyTurnResolved := false
+	legacyLogicalTurnMatch := false
+	if !logicalTurnResolved && decision.LogicalTurnID != "" && s.Store != nil {
+		if logs, err := s.Store.ListChatLogs(ctx, sid, turnIndex, turnIndex); err == nil {
+			userMatches, assistantMatches := completeTurnRawRoleContentMatches(logs, sid, turnIndex, *req.UserInput, *req.AssistantContent)
+			_, hasAssistant := completeTurnRawRolePresence(logs, sid, turnIndex)
+			legacyTurnResolved = userMatches && hasAssistant
+			legacyLogicalTurnMatch = legacyTurnResolved && !assistantMatches
+		}
+	}
+	// RisuAI message indexes identify the observed Host message; they are not
+	// canonical Archive Center turn numbers. Reuse an existing logical turn
+	// above for rerolls/edits, otherwise append after the committed DB tail.
+	if !logicalTurnResolved && !legacyTurnResolved && latestCanonicalTurn > 0 && turnIndex <= latestCanonicalTurn {
+		// 포크 추가: 3.9부터 tail 충돌을 거부하지 않고 여기서 조용히 밀어내므로,
+		// 어긋난 두 숫자를 찍어야 화면/DB 중 어느 쪽이 밀렸는지 판단할 수 있다.
+		slog.Warn("turn index rebased onto canonical tail",
+			"session_id", sid,
+			"incoming_turn", turnIndex,
+			"latest_canonical_turn", latestCanonicalTurn,
+			"rebased_turn", latestCanonicalTurn+1,
+			"active_message_count", observation.ActiveMessageCount,
+		)
+		turnIndex = latestCanonicalTurn + 1
 	}
 	decision.Revision = completeTurnSourceRevision(sid, turnIndex, observation)
 	decision.BoundTurn = turnIndex
 	key := sourceAcceptanceStateKey(sid, turnIndex)
 	previous := ledger.current[key]
 	decision.Previous = previous.Revision
-	legacyLogicalTurnMatch := false
-	if decision.LogicalTurnID != "" && previous.LogicalTurnID == "" && s.Store != nil {
-		if logs, err := s.Store.ListChatLogs(ctx, sid, turnIndex, turnIndex); err == nil {
-			userMatches, assistantMatches := completeTurnRawRoleContentMatches(logs, sid, turnIndex, *req.UserInput, *req.AssistantContent)
-			_, hasAssistant := completeTurnRawRolePresence(logs, sid, turnIndex)
-			legacyLogicalTurnMatch = userMatches && hasAssistant && !assistantMatches
-		}
-	}
 	if invalidation := ledger.invalidations[sid]; invalidation.FromTurn > 0 && turnIndex >= invalidation.FromTurn && observation.ObservedAtMS <= invalidation.ObservedAtMS {
 		return rejectedCompleteTurnSourceAcceptance("source_acceptance_deleted_or_rolled_back", false, observation)
 	}
@@ -338,7 +715,38 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 			return stale
 		}
 	}
-	decision.ReplaceExisting = (previous.Revision != "" && previous.LogicalTurnID == decision.LogicalTurnID && previous.ContentHash != observation.ObservedContentHash) || legacyLogicalTurnMatch
+	// Revision identity, not only text inequality, owns supersession. A reroll
+	// may legitimately produce byte-identical text under a new Host-observed
+	// generation/message identity; that new accepted revision still supersedes
+	// the prior active worker fence.
+	decision.ReplaceExisting = (previous.Revision != "" &&
+		previous.LogicalTurnID == decision.LogicalTurnID &&
+		previous.Revision != decision.Revision) || legacyLogicalTurnMatch
+	if decision.ReplaceExisting {
+		switch {
+		case previous.Revision == "":
+			decision.ReplacementKind = "canonical_content_replacement"
+		case previous.MessageChatID != "" || observation.MessageChatID != "":
+			if previous.MessageChatID == observation.MessageChatID &&
+				previous.GenerationID == observation.GenerationID {
+				if completeTurnObservedSwipeTransition(previous, observation) {
+					decision.ReplacementKind = "host_observed_reroll"
+				} else {
+					decision.ReplacementKind = "host_observed_edit"
+				}
+			} else {
+				decision.ReplacementKind = "host_observed_reroll"
+			}
+		case previous.GenerationID != "" && previous.GenerationID == observation.GenerationID:
+			if completeTurnObservedSwipeTransition(previous, observation) {
+				decision.ReplacementKind = "host_observed_reroll"
+			} else {
+				decision.ReplacementKind = "host_observed_edit"
+			}
+		default:
+			decision.ReplacementKind = "host_observed_reroll"
+		}
+	}
 	var superseded *completeTurnSourceAcceptanceState
 	if decision.ReplaceExisting {
 		prior := previous
@@ -350,7 +758,10 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 	}
 	state := completeTurnSourceAcceptanceState{
 		SessionID: sid, TurnIndex: turnIndex, Revision: decision.Revision,
-		GenerationID: observation.GenerationID, HostChatID: observation.HostChatID,
+		GenerationID: observation.GenerationID, MessageChatID: observation.MessageChatID,
+		HostChatID: observation.HostChatID, BranchID: observedCompleteTurnBranchIdentity(observation),
+		BranchIDState:  firstNonEmpty(observation.BranchIDState, "not_exposed_by_risuai"),
+		MessageSwipeID: observation.MessageSwipeID, MessageSwipeState: observation.MessageSwipeIDState,
 		ContentHash: observation.ObservedContentHash, ObservedAtMS: observation.ObservedAtMS,
 		Lifecycle: "active_final", LogicalTurnID: decision.LogicalTurnID,
 	}
@@ -359,7 +770,19 @@ func (s *Server) beginCompleteTurnSourceAcceptance(ctx context.Context, req dto.
 	}
 	if worker := ledger.workers[key]; worker.cancel != nil && worker.revision != decision.Revision {
 		worker.cancel()
+		if worker.done != nil {
+			supersededWorkerDone = append(supersededWorkerDone, worker.done)
+		}
 		delete(ledger.workers, key)
+	}
+	if previous.Revision != "" && previous.Revision != decision.Revision {
+		if worker := ledger.reprocessingWorkers[previous.Revision]; worker != nil {
+			worker.cancel()
+			if worker.done != nil {
+				supersededWorkerDone = append(supersededWorkerDone, worker.done)
+			}
+			delete(ledger.reprocessingWorkers, previous.Revision)
+		}
 	}
 	ledger.current[key] = state
 	if s.Store != nil && s.usesShadowWriteStore() {
@@ -443,7 +866,8 @@ func (s *Server) completeTurnSourceAcceptanceProcessingContext(parent context.Co
 	if previous := s.SourceAcceptances.workers[key]; previous.cancel != nil && previous.revision != decision.Revision {
 		previous.cancel()
 	}
-	s.SourceAcceptances.workers[key] = completeTurnSourceAcceptanceWorker{revision: decision.Revision, cancel: cancel}
+	worker := completeTurnSourceAcceptanceWorker{revision: decision.Revision, cancel: cancel, done: make(chan struct{})}
+	s.SourceAcceptances.workers[key] = worker
 	s.SourceAcceptances.mu.Unlock()
 	return ctx, func() {
 		s.SourceAcceptances.mu.Lock()
@@ -452,14 +876,97 @@ func (s *Server) completeTurnSourceAcceptanceProcessingContext(parent context.Co
 		}
 		s.SourceAcceptances.mu.Unlock()
 		cancel()
+		close(worker.done)
 	}
+}
+
+func (s *Server) completeTurnStoredSourceProcessingContext(parent context.Context, source *store.MemorySourceRevision) (context.Context, func()) {
+	if source == nil ||
+		strings.TrimSpace(source.ChatSessionID) == "" ||
+		strings.TrimSpace(source.SourceRevision) == "" ||
+		source.TurnIndex <= 0 {
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	ledger := s.SourceAcceptances
+	if ledger == nil {
+		ledger = newCompleteTurnSourceAcceptanceLedger()
+		s.SourceAcceptances = ledger
+	}
+	worker := &completeTurnSourceReprocessingWorker{
+		sessionID: source.ChatSessionID,
+		turnIndex: source.TurnIndex,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
+	var previousDone <-chan struct{}
+	ledger.mu.Lock()
+	if previous := ledger.reprocessingWorkers[source.SourceRevision]; previous != nil {
+		previous.cancel()
+		previousDone = previous.done
+	}
+	ledger.reprocessingWorkers[source.SourceRevision] = worker
+	ledger.mu.Unlock()
+	waitForCompleteTurnSourceWorkers([]<-chan struct{}{previousDone})
+	return ctx, func() {
+		ledger.mu.Lock()
+		if ledger.reprocessingWorkers[source.SourceRevision] == worker {
+			delete(ledger.reprocessingWorkers, source.SourceRevision)
+		}
+		ledger.mu.Unlock()
+		cancel()
+		close(worker.done)
+	}
+}
+
+func waitForCompleteTurnSourceWorkers(workers []<-chan struct{}) {
+	for _, done := range workers {
+		if done != nil {
+			<-done
+		}
+	}
+}
+
+func (s *Server) cancelCompleteTurnSourceWorkers(sid string, fromTurn int) {
+	if strings.TrimSpace(sid) == "" || fromTurn <= 0 || s.SourceAcceptances == nil {
+		return
+	}
+	ledger := s.SourceAcceptances
+	var workers []<-chan struct{}
+	ledger.mu.Lock()
+	for key, state := range ledger.current {
+		if state.SessionID != sid || state.TurnIndex < fromTurn {
+			continue
+		}
+		if worker := ledger.workers[key]; worker.cancel != nil {
+			worker.cancel()
+			if worker.done != nil {
+				workers = append(workers, worker.done)
+			}
+			delete(ledger.workers, key)
+		}
+	}
+	for revision, worker := range ledger.reprocessingWorkers {
+		if worker == nil || worker.sessionID != sid || worker.turnIndex < fromTurn {
+			continue
+		}
+		worker.cancel()
+		if worker.done != nil {
+			workers = append(workers, worker.done)
+		}
+		delete(ledger.reprocessingWorkers, revision)
+	}
+	ledger.mu.Unlock()
+	waitForCompleteTurnSourceWorkers(workers)
 }
 
 func (l *completeTurnSourceAcceptanceLedger) loadDurableStateLocked(ctx context.Context, st store.Store, sid string) {
 	if st == nil {
 		return
 	}
-	if events, err := st.ListAuditLogs(ctx, sid, sourceAcceptanceTransitionEvent, 500); err == nil {
+	if events, err := st.ListAuditLogs(ctx, sid, sourceAcceptanceTransitionEvent, 0); err == nil {
 		for _, event := range events {
 			var state completeTurnSourceAcceptanceState
 			if json.Unmarshal([]byte(event.DetailsJSON), &state) != nil || state.TurnIndex <= 0 || state.Revision == "" {
@@ -475,7 +982,7 @@ func (l *completeTurnSourceAcceptanceLedger) loadDurableStateLocked(ctx context.
 			}
 		}
 	}
-	if events, err := st.ListAuditLogs(ctx, sid, sourceAcceptanceInvalidationEvent, 100); err == nil {
+	if events, err := st.ListAuditLogs(ctx, sid, sourceAcceptanceInvalidationEvent, 0); err == nil {
 		for _, event := range events {
 			var invalidation sourceAcceptanceInvalidation
 			if json.Unmarshal([]byte(event.DetailsJSON), &invalidation) != nil || invalidation.FromTurn <= 0 {
@@ -483,6 +990,29 @@ func (l *completeTurnSourceAcceptanceLedger) loadDurableStateLocked(ctx context.
 			}
 			if invalidation.ObservedAtMS > l.invalidations[sid].ObservedAtMS {
 				l.invalidations[sid] = invalidation
+			}
+		}
+	}
+	if lister, ok := st.(store.ActiveSourceRevisionLister); ok {
+		if sources, err := lister.ListActiveSourceRevisions(ctx, sid, 0, 0); err == nil {
+			for _, source := range sources {
+				if source.TurnIndex <= 0 || strings.TrimSpace(source.SourceRevision) == "" {
+					continue
+				}
+				l.current[sourceAcceptanceStateKey(sid, source.TurnIndex)] = completeTurnSourceAcceptanceState{
+					SessionID:         sid,
+					TurnIndex:         source.TurnIndex,
+					Revision:          source.SourceRevision,
+					GenerationID:      source.SourceGenerationID,
+					MessageChatID:     source.SourceMessageID,
+					BranchID:          source.BranchID,
+					BranchIDState:     source.BranchState,
+					ContentHash:       source.CombinedContentHash,
+					ObservedAtMS:      source.HostObservedAtMS,
+					Lifecycle:         "active_final",
+					LogicalTurnID:     source.LogicalTurnID,
+					ReplacementStatus: "",
+				}
 			}
 		}
 	}
@@ -536,6 +1066,7 @@ func (s *Server) invalidateCompleteTurnSourceAcceptances(ctx context.Context, si
 	ledger.mu.Lock()
 	ledger.loadDurableStateLocked(ctx, s.Store, sid)
 	hasAcceptedSource := false
+	var workers []<-chan struct{}
 	for _, state := range ledger.current {
 		if state.SessionID == sid && state.TurnIndex >= fromTurn && state.Lifecycle == "active_final" {
 			hasAcceptedSource = true
@@ -561,11 +1092,24 @@ func (s *Server) invalidateCompleteTurnSourceAcceptances(ctx context.Context, si
 			ledger.current[key] = state
 			if worker := ledger.workers[key]; worker.cancel != nil {
 				worker.cancel()
+				if worker.done != nil {
+					workers = append(workers, worker.done)
+				}
 				delete(ledger.workers, key)
 			}
 		}
 	}
+	for revision, worker := range ledger.reprocessingWorkers {
+		if worker != nil && worker.sessionID == sid && worker.turnIndex >= fromTurn {
+			worker.cancel()
+			if worker.done != nil {
+				workers = append(workers, worker.done)
+			}
+			delete(ledger.reprocessingWorkers, revision)
+		}
+	}
 	ledger.mu.Unlock()
+	waitForCompleteTurnSourceWorkers(workers)
 	if s.Store != nil && s.usesShadowWriteStore() {
 		invalidation := sourceAcceptanceInvalidation{FromTurn: fromTurn, ObservedAtMS: observedAt}
 		_ = s.Store.SaveAuditLog(context.WithoutCancel(ctx), &store.AuditLog{
@@ -597,13 +1141,23 @@ func completeTurnSourceAcceptancePayload(decision completeTurnSourceAcceptanceDe
 		"accepted": decision.Accepted, "retryable": decision.Retryable, "queue_action": decision.QueueAction,
 		"revision": decision.Revision, "previous_revision": decision.Previous,
 		"logical_turn_id": decision.LogicalTurnID, "replace_existing": decision.ReplaceExisting,
-		"host_revision_capability": decision.Observation.RevisionState,
-		"lifecycle":                lifecycle,
-		"generation_id":            nilIfEmpty(decision.Observation.GenerationID),
-		"generation_id_state":      decision.Observation.GenerationIDState,
-		"message_index":            decision.Observation.MessageIndex,
-		"observed_content_hash":    nilIfEmpty(decision.Observation.ObservedContentHash),
-		"persistence_content_hash": nilIfEmpty(decision.Observation.PersistenceContentHash),
-		"hash_algorithm":           nilIfEmpty(decision.Observation.HashAlgorithm),
+		"replacement_kind":                      nilIfEmpty(decision.ReplacementKind),
+		"observation_contract_version":          decision.Observation.ContractVersion,
+		"host_lifecycle_contract_version":       nilIfEmpty(decision.Observation.HostLifecycleContractVersion),
+		"finality_source":                       nilIfEmpty(decision.Observation.FinalitySource),
+		"request_id_provenance":                 nilIfEmpty(decision.Observation.RequestIDProvenance),
+		"archive_center_request_correlation_id": nilIfEmpty(decision.Observation.ArchiveCenterCorrelationID),
+		"host_revision_capability":              decision.Observation.RevisionState,
+		"lifecycle":                             lifecycle,
+		"generation_id":                         nilIfEmpty(decision.Observation.GenerationID),
+		"generation_id_state":                   decision.Observation.GenerationIDState,
+		"branch_id":                             nilIfEmpty(observedCompleteTurnBranchIdentity(decision.Observation)),
+		"branch_id_state":                       firstNonEmpty(decision.Observation.BranchIDState, "not_exposed_by_risuai"),
+		"message_swipe_id":                      decision.Observation.MessageSwipeID,
+		"message_swipe_id_state":                firstNonEmpty(decision.Observation.MessageSwipeIDState, "unobserved"),
+		"message_index":                         decision.Observation.MessageIndex,
+		"observed_content_hash":                 nilIfEmpty(decision.Observation.ObservedContentHash),
+		"persistence_content_hash":              nilIfEmpty(decision.Observation.PersistenceContentHash),
+		"hash_algorithm":                        nilIfEmpty(decision.Observation.HashAlgorithm),
 	}
 }

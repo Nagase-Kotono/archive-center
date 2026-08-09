@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/risulongmemory/archive-center-go/internal/config"
+	"github.com/risulongmemory/archive-center-go/internal/dto"
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
@@ -394,6 +395,63 @@ func TestRepairReplayWriteStoreDryRunAndReplay(t *testing.T) {
 	}
 }
 
+func TestRepairReplayProgressReportsRealEntryCounts(t *testing.T) {
+	existingUser := "already saved"
+	missingAssistant := "missing assistant"
+	newUser := "new user"
+	newAssistant := "new assistant"
+	fake := &turnRecordingStore{
+		returnChatLogs: []store.ChatLog{
+			{ChatSessionID: "sess-repair-progress", TurnIndex: 1, Role: "user", Content: existingUser},
+		},
+	}
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	srv := NewServer(cfg)
+	srv.Store = fake
+	srv.StoreOpenError = nil
+	progressSnapshots := []map[string]any{}
+	result, err := srv.runChatLogRepairReplayWithProgress(
+		context.Background(),
+		"sess-repair-progress",
+		dto.ChatLogRepairReplayRequest{
+			Entries: []dto.ChatLogRepairEntryRequest{
+				{TurnIndex: 1, UserContent: &existingUser, AssistantContent: &missingAssistant},
+				{TurnIndex: 2, UserContent: &newUser, AssistantContent: &newAssistant},
+			},
+		},
+		func(progress map[string]any) {
+			progressSnapshots = append(progressSnapshots, cloneMapAny(progress))
+		},
+	)
+	if err != nil {
+		t.Fatalf("repair replay with progress: %v", err)
+	}
+	if len(progressSnapshots) < 3 {
+		t.Fatalf("progress snapshot count=%d, want initial, operation phases, and completed entries", len(progressSnapshots))
+	}
+	first := progressSnapshots[0]
+	if first["processed"] != 0 || first["candidate_count"] != 2 {
+		t.Fatalf("initial progress=%#v, want 0/2 rather than 0/0", first)
+	}
+	seenPhases := map[string]bool{}
+	for _, snapshot := range progressSnapshots {
+		seenPhases[strings.TrimSpace(fmt.Sprint(snapshot["phase"]))] = true
+	}
+	for _, phase := range []string{"repair_replay_start", "list_chat_logs", "repair_roles", "entry_complete"} {
+		if !seenPhases[phase] {
+			t.Fatalf("progress phase %q missing: %#v", phase, progressSnapshots)
+		}
+	}
+	last := progressSnapshots[len(progressSnapshots)-1]
+	if last["processed"] != 2 || last["candidate_count"] != 2 || last["succeeded"] != 2 || last["progress_percent"] != 100 {
+		t.Fatalf("terminal repair progress=%#v, want 2/2 succeeded", last)
+	}
+	if result["processed"] != 2 || result["succeeded"] != 2 || result["failed"] != 0 {
+		t.Fatalf("repair result progress counts=%#v", result)
+	}
+}
+
 func TestAdminRescanRegeneratesMissingArtifactsFromRawTurn(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnChatLogs: []store.ChatLog{
@@ -411,7 +469,7 @@ func TestAdminRescanRegeneratesMissingArtifactsFromRawTurn(t *testing.T) {
 		"turn_summary":      "Mina found and kept the blue key safe.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{"Mina promised to keep the blue key safe."},
-		"kg_triples":        []any{map[string]any{"subject": "Mina", "predicate": "keeps", "object": "blue key"}},
+		"kg_triples":        []any{testEntityScalarKG("state_fact", "Mina", "character", "keep", "safe", "state", "Mina promised to keep the blue key safe.")},
 		"entities":          map[string]any{"characters": []any{map[string]any{"name": "Mina"}}},
 	})
 	chatResp, _ := json.Marshal(map[string]any{
@@ -463,9 +521,6 @@ func TestAdminRescanRegeneratesMissingArtifactsFromRawTurn(t *testing.T) {
 
 func TestAdminRescanIncludesTurnZeroAndTrustsCanonicalPlanBlocks(t *testing.T) {
 	starter := "The rain had not stopped when Mina reached the old gate.\n\n# Narrative Guide\nScene Mandate: preserve the language barrier.\nForbidden Moves:\n- instant mutual understanding"
-	if !looksLikeSourceControlResidue(starter) {
-		t.Fatal("test fixture must exercise the legacy source-aware content heuristic")
-	}
 	fake := &turnRecordingStore{
 		returnChatLogs: []store.ChatLog{
 			{ChatSessionID: "sess-starter-rescan", TurnIndex: 0, Role: "assistant", Content: starter, CreatedAt: time.Now()},
@@ -1012,9 +1067,12 @@ func TestRollbackNegativeTurnIndex(t *testing.T) {
 // rollbackRecordingStore wraps a Store and records RollbackStore calls.
 type rollbackRecordingStore struct {
 	store.Store
-	deletes   []string
-	deleteErr error
-	audits    []*store.AuditLog
+	deletes          []string
+	deleteErr        error
+	audits           []*store.AuditLog
+	chapterSummaries []store.ChapterSummary
+	arcSummaries     []store.ArcSummary
+	sagaDigests      []store.SagaDigest
 }
 
 func (r *rollbackRecordingStore) DeleteChatLogs(ctx context.Context, sid string, fromTurn int) error {

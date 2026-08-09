@@ -22,6 +22,8 @@ type RuntimeConfig struct {
 	MainExtraHeadersJSON               string
 	MainExtraBodyJSON                  string
 	MainVertexFlexMode                 string
+	MainLLMGatewayServiceTier          string
+	MainClaudePromptCacheMode          string
 	CriticProvider                     string
 	CriticAPIKey                       string
 	CriticEndpoint                     string
@@ -35,6 +37,8 @@ type RuntimeConfig struct {
 	CriticExtraHeadersJSON             string
 	CriticExtraBodyJSON                string
 	CriticVertexFlexMode               string
+	CriticLLMGatewayServiceTier        string
+	CriticClaudePromptCacheMode        string
 	SupervisorProvider                 string
 	SupervisorAPIKey                   string
 	SupervisorEndpoint                 string
@@ -48,6 +52,8 @@ type RuntimeConfig struct {
 	SupervisorExtraHeadersJSON         string
 	SupervisorExtraBodyJSON            string
 	SupervisorVertexFlexMode           string
+	SupervisorLLMGatewayServiceTier    string
+	SupervisorClaudePromptCacheMode    string
 	EmbeddingProvider                  string
 	EmbeddingAPIKey                    string
 	EmbeddingEndpoint                  string
@@ -63,6 +69,8 @@ type RuntimeConfig struct {
 	SourceSearchPlannerReasoningPreset string
 	SourceSearchPlannerReasoningEffort string
 	SourceSearchPlannerReasoningBudget *int64
+	LLMRetryCount                      int
+	FailedQueueMaxAttempts             int
 	TopK                               int64
 }
 
@@ -147,7 +155,10 @@ func embeddingEnvSource(keys ...string) runtimeSourceValue {
 func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 	updated := []string{}
 	s.RuntimeConfigMu.Lock()
-	defer s.RuntimeConfigMu.Unlock()
+	defer func() {
+		s.RuntimeConfigMu.Unlock()
+		s.wakeMemoryWorkers()
+	}()
 	s.RuntimeConfig.Synced = true
 
 	setString := func(pluginKey string, target *string) {
@@ -182,6 +193,19 @@ func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 			updated = append(updated, pluginKey)
 		}
 	}
+	setClampedInt := func(pluginKey string, target *int, minimum, maximum int) {
+		if value, ok := body[pluginKey]; ok {
+			parsed := intFromAny(value, 0)
+			if parsed < minimum {
+				parsed = minimum
+			}
+			if parsed > maximum {
+				parsed = maximum
+			}
+			*target = parsed
+			updated = append(updated, pluginKey)
+		}
+	}
 
 	setString("mainProvider", &s.RuntimeConfig.MainProvider)
 	setString("mainApiKey", &s.RuntimeConfig.MainAPIKey)
@@ -196,6 +220,8 @@ func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 	setString("mainExtraHeadersJson", &s.RuntimeConfig.MainExtraHeadersJSON)
 	setString("mainExtraBodyJson", &s.RuntimeConfig.MainExtraBodyJSON)
 	setString("mainVertexFlexMode", &s.RuntimeConfig.MainVertexFlexMode)
+	setString("mainLlmGatewayServiceTier", &s.RuntimeConfig.MainLLMGatewayServiceTier)
+	setString("mainClaudePromptCacheMode", &s.RuntimeConfig.MainClaudePromptCacheMode)
 	setString("criticProvider", &s.RuntimeConfig.CriticProvider)
 	setString("criticApiKey", &s.RuntimeConfig.CriticAPIKey)
 	setString("criticEndpoint", &s.RuntimeConfig.CriticEndpoint)
@@ -209,6 +235,8 @@ func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 	setString("criticExtraHeadersJson", &s.RuntimeConfig.CriticExtraHeadersJSON)
 	setString("criticExtraBodyJson", &s.RuntimeConfig.CriticExtraBodyJSON)
 	setString("criticVertexFlexMode", &s.RuntimeConfig.CriticVertexFlexMode)
+	setString("criticLlmGatewayServiceTier", &s.RuntimeConfig.CriticLLMGatewayServiceTier)
+	setString("criticClaudePromptCacheMode", &s.RuntimeConfig.CriticClaudePromptCacheMode)
 	setString("supervisorProvider", &s.RuntimeConfig.SupervisorProvider)
 	setString("supervisorApiKey", &s.RuntimeConfig.SupervisorAPIKey)
 	setString("supervisorEndpoint", &s.RuntimeConfig.SupervisorEndpoint)
@@ -222,6 +250,8 @@ func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 	setString("supervisorExtraHeadersJson", &s.RuntimeConfig.SupervisorExtraHeadersJSON)
 	setString("supervisorExtraBodyJson", &s.RuntimeConfig.SupervisorExtraBodyJSON)
 	setString("supervisorVertexFlexMode", &s.RuntimeConfig.SupervisorVertexFlexMode)
+	setString("supervisorLlmGatewayServiceTier", &s.RuntimeConfig.SupervisorLLMGatewayServiceTier)
+	setString("supervisorClaudePromptCacheMode", &s.RuntimeConfig.SupervisorClaudePromptCacheMode)
 	setString("embeddingProvider", &s.RuntimeConfig.EmbeddingProvider)
 	setString("embeddingApiKey", &s.RuntimeConfig.EmbeddingAPIKey)
 	setString("embeddingEndpoint", &s.RuntimeConfig.EmbeddingEndpoint)
@@ -237,6 +267,8 @@ func (s *Server) updateRuntimeConfig(body map[string]any) []string {
 	setString("sourceSearchPlannerReasoningPreset", &s.RuntimeConfig.SourceSearchPlannerReasoningPreset)
 	setString("sourceSearchPlannerReasoningEffort", &s.RuntimeConfig.SourceSearchPlannerReasoningEffort)
 	setIntPtr("sourceSearchPlannerReasoningBudgetTokens", &s.RuntimeConfig.SourceSearchPlannerReasoningBudget)
+	setClampedInt("llmRetryCount", &s.RuntimeConfig.LLMRetryCount, 0, 10)
+	setClampedInt("failedQueueMaxAttempts", &s.RuntimeConfig.FailedQueueMaxAttempts, 1, 11)
 	setInt("topK", &s.RuntimeConfig.TopK)
 
 	return updated
@@ -248,9 +280,9 @@ func (s *Server) runtimeConfigSnapshot() RuntimeConfig {
 	return s.RuntimeConfig
 }
 
-func runtimeTimeoutMs(seconds int64, fallbackMs int64) int64 {
+func runtimeTimeoutMs(seconds int64) int64 {
 	if seconds <= 0 {
-		return fallbackMs
+		return 0
 	}
 	return seconds * 1000
 }
@@ -270,7 +302,7 @@ func (s *Server) supervisorLLMConfig() completeTurnLLMConfig {
 		Endpoint:              rt.SupervisorEndpoint,
 		Model:                 rt.SupervisorModel,
 		Provider:              rt.SupervisorProvider,
-		TimeoutMs:             runtimeTimeoutMs(rt.SupervisorTimeoutSec, 60000),
+		TimeoutMs:             runtimeTimeoutMs(rt.SupervisorTimeoutSec),
 		Temperature:           temperature,
 		MaxTokens:             maxTokens,
 		ReasoningPreset:       rt.SupervisorReasoningPreset,
@@ -279,6 +311,9 @@ func (s *Server) supervisorLLMConfig() completeTurnLLMConfig {
 		ExtraHeadersJSON:      rt.SupervisorExtraHeadersJSON,
 		ExtraBodyJSON:         rt.SupervisorExtraBodyJSON,
 		VertexFlexMode:        rt.SupervisorVertexFlexMode,
+		LLMGatewayServiceTier: rt.SupervisorLLMGatewayServiceTier,
+		ClaudePromptCacheMode: rt.SupervisorClaudePromptCacheMode,
+		RetryBudget:           newLLMRetryBudget(rt.LLMRetryCount),
 	}
 }
 
@@ -303,11 +338,12 @@ func (s *Server) sourceSearchPlannerLLMConfig() completeTurnLLMConfig {
 	return completeTurnLLMConfig{
 		APIKey: rt.SourceSearchPlannerAPIKey, Endpoint: rt.SourceSearchPlannerEndpoint,
 		Model: rt.SourceSearchPlannerModel, Provider: rt.SourceSearchPlannerProvider,
-		TimeoutMs:   runtimeTimeoutMs(rt.SourceSearchPlannerTimeoutSec, 60000),
+		TimeoutMs:   runtimeTimeoutMs(rt.SourceSearchPlannerTimeoutSec),
 		Temperature: temperature, MaxTokens: maxTokens,
 		ReasoningPreset:       reasoningPreset,
 		ReasoningEffort:       reasoningEffort,
 		ReasoningBudgetTokens: int64PtrValue(rt.SourceSearchPlannerReasoningBudget, 0),
+		RetryBudget:           newLLMRetryBudget(rt.LLMRetryCount),
 	}
 }
 
@@ -326,7 +362,7 @@ func (s *Server) chapterLLMConfig() completeTurnLLMConfig {
 		Endpoint:              rt.MainEndpoint,
 		Model:                 rt.MainModel,
 		Provider:              rt.MainProvider,
-		TimeoutMs:             runtimeTimeoutMs(rt.MainTimeoutSec, 60000),
+		TimeoutMs:             runtimeTimeoutMs(rt.MainTimeoutSec),
 		Temperature:           temperature,
 		MaxTokens:             maxTokens,
 		ReasoningPreset:       rt.MainReasoningPreset,
@@ -335,6 +371,9 @@ func (s *Server) chapterLLMConfig() completeTurnLLMConfig {
 		ExtraHeadersJSON:      rt.MainExtraHeadersJSON,
 		ExtraBodyJSON:         rt.MainExtraBodyJSON,
 		VertexFlexMode:        rt.MainVertexFlexMode,
+		LLMGatewayServiceTier: rt.MainLLMGatewayServiceTier,
+		ClaudePromptCacheMode: rt.MainClaudePromptCacheMode,
+		RetryBudget:           newLLMRetryBudget(rt.LLMRetryCount),
 	}
 }
 
@@ -357,13 +396,45 @@ func configMissingFieldsWithProvider(provider, apiKey, endpoint, model string) [
 }
 
 func configuredTrace(provider, apiKey, endpoint, model string, timeoutSec int64) map[string]any {
+	missing := configMissingFieldsWithProvider(provider, apiKey, endpoint, model)
+	if timeoutSec <= 0 {
+		missing = append(missing, "timeout_ms")
+	}
 	return map[string]any{
-		"configured":     len(configMissingFieldsWithProvider(provider, apiKey, endpoint, model)) == 0,
+		"configured":     len(missing) == 0,
 		"provider":       strings.TrimSpace(provider),
 		"endpoint_host":  endpointHost(endpoint),
 		"model":          strings.TrimSpace(model),
 		"timeout_sec":    timeoutSec,
-		"missing_fields": configMissingFieldsWithProvider(provider, apiKey, endpoint, model),
+		"missing_fields": missing,
+	}
+}
+
+func sourceSearchConfigMissingFields(provider, apiKey, model string) []string {
+	missing := []string{}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai", "gemini", "claude", "ollama":
+	default:
+		missing = append(missing, "provider")
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		missing = append(missing, "api_key")
+	}
+	if strings.TrimSpace(model) == "" {
+		missing = append(missing, "model")
+	}
+	return missing
+}
+
+func sourceSearchConfiguredTrace(provider, apiKey, endpoint, model string, timeoutSec int64) map[string]any {
+	missing := sourceSearchConfigMissingFields(provider, apiKey, model)
+	return map[string]any{
+		"configured":     len(missing) == 0,
+		"provider":       strings.TrimSpace(provider),
+		"endpoint_host":  endpointHost(endpoint),
+		"model":          strings.TrimSpace(model),
+		"timeout_sec":    timeoutSec,
+		"missing_fields": missing,
 	}
 }
 
@@ -458,6 +529,12 @@ func (s *Server) runtimeConfigTrace() map[string]any {
 	addRuntimeSourceTrace(mainTrace, mainProviderID, mainAPIKeyID, mainEndpointID, mainModelID)
 	addOptionalRuntimeTraceFields(mainTrace, rt.MainTemperature, rt.MainMaxTokens)
 	addOptionalReasoningTraceFields(mainTrace, rt.MainReasoningPreset, rt.MainReasoningEffort, rt.MainReasoningBudget)
+	if strings.TrimSpace(rt.MainLLMGatewayServiceTier) != "" {
+		mainTrace["llm_gateway_service_tier"] = strings.TrimSpace(rt.MainLLMGatewayServiceTier)
+	}
+	if strings.TrimSpace(rt.MainClaudePromptCacheMode) != "" {
+		mainTrace["claude_prompt_cache_mode"] = strings.TrimSpace(rt.MainClaudePromptCacheMode)
+	}
 	mainTrace["runtime_role"] = "publisher_editor_default"
 	mainTrace["direct_generation"] = map[string]any{
 		"status":  "risuai_host_retained",
@@ -474,6 +551,12 @@ func (s *Server) runtimeConfigTrace() map[string]any {
 	addRuntimeSourceTrace(supervisorTrace, supervisorProviderID, supervisorAPIKeyID, supervisorEndpointID, supervisorModelID)
 	addOptionalRuntimeTraceFields(supervisorTrace, rt.SupervisorTemperature, rt.SupervisorMaxTokens)
 	addOptionalReasoningTraceFields(supervisorTrace, rt.SupervisorReasoningPreset, rt.SupervisorReasoningEffort, rt.SupervisorReasoningBudget)
+	if strings.TrimSpace(rt.SupervisorLLMGatewayServiceTier) != "" {
+		supervisorTrace["llm_gateway_service_tier"] = strings.TrimSpace(rt.SupervisorLLMGatewayServiceTier)
+	}
+	if strings.TrimSpace(rt.SupervisorClaudePromptCacheMode) != "" {
+		supervisorTrace["claude_prompt_cache_mode"] = strings.TrimSpace(rt.SupervisorClaudePromptCacheMode)
+	}
 	criticTrace := configuredTrace(
 		criticProviderID.Value,
 		criticAPIKeyID.Value,
@@ -484,6 +567,12 @@ func (s *Server) runtimeConfigTrace() map[string]any {
 	addRuntimeSourceTrace(criticTrace, criticProviderID, criticAPIKeyID, criticEndpointID, criticModelID)
 	addOptionalRuntimeTraceFields(criticTrace, rt.CriticTemperature, rt.CriticMaxTokens)
 	addOptionalReasoningTraceFields(criticTrace, rt.CriticReasoningPreset, rt.CriticReasoningEffort, rt.CriticReasoningBudget)
+	if strings.TrimSpace(rt.CriticLLMGatewayServiceTier) != "" {
+		criticTrace["llm_gateway_service_tier"] = strings.TrimSpace(rt.CriticLLMGatewayServiceTier)
+	}
+	if strings.TrimSpace(rt.CriticClaudePromptCacheMode) != "" {
+		criticTrace["claude_prompt_cache_mode"] = strings.TrimSpace(rt.CriticClaudePromptCacheMode)
+	}
 	embeddingTrace := configuredTrace(
 		embeddingProviderID.Value,
 		embeddingAPIKeyID.Value,
@@ -492,7 +581,7 @@ func (s *Server) runtimeConfigTrace() map[string]any {
 		rt.EmbeddingTimeoutSec,
 	)
 	addRuntimeSourceTrace(embeddingTrace, embeddingProviderID, embeddingAPIKeyID, embeddingEndpointID, embeddingModelID)
-	sourceSearchPlannerTrace := configuredTrace(
+	sourceSearchPlannerTrace := sourceSearchConfiguredTrace(
 		sourceSearchPlannerProviderID.Value,
 		sourceSearchPlannerAPIKeyID.Value,
 		sourceSearchPlannerEndpointID.Value,
@@ -503,11 +592,13 @@ func (s *Server) runtimeConfigTrace() map[string]any {
 	addOptionalRuntimeTraceFields(sourceSearchPlannerTrace, rt.SourceSearchPlannerTemperature, rt.SourceSearchPlannerMaxTokens)
 	addOptionalReasoningTraceFields(sourceSearchPlannerTrace, rt.SourceSearchPlannerReasoningPreset, rt.SourceSearchPlannerReasoningEffort, rt.SourceSearchPlannerReasoningBudget)
 	return map[string]any{
+		"synced":            rt.Synced,
 		"main":              mainTrace,
 		"supervisor":        supervisorTrace,
 		"critic":            criticTrace,
 		"embedding":         embeddingTrace,
 		"source_search_llm": sourceSearchPlannerTrace,
+		"llm_retry_count":   rt.LLMRetryCount,
 		"top_k":             rt.TopK,
 	}
 }

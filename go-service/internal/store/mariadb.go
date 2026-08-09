@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -15,6 +16,9 @@ import (
 // the dual-write wrapper with noop primary, so it is not an authority switch.
 type mariadbStore struct {
 	db *sql.DB
+	// Serializes the short MariaDB transactions that mutate source revisions,
+	// derived projections, retry jobs, and vector outbox rows with ResetAll.
+	memoryDerivationWriteMu sync.Mutex
 }
 
 // OpenMariaDB returns a Store backed by MariaDB.
@@ -29,8 +33,6 @@ func OpenMariaDB(dsn string) (Store, error) {
 	}
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
-	db.SetConnMaxIdleTime(2 * time.Minute)
-	db.SetConnMaxLifetime(30 * time.Minute)
 	return &mariadbStore{db: db}, nil
 }
 
@@ -84,6 +86,11 @@ var mariaAdminResetTables = []string{
 	"protagonist_entity_memories",
 	"effective_input_logs",
 	"chat_logs",
+	"memory_vector_outbox",
+	"memory_reprocessing_jobs",
+	"memory_derivation_dependencies",
+	"precise_memory_units",
+	"memory_source_revisions",
 	"memories",
 	"direct_evidence_records",
 	"kg_triples",
@@ -113,6 +120,11 @@ var mariaAdminResetTables = []string{
 	"chapter_summaries",
 	"arc_summaries",
 	"saga_digests",
+	"speaker_attributions",
+	"entity_identity_artifact_bindings",
+	"entity_identity_links",
+	"entity_identity_surfaces",
+	"entity_identities",
 	"entities",
 }
 
@@ -121,6 +133,8 @@ func (m *mariadbStore) ResetAll(ctx context.Context) (AdminResetResult, error) {
 	if err := m.ensureDB(); err != nil {
 		return result, err
 	}
+	m.memoryDerivationWriteMu.Lock()
+	defer m.memoryDerivationWriteMu.Unlock()
 	conn, err := m.db.Conn(ctx)
 	if err != nil {
 		return result, err
@@ -450,9 +464,19 @@ func mariaListWorldRules(ctx context.Context, q mariaQueryer, chatSessionID stri
 	rows, err := q.QueryContext(ctx, `
 		SELECT id, chat_session_id, scope, scope_name, category, `+"`key`"+`, value_json, genre, source_turn,
 			   pinned, suppressed, user_corrected, created_at, updated_at
-		FROM world_rules
-		WHERE chat_session_id = ?
-		ORDER BY scope, category, `+"`key`"+`
+		FROM world_rules AS current_rule
+		WHERE current_rule.chat_session_id = ?
+		  AND current_rule.id = (
+			SELECT candidate.id
+			FROM world_rules AS candidate
+			WHERE candidate.chat_session_id = current_rule.chat_session_id
+			  AND candidate.scope = current_rule.scope
+			  AND candidate.`+"`key`"+` = current_rule.`+"`key`"+`
+			  AND candidate.scope_name <=> current_rule.scope_name
+			ORDER BY COALESCE(candidate.source_turn, 0) DESC, candidate.id DESC
+			LIMIT 1
+		  )
+		ORDER BY current_rule.scope, current_rule.category, current_rule.`+"`key`"+`
 	`, chatSessionID)
 	if err != nil {
 		return nil, err

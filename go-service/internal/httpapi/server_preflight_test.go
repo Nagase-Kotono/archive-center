@@ -71,6 +71,22 @@ func TestValidateRuntimeDependenciesAllowsUnavailableReferenceCollection(t *test
 	}
 }
 
+func TestValidateRuntimeDependenciesHonorsCallerCancellation(t *testing.T) {
+	cfg := config.Default()
+	cfg.ChromaEnabled = true
+	cfg.ChromaEndpoint = "http://blocking-chroma.test"
+	srv := NewServer(cfg)
+	srv.Vector = &blockingHealthVectorStore{fakeVectorStore: &fakeVectorStore{}}
+	srv.VectorOpenError = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := srv.ValidateRuntimeDependencies(ctx)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want caller cancellation", err)
+	}
+}
+
 func TestReadyReportsUnavailableReferenceCollectionWithoutBlockingMainReadiness(t *testing.T) {
 	server := newMainHealthyReferenceUnavailableChroma(t)
 	defer server.Close()
@@ -105,7 +121,7 @@ func TestReadyReportsUnavailableReferenceCollectionWithoutBlockingMainReadiness(
 	}
 }
 
-func TestReadyLimitsSlowReferenceProbeWithoutBlockingMainReadiness(t *testing.T) {
+func TestReadyCallerCancellationLimitsSlowReferenceProbeWithoutBlockingMainReadiness(t *testing.T) {
 	cfg := config.Default()
 	cfg.ChromaEnabled = true
 	cfg.ChromaEndpoint = "http://reference-probe.test"
@@ -121,7 +137,10 @@ func TestReadyLimitsSlowReferenceProbeWithoutBlockingMainReadiness(t *testing.T)
 
 	started := time.Now()
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	requestCtx, cancelRequest := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelRequest()
+	request := httptest.NewRequest(http.MethodGet, "/ready", nil).WithContext(requestCtx)
+	mux.ServeHTTP(rec, request)
 	elapsed := time.Since(started)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ready status=%d body=%s", rec.Code, rec.Body.String())
@@ -174,7 +193,7 @@ func TestReferenceVectorFailureDoesNotBreakPrepareOrCompleteTurnStorage(t *testi
 	if complete.Code != http.StatusOK {
 		t.Fatalf("complete-turn status=%d body=%s", complete.Code, complete.Body.String())
 	}
-	if len(recordingStore.savedChatLogs) != 2 || len(recordingStore.savedEffectiveInputs) != 1 {
+	if len(recordingStore.savedChatLogs) != 2 || len(recordingStore.savedEffectiveInputs) != 0 {
 		t.Fatalf("main turn storage was not preserved: logs=%d effective_inputs=%d", len(recordingStore.savedChatLogs), len(recordingStore.savedEffectiveInputs))
 	}
 }

@@ -443,3 +443,143 @@ func TestDualWriteSaverInterfacesDelegate(t *testing.T) {
 		t.Errorf("shadow SaveActiveState calls = %d, want 1", shadow.saveActiveCalls)
 	}
 }
+
+type identityWriterStore struct {
+	Store
+	saveErr error
+	calls   int64
+}
+
+func (s *identityWriterStore) SaveEntityIdentity(context.Context, *EntityIdentity) error {
+	atomic.AddInt64(&s.calls, 1)
+	return s.saveErr
+}
+
+func (s *identityWriterStore) SaveEntityIdentitySurface(context.Context, *EntityIdentitySurface) error {
+	atomic.AddInt64(&s.calls, 1)
+	return s.saveErr
+}
+
+func (s *identityWriterStore) SaveEntityIdentityArtifactBinding(context.Context, *EntityIdentityArtifactBinding) error {
+	atomic.AddInt64(&s.calls, 1)
+	return s.saveErr
+}
+
+func (s *identityWriterStore) SaveSpeakerAttribution(context.Context, *SpeakerAttribution) error {
+	atomic.AddInt64(&s.calls, 1)
+	return s.saveErr
+}
+
+func Test36BDualWriteIdentityAvailabilityMatchesOwnedLanes(t *testing.T) {
+	disabled := NewDualWriteStore(NewNoopStore(), NewNoopStore()).(*dualWriteStore)
+	if disabled.EntityIdentityWritesEnabled() {
+		t.Fatal("no-op dual-write lanes must not advertise entity identity persistence")
+	}
+
+	shadow := &identityWriterStore{Store: NewNoopStore()}
+	enabled := NewDualWriteStore(NewNoopStore(), shadow).(*dualWriteStore)
+	if !enabled.EntityIdentityWritesEnabled() {
+		t.Fatal("Maria-like shadow writer must advertise entity identity persistence")
+	}
+	if err := enabled.SaveEntityIdentity(context.Background(), &EntityIdentity{}); err != nil {
+		t.Fatalf("shadow identity write unexpectedly failed the primary path: %v", err)
+	}
+	if atomic.LoadInt64(&shadow.calls) != 1 {
+		t.Fatalf("shadow identity writes = %d, want 1", shadow.calls)
+	}
+}
+
+func Test36BDualWriteIdentityShadowFailureIsRecordedNotSurfaced(t *testing.T) {
+	shadowErr := errors.New("identity shadow down")
+	shadow := &identityWriterStore{Store: NewNoopStore(), saveErr: shadowErr}
+	dual := NewDualWriteStore(NewNoopStore(), shadow).(*dualWriteStore)
+
+	if err := dual.SaveEntityIdentity(context.Background(), &EntityIdentity{}); err != nil {
+		t.Fatalf("shadow-only identity failure must not fail the primary workflow: %v", err)
+	}
+	failures, lastErr := dual.ShadowStatus()
+	if failures != 1 || !errors.Is(lastErr, shadowErr) {
+		t.Fatalf("shadow failure was not recorded: failures=%d err=%v", failures, lastErr)
+	}
+}
+
+type preciseMemoryWriterStore struct {
+	Store
+	enabled  bool
+	inserted bool
+	saveErr  error
+	calls    int64
+}
+
+func (s *preciseMemoryWriterStore) PreciseMemoryWritesEnabled() bool {
+	return s.enabled
+}
+
+func (s *preciseMemoryWriterStore) SavePreciseMemoryUnit(context.Context, *PreciseMemoryUnit) (bool, error) {
+	atomic.AddInt64(&s.calls, 1)
+	return s.inserted, s.saveErr
+}
+
+func TestDualWritePreciseMemoryAvailabilityRequiresRealWriter(t *testing.T) {
+	dual := NewDualWriteStore(NewNoopStore(), NewNoopStore()).(*dualWriteStore)
+	if dual.PreciseMemoryWritesEnabled() {
+		t.Fatal("no-op lanes advertised precise-memory writes")
+	}
+	if inserted, err := dual.SavePreciseMemoryUnit(context.Background(), &PreciseMemoryUnit{}); !errors.Is(err, ErrNotEnabled) || inserted {
+		t.Fatalf("no-writer save inserted=%v err=%v, want disabled", inserted, err)
+	}
+
+	disabledWriter := &preciseMemoryWriterStore{Store: NewNoopStore()}
+	dual = NewDualWriteStore(NewNoopStore(), disabledWriter).(*dualWriteStore)
+	if dual.PreciseMemoryWritesEnabled() {
+		t.Fatal("explicitly unavailable writer advertised precise-memory writes")
+	}
+}
+
+func TestDualWritePreciseMemoryShadowFailureIsRecordedNotSurfaced(t *testing.T) {
+	shadowErr := errors.New("precise memory shadow down")
+	shadow := &preciseMemoryWriterStore{
+		Store: NewNoopStore(), enabled: true, inserted: true, saveErr: shadowErr,
+	}
+	dual := NewDualWriteStore(NewNoopStore(), shadow).(*dualWriteStore)
+	inserted, err := dual.SavePreciseMemoryUnit(context.Background(), &PreciseMemoryUnit{})
+	if err != nil || inserted {
+		t.Fatalf("shadow-only failure inserted=%v err=%v, want honest false and no surfaced error", inserted, err)
+	}
+	failures, lastErr := dual.ShadowStatus()
+	if failures != 1 || !errors.Is(lastErr, shadowErr) || atomic.LoadInt64(&shadow.calls) != 1 {
+		t.Fatalf("shadow failure not recorded: failures=%d err=%v calls=%d", failures, lastErr, shadow.calls)
+	}
+}
+
+type canonicalTailTestStore struct {
+	Store
+	rollbackErr   error
+	rollbackCalls int
+}
+
+func (s *canonicalTailTestStore) ReplaceLogicalTurn(context.Context, LogicalTurnReplacement) error {
+	return nil
+}
+
+func (s *canonicalTailTestStore) RollbackCanonicalTail(context.Context, LogicalTurnRollback) error {
+	s.rollbackCalls++
+	return s.rollbackErr
+}
+
+func TestDualWriteCanonicalRollbackDoesNotHidePrimaryFailure(t *testing.T) {
+	primaryErr := errors.New("primary canonical rollback failed")
+	primary := &canonicalTailTestStore{Store: NewNoopStore(), rollbackErr: primaryErr}
+	shadow := &canonicalTailTestStore{Store: NewNoopStore()}
+	dual := NewDualWriteStore(primary, shadow).(*dualWriteStore)
+
+	err := dual.RollbackCanonicalTail(context.Background(), LogicalTurnRollback{
+		ChatSessionID: "session", TurnIndex: 4,
+	})
+	if !errors.Is(err, primaryErr) {
+		t.Fatalf("rollback error = %v, want primary failure", err)
+	}
+	if primary.rollbackCalls != 1 || shadow.rollbackCalls != 0 {
+		t.Fatalf("rollback calls primary=%d shadow=%d, want 1/0", primary.rollbackCalls, shadow.rollbackCalls)
+	}
+}

@@ -13,7 +13,7 @@ func TestArchiveCenterJSSeq165P142InputContextSlotGovernorMarkers(t *testing.T) 
 		"function buildInputContext(userInput, orchResult, bundledContinuityText, governorContext) {",
 		"slotGovernorPolicyVersion: \"s16.5-ig.v1\"",
 		"slotGovernorMode: \"turn_need_risk_slot_governor\"",
-		"const budget = Math.max(200, Math.min(1500, settings.maxInputContextChars || 800));",
+		"const budget = Math.max(1, Math.floor(Number(settings.maxInputContextChars) || DEFAULT_SETTINGS.maxInputContextChars));",
 		"function buildTemporalCandidate() {",
 		"function buildSceneCandidate() {",
 		"function buildEntityCandidate() {",
@@ -116,14 +116,11 @@ func TestArchiveCenterJSSeq165P145StaleArcGuardCarryInHooksMarkers(t *testing.T)
 func TestArchiveCenterJSSeq165P169DecisionAdaptiveFloorCeilingMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"const manualBudgetLimit = Math.max(500, settings.maxInjectionChars || DEFAULT_SETTINGS.maxInjectionChars);",
-		"mid_context_300k: 9000",
-		"wide_context_500k: 18000",
-		"ultra_long_1m_plus: 27000",
-		"extreme_long_2m_plus: 36000",
-		"max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.budgetLimit",
-		"runtimeTokenInfo,",
-		"Math.min(51000, automaticBudgetLimit + userExtraBudgetChars)",
+		"max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.configuredBudgetChars",
+		"current_chat_tokens: prepareInjectionBudget.currentChatTokens",
+		"context_window_tokens: prepareInjectionBudget.contextWindowTokens",
+		"current_chat_chars: prepareInjectionBudget.currentChatChars",
+		"extra_chars: prepareInjectionBudget.userExtraBudgetChars",
 		"parts.push(b.text);",
 		"const step13TokenTruthFloorCoreLabels = [\"latest_direct_evidence\", \"recent_raw_turn\", \"active_state\", \"canonical_state_layer\"];",
 		"const step13TokenTruthFloorContinuityLabels = [\"storylines\", \"episode\", \"chapter\", \"arc\", \"saga\"];",
@@ -211,7 +208,7 @@ func TestArchiveCenterJSSeq165P173DecisionExplicitUserInputSpecificityMarkers(t 
 		"const weakInput = !rawInput || rawInput.length <= 24 || /^(continue|go on|next|more|resume|keep going|계속|계속해|이어서|이어가|다음|다음 장면|다음으로|응|ㅇㅇ|좋아|그래|좋아 계속)$/i.test(rawInput);",
 		"const temporalQuery = isTemporalQueryInput(rawInput);",
 		"const resumePressure = /(continue|resume|pick up|where we left|keep going|이어서|이어가|계속|재개|다시 이어)/i.test(rawInput);",
-		"const longGapResume = idleGapMs >= longGapThresholdMs || continuityTriggerMode === \"idle_reentry\";",
+		"const longGapResume = continuityTriggerMode === \"idle_reentry\";",
 		"const explicitRedirection = /(instead|not that|ignore previous|leave that|move on|new scene|different topic|새로|다른 쪽|말고|이제는|이번 장면|지금 장면|새 갈등|딴 이야기|전 장면 말고)/i.test(rawInput);",
 		"const strongUserIntent = rawInput.length >= 48 || rawInput.split(/\\s+/).filter(Boolean).length >= 10;",
 	}
@@ -219,6 +216,9 @@ func TestArchiveCenterJSSeq165P173DecisionExplicitUserInputSpecificityMarkers(t 
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing SEQ-16.5-P173 explicit user-input specificity decision marker %q", needle)
 		}
+	}
+	if strings.Contains(src, "idleGapMs >= longGapThresholdMs") {
+		t.Fatal("Archive Center.js restored a hidden elapsed-time resume policy")
 	}
 }
 
@@ -287,8 +287,8 @@ func TestArchiveCenterJSSeq165P179Step17DirectHandoffGateMarkers(t *testing.T) {
 func TestArchiveCenterJSSeq165P183Step17EvaluationHarnessBaselineMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"const manualBudgetLimit = Math.max(500, settings.maxInjectionChars || DEFAULT_SETTINGS.maxInjectionChars);",
-		"const budget = Math.max(200, Math.min(1500, settings.maxInputContextChars || 800));",
+		"max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.configuredBudgetChars",
+		"const budget = Math.max(1, Math.floor(Number(settings.maxInputContextChars) || DEFAULT_SETTINGS.maxInputContextChars));",
 		"policyVersion: \"s16.8-ft.v1\"",
 		"mode: \"recall_gain_vs_monopoly_cost_split\"",
 		"slotGovernorPolicyVersion: \"s16.5-ig.v1\"",
@@ -673,7 +673,7 @@ func TestArchiveCenterJSSeq168P136BackendMetadataAlignmentMarkers(t *testing.T) 
 		"pendingThreadCount",
 		"suppressionTriggerActive",
 		"guidance_metadata",
-		"input_context_enabled",
+		"max_input_context_chars",
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {

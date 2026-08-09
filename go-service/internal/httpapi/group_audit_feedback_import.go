@@ -295,7 +295,10 @@ func (s *Server) feedbackTargetBelongsToSession(ctx context.Context, sid string,
 }
 
 func (s *Server) handleImportHypamemory(w http.ResponseWriter, r *http.Request) {
-	var req dto.HypaImportRequest
+	var req struct {
+		dto.HypaImportRequest
+		ClientMeta map[string]any `json:"client_meta,omitempty"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "code": "invalid_json", "detail": err.Error()})
 		return
@@ -317,8 +320,21 @@ func (s *Server) handleImportHypamemory(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "error", "code": "store_not_enabled", "detail": "store is not enabled"})
 		return
 	}
+	if availability, ok := s.Store.(store.MemoryDerivationLifecycleAvailability); ok &&
+		availability.MemoryDerivationLifecycleEnabled() {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"status":          "error",
+			"code":            "external_import_source_admission_required",
+			"detail":          "HypaMemory summaries cannot bypass accepted-source admission in the canonical writer.",
+			"chat_session_id": sid,
+			"total":           len(req.Summaries),
+			"succeeded":       0,
+			"failed":          len(req.Summaries),
+		})
+		return
+	}
 
-	extractionCfg := s.completeTurnExtractionConfig(nil)
+	extractionCfg := s.completeTurnExtractionConfig(req.ClientMeta)
 	llmTrace := completeTurnLLMConfigTrace(extractionCfg)
 	if !extractionCfg.Critic.hasConfig() {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -536,7 +552,7 @@ func (s *Server) scoreHypaMemoryImport(ctx context.Context, sid string, summary 
 	}
 	applyProxyOverridesFromLLMConfig(&req, cfg)
 
-	upstream, _, err := performProxyPluginMain(ctx, req)
+	upstream, _, err := performProxyPluginMainWithRetryBudget(ctx, req, cfg.RetryBudget)
 	if err != nil {
 		return fallback, nil, err
 	}

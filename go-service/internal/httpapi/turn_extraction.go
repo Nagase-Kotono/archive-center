@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -28,7 +29,10 @@ type completeTurnLLMConfig struct {
 	ExtraHeadersJSON      string
 	ExtraBodyJSON         string
 	VertexFlexMode        string
+	LLMGatewayServiceTier string
+	ClaudePromptCacheMode string
 	ForceWorldRuleAudit   bool
+	RetryBudget           *llmRetryBudget
 }
 
 type completeTurnEmbeddingConfig struct {
@@ -61,9 +65,21 @@ type artifactSaveResult struct {
 	StatusEffects            int
 	NarrativeCurrentStates   int
 	NarrativeStateEvents     int
+	RelationCurrentStates    int
+	RelationStateEvents      int
+	HabitEvidenceCurrent     int
+	HabitEvidenceEvents      int
+	CharacterProfiles        int
+	VoiceBehaviorProjections int
 	PendingThreads           int
 	ActiveStates             int
 	Entities                 int
+	EntityIdentities         int
+	IdentitySurfaces         int
+	EntityIdentityLinks      int
+	IdentityBindings         int
+	SpeakerAttributions      int
+	PreciseMemoryUnits       int
 	TrustStates              int
 	VectorsUpserted          int
 	VectorsMemoryUpserted    int
@@ -251,35 +267,21 @@ func resolveCanonicalConflict(incoming store.DirectEvidence, existing []store.Di
 func applyRetentionPolicy(evidence *store.DirectEvidence, importance float64, existing []store.DirectEvidence) map[string]any {
 	decision := map[string]any{
 		"action":        "preserve",
-		"archive_state": "canonical",
+		"archive_state": "canonical_direct",
 		"importance":    importance,
-		"reason":        "direct_evidence_lineage",
+		"reason":        "direct_evidence_lifecycle_and_lineage",
 		"ttl_turns":     0,
 		"version":       "ea1l.v1",
 	}
-	if importance >= 0.8 {
-		decision["archive_state"] = "canonical_direct"
-		return decision
-	}
-	if importance >= 0.5 {
-		decision["ttl_turns"] = 120
-		decision["archive_state"] = "previous_archive"
-		return decision
-	}
 	if evidence.Tombstoned {
-		decision["ttl_turns"] = 240
 		decision["archive_state"] = "tombstone_audit"
-		decision["reason"] = "tombstone_preserve_for_audit"
+		decision["reason"] = "tombstone_preserve_for_audit_without_turn_expiry"
 		return decision
 	}
-	decision["ttl_turns"] = 30
-	decision["archive_state"] = "transient"
-	decision["reason"] = "low_importance_noise"
 	for _, ex := range existing {
 		if ex.SupersededByID == evidence.ID || ex.ID == evidence.SupersededByID {
 			decision["archive_state"] = "superseded_archive"
-			decision["ttl_turns"] = 60
-			decision["reason"] = "superseded_lineage_preserve"
+			decision["reason"] = "superseded_lineage_preserve_without_turn_expiry"
 			break
 		}
 	}
@@ -322,117 +324,16 @@ type memoryImportanceUpdater interface {
 	UpdateMemoryImportance(ctx context.Context, chatSessionID string, memoryID int64, importance float64) error
 }
 
-var placeholderKGPartPattern = regexp.MustCompile(`(?i)^\s*(?:char_\d+(?:_cid_[a-f0-9-]{8,})?|cid_[a-f0-9-]{8,}|turn_\d+|\{\{\s*(?:user|char)\s*\}\}|<\s*(?:user|char)\s*>|user|유저|사용자|ユーザー|player|플레이어|プレイヤー|participant|참가자|assistant|어시스턴트|system|시스템|developer|개발자|prompt|instruction|bot|agent)\s*$`)
-var jsonTrailingCommaPattern = regexp.MustCompile(`,\s*([}\]])`)
+var placeholderKGPartPattern = regexp.MustCompile(`(?i)^\s*(?:char_\d+(?:_cid_[a-f0-9-]{8,})?|cid_[a-f0-9-]{8,}|turn_\d+|\{\{\s*(?:user|char)\s*\}\}|<\s*(?:user|char)\s*>)\s*$`)
 var closedThoughtTagPattern = regexp.MustCompile(`(?is)<\s*(?:thoughts|thinking|analysis|reasoning|scratchpad|filter)\b[^>]*>.*?<\s*/\s*(?:thoughts|thinking|analysis|reasoning|scratchpad|filter)\s*>`)
 var openThoughtTagPattern = regexp.MustCompile(`(?is)<\s*(?:thoughts|thinking|analysis|reasoning|scratchpad|filter)\b[^>]*>.*$`)
 var filterCompleteMarkerPattern = regexp.MustCompile(`(?is)<\s*__filter_complete__\s*>`)
 var thoughtLinePrefixPattern = regexp.MustCompile(`(?im)^\s*(?:chain of thought|hidden chain-of-thought|thought process|thinking|analysis|reasoning|scratchpad)\s*:\s*.*(?:\r?\n|$)`)
 
-var oocPrefixPattern = regexp.MustCompile(`(?i)^\s*(?:/ooc\b|ooc\b\s*[:\-]|out\s+of\s+character\b|#{1,6}\s*(?:ooc|out\s+of\s+character)\b|\[\s*ooc\s*\]|\[\[\s*ooc\s*\]\]|\(\s*ooc\s*\)|\(\(\s*ooc\s*\)\)|오오씨)`)
-var sourceControlHeaderPattern = regexp.MustCompile(`(?i)^\s*(?:#{1,6}\s*)?(?:\[+\s*)?(?:narrative guide|story intent|scene mandate|forbidden moves|pressure level|prompt template|response template|system prompt|developer message|author note|system note|meta note|common behaviou?r|behaviou?r guide|style guide|writing guide|response rules|instructions?|rules?|persona|pov|long-term memory archive|archive label|toggle expansion)(?:\s*\]+)?\s*:?\s*$`)
-var sourceControlInlinePattern = regexp.MustCompile(`(?i)\b(?:narrative guide|story intent|scene mandate|forbidden moves|pressure level|prompt template|response template|system prompt|developer message|author note|system note|meta note|common behaviou?r|behaviou?r guide|style guide|writing guide|response rules|instructions?|rules?|persona|pov|long-term memory archive|archive label|toggle expansion|lorebook|preset)\b`)
-var sourceControlPlaceholderPattern = regexp.MustCompile(`(?i)(?:\{\{\s*(?:user|char)\s*\}\}|<\s*(?:user|char|system|developer|assistant|thoughts)\s*>|</\s*thoughts\s*>)`)
-var sourceControlFieldPattern = regexp.MustCompile(`(?i)(?:preset|template|control|prompt|system|developer|narrative_control|lorebook|decorator|cbs)`)
-var criticRetrySensitivePattern = regexp.MustCompile(`(?i)(?:\b(?:penis|vagina|clitoris|ejaculat\w*|orgasm\w*|semen|cum|penetrat\w*)\b|성기|음경|질|귀두|사정|삽입|오르가즘|정액|클리토리스)`)
-
-func shouldApplyCompleteTurnOOCGuard(userInput, assistantContent string, contextMessages []map[string]any) bool {
-	if looksLikeOOCText(userInput) || looksLikeOOCText(assistantContent) {
-		return true
-	}
-	start := len(contextMessages) - 3
-	if start < 0 {
-		start = 0
-	}
-	for i := len(contextMessages) - 1; i >= start; i-- {
-		item := contextMessages[i]
-		if !strings.EqualFold(strings.TrimSpace(stringFromMap(item, "role")), "user") {
-			continue
-		}
-		if looksLikeOOCText(stringFromMap(item, "content")) {
-			return true
-		}
-	}
-	return false
-}
-
-func looksLikeOOCText(text string) bool {
-	return oocPrefixPattern.MatchString(strings.TrimSpace(text))
-}
-
-func looksLikeSourceControlResidue(text string) bool {
-	raw := strings.TrimSpace(text)
-	if len(raw) < 12 {
-		return false
-	}
-	cues := 0
-	if sourceControlInlinePattern.MatchString(raw) {
-		cues++
-	}
-	if sourceControlPlaceholderPattern.MatchString(raw) {
-		cues++
-	}
-	if strings.Count(raw, "```") >= 2 {
-		cues++
-	}
-	headerCount := 0
-	bulletOrRuleCount := 0
-	for _, line := range strings.Split(raw, "\n") {
-		stripped := strings.TrimSpace(line)
-		if stripped == "" {
-			continue
-		}
-		if sourceControlHeaderPattern.MatchString(stripped) {
-			headerCount++
-			continue
-		}
-		if strings.HasPrefix(stripped, "- ") || strings.HasPrefix(stripped, "* ") || strings.Contains(stripped, ": ") {
-			if sourceControlInlinePattern.MatchString(stripped) || sourceControlPlaceholderPattern.MatchString(stripped) {
-				bulletOrRuleCount++
-			}
-		}
-	}
-	if headerCount >= 1 {
-		cues++
-	}
-	if headerCount >= 2 || bulletOrRuleCount >= 2 {
-		cues++
-	}
-	return cues >= 2
-}
+const risuChatMessageObservationContract = "risu_chat_message_observation.v1"
 
 func sanitizeTextForCriticInput(text string) string {
-	cleaned := sanitizeCriticStorageText(text)
-	if cleaned == "" {
-		return ""
-	}
-	if looksLikeSourceControlResidue(cleaned) {
-		return ""
-	}
-	lines := []string{}
-	skipControlSection := false
-	for _, line := range strings.Split(cleaned, "\n") {
-		stripped := strings.TrimSpace(line)
-		if skipControlSection {
-			if stripped == "" {
-				skipControlSection = false
-			}
-			continue
-		}
-		if sourceControlHeaderPattern.MatchString(stripped) {
-			skipControlSection = true
-			continue
-		}
-		if sourceControlInlinePattern.MatchString(stripped) && (strings.HasPrefix(stripped, "#") || strings.HasPrefix(stripped, "- ") || strings.HasPrefix(stripped, "* ") || strings.HasSuffix(stripped, ":")) {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	out := strings.TrimSpace(strings.Join(lines, "\n"))
-	if looksLikeSourceControlResidue(out) {
-		return ""
-	}
-	return out
+	return sanitizeCriticStorageText(text)
 }
 
 func boundCompleteTurnCriticInput(text string, maxRunes int) string {
@@ -460,25 +361,20 @@ func boundCompleteTurnCriticInput(text string, maxRunes int) string {
 		strings.TrimSpace(string(runes[len(runes)-tail:]))
 }
 
-func redactSensitiveCriticRetryText(text string) (string, bool) {
-	cleaned := strings.TrimSpace(text)
-	if cleaned == "" {
-		return "", false
-	}
-	redacted := criticRetrySensitivePattern.ReplaceAllString(cleaned, "[intimate scene detail redacted for critic retry]")
-	return redacted, redacted != cleaned
-}
-
 func sanitizeContextMessagesForCriticInput(messages []map[string]any) []map[string]any {
 	out := []map[string]any{}
 	for _, item := range messages {
-		if contextMessageMarkedSourceControl(item) {
+		role := strings.ToLower(strings.TrimSpace(stringFromMap(item, "role")))
+		if role != "user" && role != "assistant" {
 			continue
 		}
-		copied := map[string]any{}
-		for k, v := range item {
-			copied[k] = v
+		contractVersion := strings.TrimSpace(stringFromMap(item, "contract_version"))
+		if contractVersion != "" && (contractVersion != risuChatMessageObservationContract ||
+			!strings.EqualFold(strings.TrimSpace(stringFromMap(item, "observation_state")), "observed") ||
+			!strings.EqualFold(strings.TrimSpace(stringFromMap(item, "source_kind")), "active_chat_message")) {
+			continue
 		}
+		copied := map[string]any{"role": role}
 		if content, ok := item["content"].(string); ok {
 			cleaned := sanitizeTextForCriticInput(content)
 			if cleaned == "" && strings.TrimSpace(content) != "" {
@@ -486,25 +382,14 @@ func sanitizeContextMessagesForCriticInput(messages []map[string]any) []map[stri
 			}
 			copied["content"] = cleaned
 		}
+		if contractVersion == risuChatMessageObservationContract {
+			copied["contract_version"] = risuChatMessageObservationContract
+			copied["observation_state"] = "observed"
+			copied["source_kind"] = "active_chat_message"
+		}
 		out = append(out, copied)
 	}
 	return out
-}
-
-func contextMessageMarkedSourceControl(item map[string]any) bool {
-	for _, key := range []string{"source", "source_layer", "origin", "kind", "type", "name", "label"} {
-		if sourceControlFieldPattern.MatchString(strings.TrimSpace(stringFromMap(item, key))) {
-			return true
-		}
-	}
-	if meta := mapFromAny(item["metadata"]); len(meta) > 0 {
-		for _, key := range []string{"source", "source_layer", "origin", "kind", "type", "name", "label"} {
-			if sourceControlFieldPattern.MatchString(strings.TrimSpace(stringFromMap(meta, key))) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (s *Server) canonicalCharacterName(ctx context.Context, sid, proposed string) string {
@@ -512,130 +397,44 @@ func (s *Server) canonicalCharacterName(ctx context.Context, sid, proposed strin
 	if proposed == "" || s.Store == nil {
 		return proposed
 	}
+	if resolver, ok := s.Store.(store.UniqueActiveEntitySurfaceIdentityResolver); ok {
+		resolved, err := resolver.ResolveUniqueActiveEntityIdentityBySurface(ctx, sid, comparableEntityKey(proposed))
+		if err == nil {
+			if label := strings.TrimSpace(resolved.CanonicalLabel); label != "" {
+				return label
+			}
+		}
+		if errors.Is(err, store.ErrReviewedEntityIdentityAmbiguous) {
+			return proposed
+		}
+	}
 	states, err := s.Store.ListCharacterStates(ctx, sid)
 	if err != nil || len(states) == 0 {
 		return proposed
 	}
-	proposedKeys := comparableCharacterAliasKeys(proposed)
-	proposedKey := firstNonEmpty(proposedKeys...)
+	proposedKey := comparableEntityKey(proposed)
 	if proposedKey == "" {
 		return proposed
 	}
-	bestName := proposed
-	bestDistance := 999
+	matched := ""
 	for _, state := range states {
 		candidate := strings.TrimSpace(state.CharacterName)
-		if candidate == "" {
+		if candidate == "" || comparableEntityKey(candidate) != proposedKey {
 			continue
 		}
-		candidateKeys := comparableCharacterAliasKeys(candidate)
-		candidateKey := firstNonEmpty(candidateKeys...)
-		if candidateKey == "" {
-			continue
+		if matched != "" && matched != candidate {
+			return proposed
 		}
-		if characterAliasKeysOverlap(proposedKeys, candidateKeys) {
-			return candidate
-		}
-		dist := levenshteinDistance(proposedKey, candidateKey)
-		maxLen := len([]rune(proposedKey))
-		if other := len([]rune(candidateKey)); other > maxLen {
-			maxLen = other
-		}
-		if maxLen <= 4 {
-			continue
-		}
-		if dist < bestDistance && dist <= 2 {
-			bestDistance = dist
-			bestName = candidate
-		}
+		matched = candidate
 	}
-	return bestName
+	if matched != "" {
+		return matched
+	}
+	return proposed
 }
 
 func canonicalCharacterAliasKey(name string) string {
-	key := normalizeCharacterKey(name)
-	if key == "" {
-		return ""
-	}
-	if canonical, ok := knownCharacterAliasKeys[key]; ok {
-		return canonical
-	}
-	return key
-}
-
-var knownCharacterAliasKeys = map[string]string{
-	"isiu":              "siwoo",
-	"leesiwoo":          "siwoo",
-	"leesiwu":           "siwoo",
-	"siu":               "siwoo",
-	"siwoo":             "siwoo",
-	"siwu":              "siwoo",
-	"chloe":             "chloe",
-	"kloe":              "chloe",
-	"keulroe":           "chloe",
-	"asuna":             "asuna",
-	"aseuna":            "asuna",
-	"ichinoseasuna":     "asuna",
-	"ichinoseaseuna":    "asuna",
-	"ichinose":          "ichinose",
-	"saori":             "saori",
-	"sao-ri":            "saori",
-	"ichinoseasna":      "asuna",
-	"ichinoseasunah":    "asuna",
-	"ichinoseaseunah":   "asuna",
-	"ichinoseasunaich":  "asuna",
-	"ichinoseaseunaich": "asuna",
-	"vex":               "vex",
-	"bex":               "vex",
-	"bekseu":            "vex",
-}
-
-func comparableCharacterAliasKeys(name string) []string {
-	added := map[string]bool{}
-	out := []string{}
-	add := func(value string) {
-		key := canonicalCharacterAliasKey(value)
-		if key == "" || added[key] {
-			return
-		}
-		added[key] = true
-		out = append(out, key)
-	}
-	add(name)
-	for _, part := range strings.FieldsFunc(name, func(r rune) bool {
-		switch r {
-		case ' ', '\t', '\n', '\r', '-', '_', '.', '/', '\\', '·', '・', '(', ')', '[', ']', '{', '}', ':', ';', ',', '\'':
-			return true
-		default:
-			return false
-		}
-	}) {
-		part = strings.TrimSpace(part)
-		if len([]rune(canonicalCharacterAliasKey(part))) >= 4 {
-			add(part)
-		}
-	}
-	return out
-}
-
-func characterAliasKeysOverlap(left, right []string) bool {
-	for _, l := range left {
-		for _, r := range right {
-			if l == "" || r == "" {
-				continue
-			}
-			if l == r {
-				return true
-			}
-			if len([]rune(l)) >= 5 && strings.HasSuffix(r, l) {
-				return true
-			}
-			if len([]rune(r)) >= 5 && strings.HasSuffix(l, r) {
-				return true
-			}
-		}
-	}
-	return false
+	return normalizeCharacterKey(name)
 }
 
 var koreanInitialRoman = []string{"g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"}
@@ -756,107 +555,9 @@ func romanizeKatakanaRune(r rune) string {
 	return ""
 }
 
-func levenshteinDistance(a, b string) int {
-	ar := []rune(a)
-	br := []rune(b)
-	if len(ar) == 0 {
-		return len(br)
-	}
-	if len(br) == 0 {
-		return len(ar)
-	}
-	prev := make([]int, len(br)+1)
-	cur := make([]int, len(br)+1)
-	for j := range prev {
-		prev[j] = j
-	}
-	for i := 1; i <= len(ar); i++ {
-		cur[0] = i
-		for j := 1; j <= len(br); j++ {
-			cost := 0
-			if ar[i-1] != br[j-1] {
-				cost = 1
-			}
-			cur[j] = min3Int(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
-		}
-		prev, cur = cur, prev
-	}
-	return prev[len(br)]
-}
-
-func min3Int(a, b, c int) int {
-	if b < a {
-		a = b
-	}
-	if c < a {
-		a = c
-	}
-	return a
-}
-
-var genericDescriptorHumanTokens = map[string]bool{
-	"person": true, "people": true, "human": true, "stranger": true, "figure": true, "someone": true,
-	"man": true, "woman": true, "boy": true, "girl": true, "guy": true, "lady": true, "male": true, "female": true,
-	"guard": true, "maid": true, "teacher": true, "student": true, "clerk": true, "soldier": true,
-	"사람": true, "남자": true, "여자": true, "소년": true, "소녀": true, "경비": true, "하녀": true, "학생": true,
-}
-
-var descriptorSplitPattern = regexp.MustCompile(`[\s_\-.,/|()[\]{}"'` + "`" + `]+`)
-
-func looksLikeTransientDescriptorCharacterName(name string) bool {
-	tokens := characterDescriptorKeywords(name)
-	if len(tokens) == 0 {
-		return false
-	}
-	hasGeneric := false
-	nonGeneric := 0
-	for _, token := range tokens {
-		if genericDescriptorHumanTokens[token] {
-			hasGeneric = true
-		} else {
-			nonGeneric++
-		}
-	}
-	return hasGeneric && (nonGeneric > 0 || len(tokens) == 1)
-}
-
-func characterDescriptorKeywords(name string) []string {
-	out := []string{}
-	seen := map[string]bool{}
-	for _, raw := range descriptorSplitPattern.Split(strings.ToLower(strings.TrimSpace(name)), -1) {
-		token := strings.TrimSpace(strings.TrimSuffix(raw, "'s"))
-		if token == "" || token == "a" || token == "an" || token == "the" {
-			continue
-		}
-		if len([]rune(token)) < 3 && !containsKorean(token) {
-			continue
-		}
-		if !seen[token] {
-			seen[token] = true
-			out = append(out, token)
-		}
-	}
-	return out
-}
-
 func containsKorean(text string) bool {
 	for _, r := range text {
 		if (r >= 0xAC00 && r <= 0xD7A3) || (r >= 0x1100 && r <= 0x11FF) {
-			return true
-		}
-	}
-	return false
-}
-
-func characterDeltaHasContinuityAnchor(delta map[string]any) bool {
-	for _, key := range []string{"appearance", "personality", "relationships", "speech_style"} {
-		if hasMeaningfulPayload(delta[key]) {
-			return true
-		}
-	}
-	for _, item := range sliceFromAny(delta["events"]) {
-		eventType := strings.TrimSpace(stringFromMap(mapFromAny(item), "type"))
-		if eventType == "relationship_shift" || eventType == "personality_change" {
 			return true
 		}
 	}
@@ -898,7 +599,7 @@ func completeTurnExtractionConfigFromMeta(meta map[string]any) completeTurnExtra
 			Endpoint:              stringFromMap(criticMap, "endpoint"),
 			Model:                 stringFromMap(criticMap, "model"),
 			Provider:              stringFromMap(criticMap, "provider"),
-			TimeoutMs:             int64FromMap(criticMap, "timeout_ms", 60000),
+			TimeoutMs:             int64FromMap(criticMap, "timeout_ms", 0),
 			Temperature:           floatFromMap(criticMap, "temperature", 0.2),
 			MaxTokens:             int64FromMap(criticMap, "max_tokens", 1600),
 			MaxCompletionTokens:   int64FromMap(criticMap, "max_completion_tokens", 1600),
@@ -909,6 +610,8 @@ func completeTurnExtractionConfigFromMeta(meta map[string]any) completeTurnExtra
 			ExtraHeadersJSON:      stringFromMap(criticMap, "extra_headers_json"),
 			ExtraBodyJSON:         stringFromMap(criticMap, "extra_body_json"),
 			VertexFlexMode:        stringFromMap(criticMap, "vertex_flex_mode"),
+			LLMGatewayServiceTier: stringFromMap(criticMap, "llm_gateway_service_tier"),
+			ClaudePromptCacheMode: stringFromMap(criticMap, "claude_prompt_cache_mode"),
 			ForceWorldRuleAudit:   boolFromAny(meta["force_world_rule_backfill"]) || boolFromAny(meta["force_focused_world_rule_audit"]),
 		},
 		Embedder: completeTurnEmbeddingConfig{
@@ -916,7 +619,7 @@ func completeTurnExtractionConfigFromMeta(meta map[string]any) completeTurnExtra
 			Endpoint:  stringFromMap(embeddingMap, "endpoint"),
 			Model:     stringFromMap(embeddingMap, "model"),
 			Provider:  stringFromMap(embeddingMap, "provider"),
-			TimeoutMs: int64FromMap(embeddingMap, "timeout_ms", 30000),
+			TimeoutMs: int64FromMap(embeddingMap, "timeout_ms", 0),
 		},
 	}
 }
@@ -928,7 +631,7 @@ func (s *Server) completeTurnExtractionConfig(meta map[string]any) completeTurnE
 
 	cfg.Critic = selectCompleteTurnLLMCoreConfig(cfg.Critic, criticMap, rt.CriticProvider, rt.CriticAPIKey, rt.CriticEndpoint, rt.CriticModel, "critic")
 	if rt.CriticTimeoutSec > 0 {
-		cfg.Critic.TimeoutMs = runtimeTimeoutMs(rt.CriticTimeoutSec, cfg.Critic.TimeoutMs)
+		cfg.Critic.TimeoutMs = runtimeTimeoutMs(rt.CriticTimeoutSec)
 	}
 	if rt.CriticTemperature != nil && criticMap["temperature"] == nil {
 		cfg.Critic.Temperature = *rt.CriticTemperature
@@ -962,6 +665,13 @@ func (s *Server) completeTurnExtractionConfig(meta map[string]any) completeTurnE
 	if strings.TrimSpace(cfg.Critic.VertexFlexMode) == "" {
 		cfg.Critic.VertexFlexMode = rt.CriticVertexFlexMode
 	}
+	if strings.TrimSpace(cfg.Critic.LLMGatewayServiceTier) == "" {
+		cfg.Critic.LLMGatewayServiceTier = rt.CriticLLMGatewayServiceTier
+	}
+	if strings.TrimSpace(cfg.Critic.ClaudePromptCacheMode) == "" {
+		cfg.Critic.ClaudePromptCacheMode = rt.CriticClaudePromptCacheMode
+	}
+	cfg.Critic.RetryBudget = newLLMRetryBudget(rt.LLMRetryCount)
 
 	cfg.Embedder = s.selectCompleteTurnEmbeddingConfig(meta, cfg.Embedder, rt)
 	return cfg
@@ -994,12 +704,9 @@ func selectCompleteTurnLLMCoreConfig(metaCfg completeTurnLLMConfig, metaMap map[
 
 func (s *Server) selectCompleteTurnEmbeddingConfig(meta map[string]any, metaCfg completeTurnEmbeddingConfig, rt RuntimeConfig) completeTurnEmbeddingConfig {
 	metaCfg.APIKey = normalizeConfigSecret(metaCfg.APIKey)
-	if metaCfg.TimeoutMs <= 0 {
-		metaCfg.TimeoutMs = 30000
-	}
 	timeoutMs := metaCfg.TimeoutMs
 	if rt.EmbeddingTimeoutSec > 0 {
-		timeoutMs = runtimeTimeoutMs(rt.EmbeddingTimeoutSec, timeoutMs)
+		timeoutMs = runtimeTimeoutMs(rt.EmbeddingTimeoutSec)
 	}
 	metaCfg.TimeoutMs = timeoutMs
 	metaEmbedding := mapFromAny(meta["embedding"])
@@ -1054,7 +761,11 @@ func (c completeTurnLLMConfig) hasConfig() bool {
 }
 
 func (c completeTurnLLMConfig) missingFields() []string {
-	return configMissingFieldsWithProvider(c.Provider, c.APIKey, c.Endpoint, c.Model)
+	missing := configMissingFieldsWithProvider(c.Provider, c.APIKey, c.Endpoint, c.Model)
+	if c.TimeoutMs <= 0 {
+		missing = append(missing, "timeout_ms")
+	}
+	return missing
 }
 
 func (c completeTurnLLMConfig) hasAnyAuthorityConfigField() bool {
@@ -1068,7 +779,11 @@ func (c completeTurnEmbeddingConfig) hasConfig() bool {
 }
 
 func (c completeTurnEmbeddingConfig) missingFields() []string {
-	return configMissingFieldsWithProvider(c.Provider, c.APIKey, c.Endpoint, c.Model)
+	missing := configMissingFieldsWithProvider(c.Provider, c.APIKey, c.Endpoint, c.Model)
+	if c.TimeoutMs <= 0 {
+		missing = append(missing, "timeout_ms")
+	}
+	return missing
 }
 
 func (c completeTurnEmbeddingConfig) hasAnyConfigField() bool {
@@ -1151,6 +866,12 @@ func addCompleteTurnReasoningTraceFields(trace map[string]any, cfg completeTurnL
 	if strings.TrimSpace(cfg.VertexFlexMode) != "" {
 		trace["vertex_flex_mode"] = strings.TrimSpace(cfg.VertexFlexMode)
 	}
+	if strings.TrimSpace(cfg.LLMGatewayServiceTier) != "" {
+		trace["llm_gateway_service_tier"] = strings.TrimSpace(cfg.LLMGatewayServiceTier)
+	}
+	if strings.TrimSpace(cfg.ClaudePromptCacheMode) != "" {
+		trace["claude_prompt_cache_mode"] = strings.TrimSpace(cfg.ClaudePromptCacheMode)
+	}
 	if strings.TrimSpace(cfg.ExtraHeadersJSON) != "" {
 		trace["extra_headers_json_configured"] = true
 	}
@@ -1171,6 +892,12 @@ func applyProxyOverridesFromLLMConfig(req *dto.ProxyPluginMainRequest, cfg compl
 	}
 	if strings.TrimSpace(cfg.VertexFlexMode) != "" {
 		req.VertexFlexMode = &cfg.VertexFlexMode
+	}
+	if strings.TrimSpace(cfg.LLMGatewayServiceTier) != "" {
+		req.LLMGatewayServiceTier = &cfg.LLMGatewayServiceTier
+	}
+	if strings.TrimSpace(cfg.ClaudePromptCacheMode) != "" {
+		req.ClaudePromptCacheMode = &cfg.ClaudePromptCacheMode
 	}
 }
 

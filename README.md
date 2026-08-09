@@ -1,4 +1,4 @@
-# Archive Center 3.5
+# Archive Center 3.9.9
 
 Archive Center는 RisuAI 대화의 원문과 파생 기억을 로컬에 보존하고, 현재 장면에
 관련된 기억과 원작 근거를 다음 요청에 전달하는 로컬 우선 기억 backend입니다.
@@ -7,7 +7,9 @@ Archive Center는 RisuAI 대화의 원문과 파생 기억을 로컬에 보존�
 자료 종류별 독립 기억 예산, 출력 계보와 플로팅 진행 HUD가 포함됩니다. 완료 범위,
 실제 UI 제공 상태, 추가 검증이 필요한 부분과 3.6 이후 인계는
 [`docs/3.1-3.5-consolidated-release.md`](docs/3.1-3.5-consolidated-release.md)에
-정리되어 있습니다.
+정리되어 있습니다. 3.6부터 4.0까지의 정밀 장기 기억 구현 범위는
+[`docs/3.6-4.0-precision-long-term-memory-roadmap.md`](docs/3.6-4.0-precision-long-term-memory-roadmap.md)
+한 문서만 권위 로드맵으로 사용합니다.
 
 ## Runtime Architecture
 
@@ -31,23 +33,24 @@ matching GitHub release tag. User `.env` files, databases, vector collections,
 original-work documents, secrets, and other user-provided data are not part of
 the project license or source release.
 
-## GitHub Install/Update
+## GitHub Fresh Install
 
-For normal installs and updates, use the GitHub Release package helpers instead
-of running a raw source checkout as the backend.
+For a new installation, use the one-line entry point for your platform.
 
 POSIX:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Flazer31/archive-center/main/scripts/install-github-release.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Flazer31/archive-center/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-iwr https://raw.githubusercontent.com/Flazer31/archive-center/main/scripts/install-github-release.ps1 -OutFile install-github-release.ps1
-powershell -ExecutionPolicy Bypass -File .\install-github-release.ps1
+irm https://raw.githubusercontent.com/Flazer31/archive-center/main/install-windows.ps1 | iex
 ```
+
+Updates use a separate path; these entry points never update or overwrite an
+existing install. See [`docs/simple-fresh-install.md`](docs/simple-fresh-install.md).
 
 Raw `git clone` is a source/operator path. It does not by itself configure
 MariaDB, ChromaDB, package launchers, or live service env. See

@@ -2,7 +2,7 @@ param(
     [string]$OutputRoot,
     [string]$PackageName = "",
     [string]$PackageKind = "managed",
-    [string]$PackageVersion = "3.5.0",
+    [string]$PackageVersion = "3.9.9",
     [string]$ChromaRuntime = "",
     [string]$CodeSigningCertThumbprint = "",
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -134,7 +134,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
     $packageLabel = if ($PackageKind -eq "managed") {
         "Archive Center $version Windows Auto Install Package"
     } else {
@@ -153,7 +153,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.5.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $patterns = @("*.md", "*.txt", "*.bat", "*.cmd", "*.ps1", "*.sh", "*.command")
     foreach ($pattern in $patterns) {
@@ -273,7 +273,93 @@ function Set-OwnPayloadSignatures([string]$Root, [string]$Thumbprint, [string]$T
     return $result
 }
 
-function Write-PackageTrustEvidence([string]$Root) {
+function Write-PackageMigrationUpdateManifest([string]$Root, [string]$TargetVersion) {
+    if ([string]::IsNullOrWhiteSpace($TargetVersion)) {
+        throw "PackageVersion is required for the migration update contract."
+    }
+    $migrationRoot = Join-Path $Root "migrations"
+    $target = @()
+    $migrationFiles = @(Get-ChildItem -LiteralPath $migrationRoot -File -Filter "*.sql" | Sort-Object Name)
+    $expectedRevision = 1
+    foreach ($file in $migrationFiles) {
+        if ($file.Name -notmatch '^(\d{3})_.+\.sql$' -or [int]$Matches[1] -ne $expectedRevision) {
+            throw ("Cumulative migration inventory must contain every sequential revision from 001; expected {0:D3}, found {1}." -f $expectedRevision, $file.Name)
+        }
+        $expectedRevision++
+        $target += [ordered]@{
+            path = "migrations/$($file.Name)"
+            size_bytes = [int64]$file.Length
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    if ($target.Count -eq 0) {
+        throw "The package migration inventory is empty."
+    }
+    $schemaTool = Get-Item -LiteralPath (Join-Path $Root "bin\mariadb-schema.exe")
+    $target += [ordered]@{
+        path = "bin/mariadb-schema.exe"
+        size_bytes = [int64]$schemaTool.Length
+        sha256 = (Get-FileHash -LiteralPath $schemaTool.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $contract = [ordered]@{
+        contract_version = "archive-center.package-migration-update.v2"
+        target_version = $TargetVersion.Trim()
+        target = @($target)
+        managed_files = "complete_manifest"
+        database_policy = "expand_first_old_backend_compatible"
+        minimum_source_version = "3.9.9"
+        direct_update_supported = $true
+        migration_inventory = "cumulative_complete"
+    }
+    $path = Join-Path $Root "PACKAGE_MIGRATION_UPDATE.json"
+    [System.IO.File]::WriteAllText(
+        $path,
+        ($contract | ConvertTo-Json -Depth 8) + [Environment]::NewLine,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    return $path
+}
+
+function Get-SourceBuildIdentity([string]$Root) {
+    $excludedPathspecs = @(
+        ":(exclude)_dist/**",
+        ":(exclude)release/**",
+        ":(exclude)output/**",
+        ":(exclude)go-service/.gocache*/**",
+        ":(exclude)go-service/.gotmp*/**",
+        ":(exclude)go-service/.codex-audit-cache*/**"
+    )
+    $commit = "unknown"
+    $dirty = "unknown"
+    try {
+        $observedCommitLines = @(& git -C $Root rev-parse --verify HEAD 2>$null)
+        $observedCommit = if ($observedCommitLines.Count -gt 0) { [string]$observedCommitLines[0] } else { "" }
+        if ($LASTEXITCODE -eq 0 -and $observedCommit -match '^[0-9a-fA-F]{40}$') {
+            $commit = ([string]$observedCommit).ToLowerInvariant()
+        }
+    } catch {
+    }
+    try {
+        $statusArgs = @("-C", $Root, "status", "--porcelain=v1", "--untracked-files=all", "--", ".") + $excludedPathspecs
+        $observedStatus = @(& git @statusArgs 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $dirty = [bool]($observedStatus.Count -gt 0)
+        }
+    } catch {
+    }
+    return [ordered]@{
+        commit = $commit
+        dirty = $dirty
+        dirty_scope = "git status --porcelain=v1 excluding _dist, release, output, Go cache/temp, and Codex audit-cache roots"
+    }
+}
+
+function Write-PackageTrustEvidence(
+    [string]$Root,
+    [string]$PackageVersion,
+    $SourceIdentity,
+    [string]$BuildDescriptor
+) {
     $payloadExts = @(".exe", ".dll", ".ps1", ".psm1", ".bat", ".cmd", ".msi")
     $selfFiles = @(
         "FULL_PACKAGE_MANIFEST.json",
@@ -319,6 +405,11 @@ function Write-PackageTrustEvidence([string]$Root) {
     $manifest = [ordered]@{
         schema_version = "archive-center.package-file-manifest.v1"
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
+        package_version = $PackageVersion
+        source_commit = [string]$SourceIdentity.commit
+        source_dirty = $SourceIdentity.dirty
+        source_dirty_scope = [string]$SourceIdentity.dirty_scope
+        build_command = $BuildDescriptor
         scope = "managed_package_payloads"
         signature_scope = "executable_and_script_payloads"
         package_root = "."
@@ -374,9 +465,9 @@ if ($PackageKind -eq "managed") {
     if (-not [string]::IsNullOrWhiteSpace($ChromaRuntime)) {
         throw "Managed Windows packages must not bundle ChromaDB. Remove -ChromaRuntime or use -PackageKind full for an internal full build."
     }
-    $runtimeProfileDefault = "core_lite"
-    $vectorModeDefault = "fallback"
-    $packageProfile = "windows_managed_auto_install"
+    $runtimeProfileDefault = "full_local"
+    $vectorModeDefault = "bundled"
+    $packageProfile = "windows_managed_full_local_auto_install"
     $requiredRuntimePayloads = @()
 } else {
     $runtimeProfileDefault = "full_local"
@@ -450,7 +541,10 @@ Copy-File "ops/full-package/03_run_backend.bat" "03_run_backend.bat"
 Copy-File "ops/full-package/04_protect_env_windows.bat" "04_protect_env_windows.bat"
 Copy-File "ops/full-package/05_unprotect_env_windows.bat" "05_unprotect_env_windows.bat"
 Copy-File "ops/full-package/.env.full.example" ".env.full.example"
-Copy-Directory "ops/full-package/scripts" "scripts" @("migrate-legacy-1.0-windows.ps1")
+Copy-Directory "ops/full-package/scripts" "scripts" @(
+    "migrate-legacy-1.0-windows.ps1",
+    "apply-update-compatibility-bridge.ps1"
+)
 Copy-File "ops/install-windows.ps1" "tools/install-windows.ps1"
 Copy-File "LICENSE" "LICENSE"
 Copy-File "NOTICE" "NOTICE"
@@ -476,13 +570,35 @@ if ($chromaCopied) {
     Install-ChromaRuntimeLicenseFiles (Join-Path $runtimeRoot "ChromaDB")
 }
 $codeSigning = Set-OwnPayloadSignatures $targetFull $CodeSigningCertThumbprint $TimestampServer
-$trustEvidence = Write-PackageTrustEvidence $targetFull
+$migrationUpdateManifestPath = Write-PackageMigrationUpdateManifest $targetFull $PackageVersion
+if (-not (Test-Path -LiteralPath $migrationUpdateManifestPath -PathType Leaf)) {
+    throw "Failed to generate PACKAGE_MIGRATION_UPDATE.json."
+}
+
+function Write-PackageReleaseStatus([string]$Root, [string]$TargetVersion, [bool]$ReleaseReady) {
+    $status = [ordered]@{
+        contract_version = "archive-center.package-release-status.v1"
+        target_version = $TargetVersion.Trim()
+        release_ready = $ReleaseReady
+        automatic_update_apply = $true
+        verification_basis = if ($ReleaseReady) { "windows_managed_package_build_green" } else { "build_not_release_ready" }
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Root "PACKAGE_RELEASE_STATUS.json"),
+        ($status | ConvertTo-Json -Depth 4) + [Environment]::NewLine,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+$sourceIdentity = Get-SourceBuildIdentity $repoRoot
+$canonicalBuildDescriptor = "ops/build-full-package.ps1 -PackageKind $PackageKind -PackageVersion $PackageVersion -Zip:$([bool]$Zip) -UpdateZip:$([bool]$UpdateZip) -CodeSigning:$(-not [string]::IsNullOrWhiteSpace($CodeSigningCertThumbprint))"
 $missing = @()
 if ($PackageKind -eq "full" -and [string]::IsNullOrWhiteSpace($chromaRuntimeFound)) {
     $missing += "chromadb_runtime"
 }
 
 $releaseReady = $missing.Count -eq 0
+Write-PackageReleaseStatus $targetFull $PackageVersion $releaseReady
+$trustEvidence = Write-PackageTrustEvidence $targetFull $PackageVersion $sourceIdentity $canonicalBuildDescriptor
 if (-not $releaseReady -and -not $AllowMissingRuntimePayloads) {
     $manifest = [ordered]@{
         package_name = $PackageName
@@ -522,20 +638,23 @@ $manifest = [ordered]@{
     vector_engine = $vectorEngine
     includes_runtime_binaries = [bool]$chromaCopied
     mariadb_distribution = "separate_official_runtime_install"
+    chromadb_distribution = if ($PackageKind -eq "managed") { "separate_pinned_runtime_install" } else { "bundled" }
     runtime_profile_default = $runtimeProfileDefault
     vector_mode_default = $vectorModeDefault
     go_toolchain = $goVersionText
-    chromadb_version = if ($chromaCopied) { "1.5.9" } else { "not_bundled" }
+    chromadb_version = "1.5.9"
     chromadb_api_path = "/api/v2"
     required_runtime_payloads = $requiredRuntimePayloads
     runtime_payloads = [ordered]@{
         mariadb_payload_copied = $false
         mariadb_install_tool = "tools/install-windows.ps1"
         mariadb_external_runtime_root = "%LOCALAPPDATA%\ArchiveCenter\runtime\MariaDB"
+        chromadb_install_tool = if ($PackageKind -eq "managed") { "tools/install-windows.ps1 -InstallChromaDBRuntime" } else { "" }
+        chromadb_external_runtime_root = if ($PackageKind -eq "managed") { "%LOCALAPPDATA%\ArchiveCenter\runtime\ChromaDB\1.5.9" } else { "" }
         chromadb_copied_from = if ($chromaCopied) { "release-runtime-input" } else { "" }
         chromadb_payload_copied = [bool]$chromaCopied
         chromadb_runtime_path = $chromaRuntimeFound
-        chromadb_default_behavior = if ($PackageKind -eq "managed") { "fallback; configure an external or separately installed local ChromaDB to enable vector mode" } else { "bundled" }
+        chromadb_default_behavior = if ($PackageKind -eq "managed") { "download verified official Python, install pinned ChromaDB 1.5.9 per user, and start local vector mode" } else { "bundled" }
     }
     windows_trust = [ordered]@{
         automatic_defender_exclusions = $false
@@ -555,6 +674,8 @@ $manifest = [ordered]@{
         "licenses",
         "WINDOWS_TRUST_AND_DEFENDER.md",
         "PACKAGE_FILE_MANIFEST.json",
+        "PACKAGE_MIGRATION_UPDATE.json",
+        "PACKAGE_RELEASE_STATUS.json",
         "SHA256SUMS.txt",
         "migrations",
         "prompts",
@@ -574,6 +695,8 @@ $manifest = [ordered]@{
         "test binaries",
         "database files",
         "MariaDB runtime binaries",
+        "Python runtime binaries",
+        "ChromaDB runtime binaries",
         "legacy 1.0 migration tools and launcher",
         "ChromaDB persist data",
         "backup/release/deploy outputs"
@@ -660,7 +783,7 @@ if ($Zip -or $UpdateZip) {
             }
             $manifestEntry = $manifestEntries[0]
             $packagePrefix = $manifestEntry.Substring(0, $manifestEntry.Length - "PACKAGE_FILE_MANIFEST.json".Length)
-            foreach ($requiredEntry in @("PACKAGE_FILE_MANIFEST.json", "bin/archive-center-go.exe", "bin/archive-center-updater.exe", "Archive Center.js", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/Apache-2.0.txt")) {
+            foreach ($requiredEntry in @("PACKAGE_FILE_MANIFEST.json", "PACKAGE_MIGRATION_UPDATE.json", "PACKAGE_RELEASE_STATUS.json", "bin/archive-center-go.exe", "bin/archive-center-updater.exe", "bin/mariadb-schema.exe", "scripts/start-full-windows.ps1", "01_start_archive_center_windows.bat", "tools/install-windows.ps1", "migrations/001_schema.sql", "Archive Center.js", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/Apache-2.0.txt")) {
                 $expectedEntry = $packagePrefix + $requiredEntry
                 if (-not $entryMap.ContainsKey($expectedEntry) -or $entryMap[$expectedEntry].Length -le 0) {
                     throw "Generated ZIP is missing required package entry: $expectedEntry"

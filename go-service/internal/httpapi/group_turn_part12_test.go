@@ -201,19 +201,19 @@ func TestPrepareTurnTM1aCanonicalConsistencyRecallDocumentsSurface(t *testing.T)
 
 func TestSeq123P83LongMemoryPromotionCandidateMarkers(t *testing.T) {
 	t.Run("critic_prompt_has_durable_extraction_markers", func(t *testing.T) {
-		prompt := buildCompleteTurnCriticPrompt(
+		prompt := combinedCriticPromptForTest(t, buildCompleteTurnCriticPrompt(
 			"sess-p83", 3,
 			"Mina found the brass key.",
 			"Rowan nodded and followed.",
 			nil, nil, nil,
-		)
+		))
 		required := []string{
 			"Extract durable Archive Center memory data",
 			"[User]",
 			"[Assistant]",
 			"<Latest_Turn>",
 			"Omit unknown facts instead of inventing placeholders",
-			"evidence_excerpts must be short exact excerpts",
+			"evidence_excerpts are durable citations, not transcript samples",
 			"persona_capsule_candidates",
 			"support_only_persona_recollection",
 			"requires later user/operator approval",
@@ -222,12 +222,10 @@ func TestSeq123P83LongMemoryPromotionCandidateMarkers(t *testing.T) {
 			"challenge entry/clear/reward loops",
 			"exchange/cost economy",
 			"upgrade or unlock rules",
-			"Mandatory world-rule audit",
+			"World Rule Mandatory Audit",
 			"world_rule_audit",
-			"world_rules must not be empty",
-			"1-7 turn session",
-			"progression currency exchange",
-			"challenge reward loops",
+			"`world_rules` must not be empty",
+			"Early-session setup can already establish foundational constraints",
 			"abstract invariant",
 			"temporary strategy",
 			"not a world_rule",
@@ -251,17 +249,17 @@ func TestSeq123P83LongMemoryPromotionCandidateMarkers(t *testing.T) {
 			"locked_for_turn":         true,
 			"raw_evidence_rewritten":  true,
 		}
-		prompt := buildCompleteTurnCriticPromptWithLanguageContext(
+		prompt := combinedCriticPromptForTest(t, buildCompleteTurnCriticPromptWithLanguageContext(
 			"sess-p83-lang", 4,
 			"RAW-KO: Mina found the brass key.",
 			"Mina found the brass key.",
 			nil, nil, nil, languageContext,
-		)
+		))
 		for _, needle := range []string{
 			"Language_Context_JSON",
-			"generated natural-language memory fields must use that language",
-			"Do not default to English just because these instructions are English",
-			"Raw evidence excerpts must stay exact source text",
+			"Follow runtime language guidance from `summary_language` or `session_output_language`",
+			"Do not default to English just because this prompt is written in English",
+			"Raw evidence excerpts must remain exact source text",
 			"\"session_output_language\":\"en\"",
 			"\"raw_evidence_rewritten\":false",
 		} {
@@ -627,8 +625,8 @@ func TestSeq123P83LongMemoryPromotionCandidateMarkers(t *testing.T) {
 		if !strings.Contains(text, "protected private knowledge is present") || !strings.Contains(text, "kind=romantic_feeling") {
 			t.Fatalf("private recollection guard text missing: %q", text)
 		}
-		if strings.Contains(text, "privately likes Rowan") {
-			t.Fatalf("private recollection leaked secret text: %q", text)
+		if !strings.Contains(text, "Mina privately likes Rowan but has not revealed it.") {
+			t.Fatalf("private recollection omitted exact protected text: %q", text)
 		}
 	})
 
@@ -661,7 +659,7 @@ func TestSeq123P83LongMemoryPromotionCandidateMarkers(t *testing.T) {
 		mux := http.NewServeMux()
 		srv.RegisterRoutes(mux)
 
-		body := `{"chat_session_id":"sess-p83-ooc","turn_index":1,"user_input":"OOC: please change the plugin setting","assistant_content":"Sure, I will help.","context_messages":[]}`
+		body := `{"chat_session_id":"sess-p83-ooc","turn_index":1,"user_input":"please change the plugin setting","assistant_content":"Sure, I will help.","context_messages":[],"client_meta":{"risu_request_observation":{"contract_version":"risu_request_observation.v1","ooc_class_state":"observed","ooc_class":"ooc"}}}`
 		req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()

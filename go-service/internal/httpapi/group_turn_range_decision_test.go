@@ -19,7 +19,10 @@ type durableRoutingBaselineStore struct {
 
 type rollbackDecisionChatLogStore struct {
 	store.Store
-	logs []store.ChatLog
+	logs             []store.ChatLog
+	latestTurnCalls  int
+	listChatLogsFrom int
+	listChatLogsTo   int
 }
 
 type sessionIdentityRoutingStore struct {
@@ -27,6 +30,52 @@ type sessionIdentityRoutingStore struct {
 	sessions []store.SessionSummary
 	logs     map[string][]store.ChatLog
 	baseline *store.SessionRoutingBaseline
+}
+
+type durableSessionIdentityBindingStore struct {
+	store.Store
+	bindings map[string]string
+	locks    map[string]string
+	fail     bool
+	lastMode string
+}
+
+func (s *durableSessionIdentityBindingStore) BindSessionRoute(_ context.Context, req store.SessionRouteBindingRequest) (*store.SessionRouteBindingResult, error) {
+	if s.fail {
+		return nil, context.DeadlineExceeded
+	}
+	if s.bindings == nil {
+		s.bindings = map[string]string{}
+	}
+	s.lastMode = req.Mode
+	key := req.StableCharacterID + "\x00" + req.HostChatID
+	canonical, exists := s.bindings[key]
+	force := req.Mode == store.SessionRouteBindingModeManualAttach || req.Mode == store.SessionRouteBindingModeMigrationCommit
+	if !exists || force {
+		canonical = req.RequestedSessionID
+	}
+	redirected := false
+	if target := s.locks[canonical]; target != "" {
+		canonical = target
+		redirected = true
+	}
+	if canonical == "" {
+		return nil, store.ErrNotFound
+	}
+	s.bindings[key] = canonical
+	return &store.SessionRouteBindingResult{
+		Binding: store.SessionRouteBinding{
+			ContractVersion:    store.SessionRouteBindingContractVersion,
+			StableCharacterID:  req.StableCharacterID,
+			HostChatID:         req.HostChatID,
+			CanonicalSessionID: canonical,
+			BindingState:       "active",
+		},
+		Created:              !exists,
+		Updated:              exists && (force || redirected),
+		ReadbackVerified:     true,
+		LockedSourceRedirect: redirected,
+	}, nil
 }
 
 func (s *sessionIdentityRoutingStore) ListSessions(context.Context) ([]store.SessionSummary, error) {
@@ -41,8 +90,31 @@ func (s *sessionIdentityRoutingStore) GetSessionRoutingBaseline(context.Context,
 	return s.baseline, nil
 }
 
-func (s *rollbackDecisionChatLogStore) ListChatLogs(_ context.Context, _ string, _, _ int) ([]store.ChatLog, error) {
-	return s.logs, nil
+func (s *rollbackDecisionChatLogStore) LatestSessionTurnIndex(context.Context, string) (int, error) {
+	s.latestTurnCalls++
+	latest := 0
+	for _, item := range s.logs {
+		if item.TurnIndex > latest {
+			latest = item.TurnIndex
+		}
+	}
+	return latest, nil
+}
+
+func (s *rollbackDecisionChatLogStore) ListChatLogs(_ context.Context, _ string, fromTurn, toTurn int) ([]store.ChatLog, error) {
+	s.listChatLogsFrom = fromTurn
+	s.listChatLogsTo = toTurn
+	result := make([]store.ChatLog, 0, len(s.logs))
+	for _, item := range s.logs {
+		if fromTurn > 0 && item.TurnIndex < fromTurn {
+			continue
+		}
+		if toTurn > 0 && item.TurnIndex > toTurn {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func (s *durableRoutingBaselineStore) GetSessionRoutingBaseline(context.Context, string) (*store.SessionRoutingBaseline, error) {
@@ -125,6 +197,190 @@ func TestSessionRoutingIdentityKeepsExistingCIDWhenCharacterIndexChanges(t *test
 	}
 	if response.ChatSessionID != existingID || response.IdentityResolution != "existing_host_chat_id" {
 		t.Fatalf("same observed CID was split by character index: %+v", response)
+	}
+}
+
+func TestSessionRoutingDurableBindingSurvivesIndexMoveAndReload(t *testing.T) {
+	bindingStore := &durableSessionIdentityBindingStore{
+		Store: store.NewNoopStore(),
+	}
+	server := &Server{Store: bindingStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	post := func(requested string) sessionRoutingTurnResolutionResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+			"chat_session_id":"`+requested+`",
+			"mode":"identity",
+			"stable_character_id":"stable-character",
+			"stable_character_id_state":"observed",
+			"host_chat_id":"opaque-chat",
+			"host_chat_id_state":"observed"
+		}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		var response sessionRoutingTurnResolutionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	created := post("char_4_cid_opaque-chat")
+	if created.ChatSessionID != "char_4_cid_opaque-chat" || !created.BindingAcknowledged ||
+		!created.BindingCreated || created.IdentityResolution != "durable_binding_created" {
+		t.Fatalf("created binding response = %+v", created)
+	}
+	reloadedAfterIndexMove := post("char_1_cid_opaque-chat")
+	if reloadedAfterIndexMove.ChatSessionID != "char_4_cid_opaque-chat" ||
+		!reloadedAfterIndexMove.BindingAcknowledged ||
+		reloadedAfterIndexMove.IdentityResolution != "durable_binding_existing" {
+		t.Fatalf("index move/reload split durable binding: %+v", reloadedAfterIndexMove)
+	}
+}
+
+func TestSessionRoutingDurableBindingKeepsDifferentStableCharactersSeparate(t *testing.T) {
+	bindingStore := &durableSessionIdentityBindingStore{Store: store.NewNoopStore()}
+	server := &Server{Store: bindingStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	for _, fixture := range []struct {
+		character string
+		session   string
+	}{
+		{character: "stable-a", session: "session-a"},
+		{character: "stable-b", session: "session-b"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+			"chat_session_id":"`+fixture.session+`",
+			"mode":"identity",
+			"stable_character_id":"`+fixture.character+`",
+			"stable_character_id_state":"observed",
+			"host_chat_id":"same-opaque-chat",
+			"host_chat_id_state":"observed"
+		}`))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		var response sessionRoutingTurnResolutionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.ChatSessionID != fixture.session || !response.BindingAcknowledged {
+			t.Fatalf("%s response = %+v", fixture.character, response)
+		}
+	}
+}
+
+func TestSessionRoutingDurableBindingRedirectsLockedSource(t *testing.T) {
+	bindingStore := &durableSessionIdentityBindingStore{
+		Store: store.NewNoopStore(),
+		bindings: map[string]string{
+			"stable-character\x00opaque-chat": "locked-source",
+		},
+		locks: map[string]string{"locked-source": "migration-target"},
+	}
+	server := &Server{Store: bindingStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"locked-source",
+		"mode":"identity",
+		"stable_character_id":"stable-character",
+		"stable_character_id_state":"observed",
+		"host_chat_id":"opaque-chat",
+		"host_chat_id_state":"observed"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ChatSessionID != "migration-target" || !response.LockedSourceRedirect ||
+		!response.BindingAcknowledged || response.IdentityResolution != "durable_binding_locked_source_redirect" {
+		t.Fatalf("locked source was not redirected: %+v", response)
+	}
+}
+
+func TestSessionRoutingBindingFailureReturnsNoAcknowledgement(t *testing.T) {
+	server := &Server{Store: &durableSessionIdentityBindingStore{Store: store.NewNoopStore(), fail: true}}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"requested",
+		"mode":"identity",
+		"stable_character_id":"stable-character",
+		"stable_character_id_state":"observed",
+		"host_chat_id":"opaque-chat",
+		"host_chat_id_state":"observed"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "error" || response.Code != "session_route_binding_failed" ||
+		response.BindingAcknowledged || response.ChatSessionID != "requested" {
+		t.Fatalf("binding failure was presented as success: %+v", response)
+	}
+}
+
+func TestSessionRoutingManualAttachUsesExplicitBindingMode(t *testing.T) {
+	bindingStore := &durableSessionIdentityBindingStore{
+		Store:    store.NewNoopStore(),
+		bindings: map[string]string{"stable-character\x00opaque-chat": "old-session"},
+	}
+	server := &Server{Store: bindingStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"attached-session",
+		"mode":"identity",
+		"stable_character_id":"stable-character",
+		"stable_character_id_state":"observed",
+		"host_chat_id":"opaque-chat",
+		"host_chat_id_state":"observed",
+		"bind_requested_session":true,
+		"binding_mode":"manual_attach"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ChatSessionID != "attached-session" || !response.BindingAcknowledged ||
+		!response.BindingUpdated || bindingStore.lastMode != store.SessionRouteBindingModeManualAttach {
+		t.Fatalf("manual attach binding response = %+v mode=%q", response, bindingStore.lastMode)
+	}
+}
+
+func TestSessionRoutingLegacyIndexPinPromotesToDurableBinding(t *testing.T) {
+	bindingStore := &durableSessionIdentityBindingStore{Store: store.NewNoopStore()}
+	server := &Server{Store: bindingStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	req := httptest.NewRequest(http.MethodPost, "/session-routing/turn-resolution", strings.NewReader(`{
+		"chat_session_id":"legacy-pinned-session",
+		"mode":"identity",
+		"stable_character_id":"stable-character",
+		"stable_character_id_state":"observed",
+		"host_chat_id":"opaque-chat",
+		"host_chat_id_state":"observed",
+		"binding_mode":"legacy_promotion"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var response sessionRoutingTurnResolutionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ChatSessionID != "legacy-pinned-session" || !response.BindingAcknowledged ||
+		!response.BindingCreated || bindingStore.lastMode != store.SessionRouteBindingModeLegacyPromotion {
+		t.Fatalf("legacy promotion response = %+v mode=%q", response, bindingStore.lastMode)
 	}
 }
 
@@ -317,6 +573,12 @@ func TestRollbackDecisionHandlerUsesDurableCopiedBaselineWhenClientBaselineIsMis
 	if !response.Allowed || !response.BaselineApplied || response.FromTurn != 9 || response.ProtectedBeforeTurn != 8 || response.MinFromTurn != 9 {
 		t.Fatalf("durable copied rollback baseline was not applied: %+v", response)
 	}
+	hud, ok := response.TurnWorkflowHUD.(map[string]any)
+	if !ok || hud["display_mode"] != "notice" || hud["status"] != "running" ||
+		hud["notice_code"] != "ASSISTANT_OUTPUT_DELETE_DETECTED" ||
+		hud["title_key"] != "turn_hud.notice.delete_detected" {
+		t.Fatalf("verified deletion did not return a detection HUD: %#v", response.TurnWorkflowHUD)
+	}
 }
 
 func TestVerifiedTailDeleteUsesBackendTailWhenCopiedBaselineIsMissing(t *testing.T) {
@@ -391,12 +653,42 @@ func TestVerifiedTailDeleteWithoutClientBaselineExecutesOnlyBackendTail(t *testi
 	}
 }
 
+func TestRollbackDecisionCarriesTypedSupersession(t *testing.T) {
+	request := rollbackDecisionRequest{
+		ChatSessionID: "char_1_cid_replace", CandidateFromTurn: 4,
+		BackendLatestTurn: 4, DeletionObserved: true,
+		LifecycleActionObservation: store.LogicalTurnLifecycleSuperseded,
+	}
+	decision := calculateRollbackDecision(request)
+	if !decision.Allowed || decision.LifecycleAction != store.LogicalTurnLifecycleSuperseded {
+		t.Fatalf("supersession decision=%+v", decision)
+	}
+	ledger := newRollbackDecisionLedger()
+	record := ledger.issue(decision.ChatSessionID, decision.FromTurn, "adapter", decision.LifecycleAction)
+	consumed, ok := ledger.consume(record.Token, decision.ChatSessionID, decision.FromTurn)
+	if !ok || consumed.LifecycleAction != store.LogicalTurnLifecycleSuperseded {
+		t.Fatalf("typed supersession was not preserved by decision token: %+v ok=%v", consumed, ok)
+	}
+}
+
+func TestRollbackDecisionRejectsUnknownLifecycleAction(t *testing.T) {
+	decision := calculateRollbackDecision(rollbackDecisionRequest{
+		ChatSessionID: "char_1_cid_replace", CandidateFromTurn: 4,
+		BackendLatestTurn: 4, DeletionObserved: true,
+		LifecycleActionObservation: "guess_from_prompt_text",
+	})
+	if decision.Allowed || decision.Reason != "lifecycle_action_observation_invalid" {
+		t.Fatalf("unknown lifecycle action was not rejected: %+v", decision)
+	}
+}
+
 func TestRollbackDecisionHandlerVerifiesIncompleteUserOnlyBackendTail(t *testing.T) {
 	const sid = "char_1_cid_user_only_tail"
-	server := &Server{Store: &rollbackDecisionChatLogStore{
+	decisionStore := &rollbackDecisionChatLogStore{
 		Store: store.NewNoopStore(),
 		logs:  []store.ChatLog{{ChatSessionID: sid, TurnIndex: 9, Role: "user", Content: "saved input only"}},
-	}}
+	}
+	server := &Server{Store: decisionStore}
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
@@ -423,6 +715,45 @@ func TestRollbackDecisionHandlerVerifiesIncompleteUserOnlyBackendTail(t *testing
 	}
 	if !response.Allowed || response.FromTurn != 9 || response.DecisionToken == "" {
 		t.Fatalf("user-only tail decision=%+v", response)
+	}
+	if decisionStore.latestTurnCalls != 1 || decisionStore.listChatLogsFrom != 9 || decisionStore.listChatLogsTo != 9 {
+		t.Fatalf("latest calls=%d chat log range=%d..%d, want one latest lookup and turn 9 only", decisionStore.latestTurnCalls, decisionStore.listChatLogsFrom, decisionStore.listChatLogsTo)
+	}
+}
+
+func TestRollbackDecisionHandlerResolvesMissingBackendLatestTurn(t *testing.T) {
+	const sid = "char_1_cid_manual_delete"
+	decisionStore := &rollbackDecisionChatLogStore{
+		Store: store.NewNoopStore(),
+		logs: []store.ChatLog{
+			{ChatSessionID: sid, TurnIndex: 6, Role: "user", Content: "u"},
+			{ChatSessionID: sid, TurnIndex: 6, Role: "assistant", Content: "a"},
+		},
+	}
+	server := &Server{Store: decisionStore}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/rollback/decision", strings.NewReader(`{
+		"chat_session_id":"`+sid+`",
+		"request_source":"manual",
+		"candidate_from_turn":5,
+		"deletion_observed":true,
+		"allow_manual_candidate":true,
+		"lifecycle_action_observation":"deleted"
+	}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	var response rollbackDecisionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Allowed || response.FromTurn != 5 || response.DecisionToken == "" {
+		t.Fatalf("manual delete decision=%+v", response)
+	}
+	if decisionStore.latestTurnCalls != 1 {
+		t.Fatalf("latest turn calls=%d, want 1", decisionStore.latestTurnCalls)
 	}
 }
 
@@ -685,7 +1016,7 @@ func TestCopiedEightPlusOneRollbackDecisionExecutesOnlyTurnNine(t *testing.T) {
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
 	recordingStore := &rollbackRecordingStore{Store: store.NewNoopStore()}
 	server := &Server{Cfg: cfg, Store: recordingStore}
-	record := server.rollbackDecisionLedger().issue(sid, decision.FromTurn, "auto")
+	record := server.rollbackDecisionLedger().issue(sid, decision.FromTurn, "auto", store.LogicalTurnLifecycleDeleted)
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 	req := httptest.NewRequest(http.MethodDelete, "/rollback/9?chat_session_id="+sid+"&req_source=auto&decision_token="+record.Token, nil)
@@ -706,16 +1037,31 @@ func TestCopiedEightPlusOneRollbackDecisionExecutesOnlyTurnNine(t *testing.T) {
 
 func TestRollbackDecisionTokenIsOneUseAndBoundToRange(t *testing.T) {
 	ledger := newRollbackDecisionLedger()
-	record := ledger.issue("s", 4, "auto")
+	record := ledger.issue("s", 4, "auto", store.LogicalTurnLifecycleDeleted)
 	if _, ok := ledger.consume(record.Token, "s", 5); ok {
 		t.Fatal("token accepted wrong turn")
 	}
-	record = ledger.issue("s", 4, "auto")
+	record = ledger.issue("s", 4, "auto", store.LogicalTurnLifecycleDeleted)
 	if _, ok := ledger.consume(record.Token, "s", 4); !ok {
 		t.Fatal("token rejected matching decision")
 	}
 	if _, ok := ledger.consume(record.Token, "s", 4); ok {
 		t.Fatal("token reused")
+	}
+}
+
+func TestRollbackDecisionLedgerEvictsOldestTokenAtCapacity(t *testing.T) {
+	ledger := newRollbackDecisionLedger()
+	first := ledger.issue("s", 4, "auto", store.LogicalTurnLifecycleDeleted)
+	var latest rollbackDecisionRecord
+	for index := 1; index <= rollbackDecisionMax; index++ {
+		latest = ledger.issue("s", 4+index, "auto", store.LogicalTurnLifecycleDeleted)
+	}
+	if _, ok := ledger.consume(first.Token, "s", 4); ok {
+		t.Fatal("oldest rollback token survived capacity eviction")
+	}
+	if _, ok := ledger.consume(latest.Token, latest.SessionID, latest.FromTurn); !ok {
+		t.Fatal("latest rollback token was not retained")
 	}
 }
 

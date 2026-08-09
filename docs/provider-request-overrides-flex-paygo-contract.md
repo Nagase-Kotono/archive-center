@@ -1,8 +1,8 @@
 # Provider Request Overrides and Vertex Flex PayGo Contract
 
-Status: design contract; Risu Output Quality Layer standalone JS implemented; Archive Center backend pending
+Status: Archive Center backend and adapter implemented; live provider verification pending
 
-Last updated: 2026-07-07
+Last updated: 2026-07-31
 
 ## Purpose
 
@@ -338,6 +338,247 @@ Provisioned then Flex
 Flex only
   Force cheaper shared Flex traffic. May be slower.
 ```
+
+## OpenAI-Compatible Gateways and Service Tiers
+
+Archive Center exposes LLM Gateway and Vercel AI Gateway as independent
+generation providers. Both use an OpenAI-compatible Chat Completions transport,
+but they are not stored or reported as `openai` or `custom`.
+
+Default endpoints:
+
+```text
+LLM Gateway:      https://api.llmgateway.io/v1
+Vercel AI Gateway: https://ai-gateway.vercel.sh/v1
+```
+
+Role-specific settings:
+
+```json
+{
+  "pluginMainLlmGatewayServiceTier": "standard",
+  "subLlmLlmGatewayServiceTier": "standard"
+}
+```
+
+Backend request field:
+
+```json
+{
+  "llm_gateway_service_tier": "flex"
+}
+```
+
+The field name remains backward-compatible with the earlier LLM Gateway-only
+setting. The Go provider owner normalizes it and writes the upstream
+OpenAI-compatible `service_tier` field for provider `openai`, `llmgateway`,
+`vercel`, or `custom`:
+
+| UI value | Upstream value |
+|---|---|
+| `standard` | `default` |
+| `flex` | `flex` |
+| `priority` | `priority` |
+
+Rules:
+
+- The typed tier is accepted only with provider `openai`, `llmgateway`,
+  `vercel`, or `custom`.
+- `standard` is omitted so the provider keeps its normal default. Only an
+  explicit Flex or Priority selection is forwarded. Provider applicability,
+  normalization, and conflicts are owned by Go; JavaScript uses its provider
+  list only to present the relevant settings row.
+- Invalid values and a conflicting `extra_body_json.service_tier` fail before
+  an upstream request.
+- Existing untyped `extra_body_json.service_tier` remains usable when the
+  typed setting is absent.
+- An upstream `unsupported_service_tier` response is returned as an error. It
+  is never retried after removing the tier and never silently downgraded.
+- Trace records the requested and applied tier. It also records the response
+  `service_tier` as the served tier, or `not_reported` when the gateway omits
+  it.
+
+OpenAI documents `service_tier:flex` as lower-cost, slower, best-effort
+processing with limited model availability. LLM Gateway documents `flex`,
+`priority`, and `default`/`auto`, but only for provider/model mappings that
+advertise the selected tier. Vercel AI Gateway forwards OpenAI service tiers
+for supported OpenAI models. Custom OpenAI-compatible endpoints receive the
+field only when the user explicitly selects Flex or Priority; Archive Center
+does not claim that every custom server supports it.
+
+Official reference:
+
+- https://developers.openai.com/api/docs/guides/flex-processing
+- https://docs.llmgateway.io/features/service-tiers
+- https://vercel.com/docs/ai-gateway/capabilities/service-tiers
+
+Implementation status:
+
+- source and automated regression: implemented for OpenAI, LLM Gateway,
+  Vercel, and Custom request construction;
+- real paid provider/model calls: unverified;
+- release status: `implemented_unverified`, not a live-provider acceptance
+  result.
+
+## Prompt Caching Across Supported Providers
+
+Archive Center does not expose one fake universal cache switch because the
+provider contracts are different:
+
+- OpenAI prompt caching is automatic for eligible requests. Recent model
+  families also expose explicit breakpoints and `prompt_cache_key`; these can
+  be sent through Extra Body JSON when the selected endpoint supports them.
+- Gemini API and Vertex Gemini implicit caching are automatic. Explicit context
+  caching requires creating a provider cache resource first; an existing
+  `cachedContent` resource reference can be sent through Extra Body JSON.
+- LLM Gateway provider caching is automatic for most mappings and injects
+  Anthropic/Bedrock cache markers when required. Gateway-level byte-identical
+  response caching remains a project setting, not a per-request Archive Center
+  toggle.
+- Vercel AI Gateway automatic provider-aware caching is available through:
+
+```json
+{
+  "providerOptions": {
+    "gateway": {
+      "caching": "auto"
+    }
+  }
+}
+```
+
+- Custom providers have no portable cache field. Extra Headers JSON and Extra
+  Body JSON are therefore the explicit compatibility path; unsupported
+  provider errors are returned rather than hidden.
+
+Gemini and Vertex normalized responses preserve the provider's complete
+`usageMetadata`. The trace copies `promptTokenCount`,
+`candidatesTokenCount`, `totalTokenCount`, `cachedContentTokenCount`, and
+`trafficType` when they are actually returned. Archive Center never invents a
+cache hit.
+
+Official reference:
+
+- https://developers.openai.com/api/docs/guides/prompt-caching
+- https://docs.llmgateway.io/features/caching/provider-cache-control
+- https://vercel.com/docs/ai-gateway/models-and-providers/provider-options
+- https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview
+
+## Critic JSON Response Enforcement
+
+The Critic/extraction path requests structured JSON at the provider request
+boundary. Ordinary narrative generation is not forced into JSON.
+
+- Gemini and Vertex receive
+  `generationConfig.responseMimeType=application/json`.
+- OpenAI, OpenRouter, and LLM Gateway receive
+  `response_format.type=json_object`.
+- Vercel receives its documented `response_format.type=json_schema` with a
+  Critic top-level object schema. User-supplied `json_schema` and Vercel's legacy
+  `type=json` are preserved.
+- Claude receives `output_config.format.type=json_schema` with the same Critic
+  top-level schema. This is applied only to Critic/extraction calls; ordinary
+  Claude narrative calls are unchanged.
+- Custom, Ollama, and Copilot do not share one verified native structured-output
+  field. Archive Center therefore does not invent `response_format` for them.
+  A user-supplied provider-native Extra Body JSON setting is preserved and
+  checked for conflict.
+- A matching user-supplied structured-output setting is preserved. A
+  conflicting setting fails before the upstream call.
+- The provider adapter does not retry by silently deleting the JSON request.
+  A provider/model that does not support structured output returns a visible
+  provider error, while the already accepted raw turn remains durable and the
+  derived Critic work remains retryable.
+
+Official reference:
+
+- https://developers.openai.com/api/docs/guides/structured-outputs
+- https://vercel.com/docs/ai-gateway/sdks-and-apis/openai-chat-completions/structured-outputs
+- https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+
+## Anthropic Claude Automatic Prompt Caching
+
+Archive Center 3.6 exposes Anthropic's automatic prompt caching only for the
+direct Claude Messages API provider ID `claude`. The UI stores independent
+Publisher and Critic choices; the Supervisor inherits the Publisher choice.
+The default is `off`.
+
+Role-specific settings:
+
+```json
+{
+  "pluginMainClaudePromptCacheMode": "off",
+  "subLlmClaudePromptCacheMode": "off"
+}
+```
+
+Backend request field:
+
+```json
+{
+  "claude_prompt_cache_mode": "ephemeral_5m"
+}
+```
+
+The Go provider owner validates the typed mode and writes the top-level
+Anthropic `cache_control` object:
+
+| Typed mode | Claude Messages API request |
+|---|---|
+| `off` | no typed `cache_control` is added |
+| `ephemeral_5m` | `{"cache_control":{"type":"ephemeral"}}` |
+| `ephemeral_1h` | `{"cache_control":{"type":"ephemeral","ttl":"1h"}}` |
+
+Anthropic documents `ephemeral` as the current cache type. Its default
+lifetime is five minutes; `ttl:"1h"` selects the one-hour duration. An
+explicit manual `ttl:"5m"` is equivalent to the omitted five-minute TTL for
+typed/manual matching, although Archive Center's typed five-minute mapping
+continues to omit `ttl`.
+
+Anthropic's official pricing uses multipliers relative to base input tokens:
+five-minute cache writes cost `1.25x`, one-hour cache writes cost `2x`, and
+cache reads/hits cost `0.1x`. The one-hour option therefore has a higher write
+cost and should be selected intentionally.
+
+Rules:
+
+- A non-`off` typed mode is accepted only with provider `claude`.
+- Invalid values and conflicting `extra_body_json.cache_control` values fail
+  before any upstream request.
+- Matching typed and manual values are accepted and traced as
+  `typed_and_extra_body_json`.
+- When the typed field is absent or `off`, an existing manual
+  `extra_body_json.cache_control` remains unchanged.
+- Manual `extra_body_json.cache_control` is backend request compatibility for
+  callers that explicitly send that field. The typed mode above remains the
+  normal Claude path; the generic Extra Body JSON field is available only for
+  advanced provider-specific options and is checked for conflicts.
+- The normalized response preserves Anthropic's raw `usage` object when it is
+  present. Trace copies `cache_creation_input_tokens`,
+  `cache_read_input_tokens`, and `usage.service_tier` only when Anthropic
+  returned those fields; missing usage is never synthesized.
+- Anthropic can process a prompt without caching when it is below the
+  model-specific minimum cacheable length. The usage cache counters are the
+  source of truth for whether a cache write or read occurred.
+
+Official reference:
+
+- https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+- https://platform.claude.com/docs/en/about-claude/pricing
+
+Implementation status:
+
+- `source_implemented`: typed mapping, conflict handling, role propagation,
+  response/trace preservation, and automated regression are implemented;
+- live Anthropic account/model call: unverified;
+- acceptance status: `live Anthropic call unverified`, not live-provider proof.
+
+Scope exclusions:
+
+- no Claude Batch API;
+- no priority or service-tier selector;
+- no Claude Flex mode;
+- no changes to retry policy or HUD design.
 
 ## Non-Goals
 

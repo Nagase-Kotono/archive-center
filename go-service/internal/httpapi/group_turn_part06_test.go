@@ -96,18 +96,18 @@ func TestPrepareTurnProtectedGuardDiversityRefillsTopK(t *testing.T) {
 	if got := strings.Count(assembly.MemoryText, "POV-scoped identity continuity:") + strings.Count(assembly.MemoryText, "Protected identity continuity:"); got != 1 {
 		t.Fatalf("protected identity guard count = %d, want 1: %q", got, assembly.MemoryText)
 	}
-	if got := strings.Count(assembly.MemoryText, "Actual event memory"); got != 9 {
-		t.Fatalf("actual vector event count = %d, want 9 plus one protected hit inside vector top_k 10: %q", got, assembly.MemoryText)
+	if got := strings.Count(assembly.MemoryText, "Actual event memory"); got != 10 {
+		t.Fatalf("actual vector event count = %d, want 10 plus one item-count-exempt protected guard: %q", got, assembly.MemoryText)
 	}
-	if got := intFromAny(assembly.Counts["selected_memory_total_count"], 0); got != 10 {
-		t.Fatalf("selected memory count = %d, want 9 actual vector memories plus one guard: %#v", got, assembly.Counts)
+	if got := intFromAny(assembly.Counts["selected_memory_total_count"], 0); got != 11 {
+		t.Fatalf("selected memory count = %d, want 10 actual vector memories plus one guard: %#v", got, assembly.Counts)
 	}
-	if got := intFromAny(assembly.Counts["actual_memory_selected_count"], 0); got != 9 {
-		t.Fatalf("actual memory count = %d, want 9: %#v", got, assembly.Counts)
+	if got := intFromAny(assembly.Counts["actual_memory_selected_count"], 0); got != 10 {
+		t.Fatalf("actual memory count = %d, want 10: %#v", got, assembly.Counts)
 	}
 	policy := mapFromAny(assembly.Counts["memory_recall_lane_policy"])
-	if got := intFromAny(policy["actual_memory_vector_selected"], 0); got != 9 {
-		t.Fatalf("vector actual memory count = %d, want 9: %#v", got, policy)
+	if got := intFromAny(policy["actual_memory_vector_selected"], 0); got != 10 {
+		t.Fatalf("vector actual memory count = %d, want 10: %#v", got, policy)
 	}
 	if policy["protected_candidates_consume_actual_memory_target"] != false {
 		t.Fatalf("protected candidates consumed actual-memory target: %#v", policy)
@@ -515,14 +515,14 @@ func TestPrepareTurnTopKPrioritizesRelevantMemoryOverRecentTail(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if fake.lastEpisodeLimit != 64 {
-		t.Fatalf("episode summary candidate read limit = %d, want independent safety bound 64", fake.lastEpisodeLimit)
+	if fake.lastEpisodeLimit != 0 {
+		t.Fatalf("episode summary candidate read limit = %d, want no pre-relevance count cap", fake.lastEpisodeLimit)
 	}
-	if fake.lastPersonaLimit != 256 {
-		t.Fatalf("persona recollection candidate read limit = %d, want independent safety bound 256", fake.lastPersonaLimit)
+	if fake.lastPersonaLimit != 0 {
+		t.Fatalf("persona recollection candidate read limit = %d, want no pre-relevance count cap", fake.lastPersonaLimit)
 	}
-	if fake.lastEntityMemoryLimit != 256 {
-		t.Fatalf("character-private recollection candidate read limit = %d, want independent safety bound 256", fake.lastEntityMemoryLimit)
+	if fake.lastEntityMemoryLimit != 0 {
+		t.Fatalf("character-private recollection candidate read limit = %d, want no pre-relevance count cap", fake.lastEntityMemoryLimit)
 	}
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -847,7 +847,8 @@ func TestPrepareTurnChromaRecallAutoEmbedsRawUserInput(t *testing.T) {
 				"api_key":"embed-key",
 				"endpoint":"https://api.example.test/v1",
 				"model":"embed-model",
-				"provider":"openai"
+				"provider":"openai",
+				"timeout_ms":30000
 			}
 		},
 		"settings":{"top_k":2}

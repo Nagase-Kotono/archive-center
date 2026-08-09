@@ -989,6 +989,9 @@ type PrepareTurnSettings struct {
 	MemoryDeliveryBudgetMode *string `json:"memory_delivery_budget_mode,omitempty"`
 	// MemoryDeliveryBudgets carries character reservations for the seven Go-owned delivery classes.
 	MemoryDeliveryBudgets map[string]int `json:"memory_delivery_budgets,omitempty"`
+	// PRESENCE: Optional non-null scalar int controlling only the final objective-event memory item ceiling.
+	// DEFAULT: No default: absent callers preserve the legacy character-budget-only delivery behavior.
+	CoreObjectiveMemoryMaxItems *int `json:"core_objective_memory_max_items,omitempty"`
 	// PRESENCE: Optional non-null scalar int carrying the configured memory cap as the reference budget basis.
 	// DEFAULT: No default: absent callers use the effective max_injection_chars for compatibility.
 	ReferenceInjectionBudgetBasisChars *int `json:"reference_injection_budget_basis_chars,omitempty"`
@@ -1093,11 +1096,13 @@ type ProxyPluginMainRequest struct {
 	BudgetTokens *int64  `json:"budget_tokens,omitempty"`
 	// PRESENCE: Optional non-null scalar string: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
 	// DEFAULT: Optional field with default (""): Go handler must apply default when field is absent in request.
-	Endpoint            *string `json:"endpoint,omitempty"`
-	ExtraBodyJSON       *string `json:"extra_body_json,omitempty"`
-	ExtraHeadersJSON    *string `json:"extra_headers_json,omitempty"`
-	GlmThinkingType     *string `json:"glm_thinking_type,omitempty"`
-	MaxCompletionTokens *int64  `json:"max_completion_tokens,omitempty"`
+	Endpoint              *string `json:"endpoint,omitempty"`
+	ClaudePromptCacheMode *string `json:"claude_prompt_cache_mode,omitempty"`
+	ExtraBodyJSON         *string `json:"extra_body_json,omitempty"`
+	ExtraHeadersJSON      *string `json:"extra_headers_json,omitempty"`
+	GlmThinkingType       *string `json:"glm_thinking_type,omitempty"`
+	LLMGatewayServiceTier *string `json:"llm_gateway_service_tier,omitempty"`
+	MaxCompletionTokens   *int64  `json:"max_completion_tokens,omitempty"`
 	// PRESENCE: Optional non-null scalar int64: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
 	// DEFAULT: Optional field with default (1024): Go handler must apply default when field is absent in request.
 	MaxTokens *int64 `json:"max_tokens,omitempty"`
@@ -1134,6 +1139,10 @@ func (dto *ProxyPluginMainRequest) ApplyDefaults() {
 	if dto.ExtraHeadersJSON == nil {
 		v := ""
 		dto.ExtraHeadersJSON = &v
+	}
+	if dto.LLMGatewayServiceTier == nil {
+		v := ""
+		dto.LLMGatewayServiceTier = &v
 	}
 	if dto.MaxTokens == nil {
 		v := int64(1024)

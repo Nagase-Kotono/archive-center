@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,32 +19,87 @@ import (
 
 type sessionMigrationPreviewStore struct {
 	store.Store
-	chatLogs           []store.ChatLog
-	effectiveInputs    []store.EffectiveInput
-	memories           []store.Memory
-	evidence           []store.DirectEvidence
-	triples            []store.KGTriple
-	episodes           []store.EpisodeSummary
-	subjective         []store.ProtagonistEntityMemory
-	completeCalled     bool
-	completeResult     *store.SessionMigrationCompleteResult
-	completeRequest    store.SessionMigrationCompleteRequest
-	vectorDocs         []store.SessionMigrationVectorDocument
-	vectorStatusCalled bool
-	vectorStatus       string
-	vectorStatusCount  int
-	vectorStatusErrors string
-	lockCalled         bool
-	lockReason         string
-	lockResult         *store.SessionMigrationSourceLockResult
-	activeLock         *store.SessionMigrationLock
-	rollbackCalled     bool
-	rollbackReason     string
-	rollbackResult     *store.SessionMigrationRollbackResult
-	cleanupPreview     *store.SessionMigrationCleanupPreview
-	cleanupCalled      bool
-	cleanupReason      string
-	cleanupResult      *store.SessionMigrationCleanupResult
+	chatLogs            []store.ChatLog
+	effectiveInputs     []store.EffectiveInput
+	memories            []store.Memory
+	evidence            []store.DirectEvidence
+	triples             []store.KGTriple
+	episodes            []store.EpisodeSummary
+	subjective          []store.ProtagonistEntityMemory
+	completeCalled      bool
+	completeResult      *store.SessionMigrationCompleteResult
+	completeErr         error
+	completeRequest     store.SessionMigrationCompleteRequest
+	resumeContext       *store.SessionMigrationResumeContext
+	resumeErr           error
+	events              []string
+	vectorDocs          []store.SessionMigrationVectorDocument
+	vectorStatusCalled  bool
+	vectorStatus        string
+	vectorStatusCount   int
+	vectorStatusErrors  string
+	parityContext       *store.SessionMigrationVectorParityContext
+	parityResult        *store.SessionMigrationVectorParityResult
+	parityErr           error
+	parityActualIDs     []string
+	parityOperations    []string
+	lockCalled          bool
+	lockPrepareCalled   bool
+	lockReleaseCalled   bool
+	lockReason          string
+	lockResult          *store.SessionMigrationSourceLockResult
+	activeLock          *store.SessionMigrationLock
+	rollbackCalled      bool
+	rollbackReason      string
+	rollbackResult      *store.SessionMigrationRollbackResult
+	cleanupPreview      *store.SessionMigrationCleanupPreview
+	cleanupPrepare      *store.SessionMigrationCleanupPreview
+	cleanupPrepareErr   error
+	cleanupPrepareCall  bool
+	cleanupVectorMarked bool
+	cleanupVectorErr    error
+	cleanupCalled       bool
+	cleanupReason       string
+	cleanupResult       *store.SessionMigrationCleanupResult
+	cleanupErr          error
+}
+
+type sourceLockDrainObservingStore struct {
+	*sessionMigrationPreviewStore
+	verifyStarted chan struct{}
+	verifyOnce    sync.Once
+}
+
+type delayedMigrationSourceLockStore struct {
+	*sessionMigrationPreviewStore
+	lockReads int
+}
+
+func (s *delayedMigrationSourceLockStore) GetSessionMigrationSourceLock(
+	ctx context.Context,
+	sourceSessionID string,
+) (*store.SessionMigrationLock, error) {
+	s.lockReads++
+	if s.lockReads == 1 {
+		return nil, store.ErrNotFound
+	}
+	return &store.SessionMigrationLock{
+		MigrationID: 42, SourceSessionID: sourceSessionID,
+		TargetSessionID: "char_59_cid_target", Locked: true,
+		LockStatus: "lock_pending_verification",
+	}, nil
+}
+
+func (s *sourceLockDrainObservingStore) VerifySessionMigrationVectorParity(
+	ctx context.Context,
+	migrationID int64,
+	operation string,
+	actualIDs []string,
+) (*store.SessionMigrationVectorParityResult, error) {
+	s.verifyOnce.Do(func() { close(s.verifyStarted) })
+	return s.sessionMigrationPreviewStore.VerifySessionMigrationVectorParity(
+		ctx, migrationID, operation, actualIDs,
+	)
 }
 
 func (s *sessionMigrationPreviewStore) ListChatLogs(ctx context.Context, chatSessionID string, fromTurn, toTurn int) ([]store.ChatLog, error) {
@@ -122,6 +179,10 @@ func (s *sessionMigrationPreviewStore) CreateProtagonistEntityMemory(ctx context
 func (s *sessionMigrationPreviewStore) CompleteSessionMigration(ctx context.Context, req store.SessionMigrationCompleteRequest) (*store.SessionMigrationCompleteResult, error) {
 	s.completeCalled = true
 	s.completeRequest = req
+	s.events = append(s.events, "complete")
+	if s.completeErr != nil {
+		return nil, s.completeErr
+	}
 	if s.completeResult != nil {
 		return s.completeResult, nil
 	}
@@ -136,6 +197,18 @@ func (s *sessionMigrationPreviewStore) CompleteSessionMigration(ctx context.Cont
 		ChromaReindexRequired: true,
 		ReadyForLive:          false,
 	}, nil
+}
+
+func (s *sessionMigrationPreviewStore) GetSessionMigrationResumeContext(ctx context.Context, req store.SessionMigrationCompleteRequest) (*store.SessionMigrationResumeContext, error) {
+	s.events = append(s.events, "resume_context")
+	if s.resumeErr != nil {
+		return nil, s.resumeErr
+	}
+	if s.resumeContext == nil {
+		return nil, store.ErrNotFound
+	}
+	copy := *s.resumeContext
+	return &copy, nil
 }
 
 func (s *sessionMigrationPreviewStore) ListSessionMigrationVectorDocuments(ctx context.Context, migrationID int64) ([]store.SessionMigrationVectorDocument, error) {
@@ -156,9 +229,65 @@ func (s *sessionMigrationPreviewStore) UpdateSessionMigrationVectorStatus(ctx co
 	return nil
 }
 
+func (s *sessionMigrationPreviewStore) GetSessionMigrationVectorParityContext(ctx context.Context, migrationID int64) (*store.SessionMigrationVectorParityContext, error) {
+	if s.parityContext != nil {
+		return s.parityContext, nil
+	}
+	context := &store.SessionMigrationVectorParityContext{MigrationID: migrationID}
+	for _, doc := range s.vectorDocs {
+		if doc.MigrationID != migrationID {
+			continue
+		}
+		if context.TargetSessionID == "" {
+			context.TargetSessionID = doc.ChatSessionID
+		}
+		context.ExpectedIDs = append(context.ExpectedIDs, doc.ID)
+	}
+	return context, nil
+}
+
+func (s *sessionMigrationPreviewStore) VerifySessionMigrationVectorParity(ctx context.Context, migrationID int64, operation string, actualIDs []string) (*store.SessionMigrationVectorParityResult, error) {
+	s.parityOperations = append(s.parityOperations, operation)
+	s.parityActualIDs = append([]string(nil), actualIDs...)
+	s.events = append(s.events, "verify:"+operation)
+	if s.parityErr != nil {
+		return nil, s.parityErr
+	}
+	if s.parityResult != nil {
+		return s.parityResult, nil
+	}
+	parityContext, _ := s.GetSessionMigrationVectorParityContext(ctx, migrationID)
+	expectedSet := map[string]bool{}
+	actualSet := map[string]bool{}
+	for _, id := range parityContext.ExpectedIDs {
+		expectedSet[id] = true
+	}
+	for _, id := range actualIDs {
+		actualSet[id] = true
+	}
+	result := &store.SessionMigrationVectorParityResult{
+		MigrationID: migrationID, TargetSessionID: parityContext.TargetSessionID,
+		ExpectedIDs: append([]string(nil), parityContext.ExpectedIDs...),
+		ActualIDs:   append([]string(nil), actualIDs...),
+	}
+	for _, id := range parityContext.ExpectedIDs {
+		if !actualSet[id] {
+			result.MissingIDs = append(result.MissingIDs, id)
+		}
+	}
+	for _, id := range actualIDs {
+		if !expectedSet[id] {
+			result.UnexpectedIDs = append(result.UnexpectedIDs, id)
+		}
+	}
+	result.Verified = len(result.MissingIDs) == 0 && len(result.UnexpectedIDs) == 0
+	return result, nil
+}
+
 func (s *sessionMigrationPreviewStore) LockSessionMigrationSource(ctx context.Context, migrationID int64, reason string) (*store.SessionMigrationSourceLockResult, error) {
 	s.lockCalled = true
 	s.lockReason = reason
+	s.events = append(s.events, "lock")
 	if s.lockResult != nil {
 		return s.lockResult, nil
 	}
@@ -179,6 +308,23 @@ func (s *sessionMigrationPreviewStore) LockSessionMigrationSource(ctx context.Co
 		Lock:            lock,
 		ReadyForLive:    true,
 	}, nil
+}
+
+func (s *sessionMigrationPreviewStore) PrepareSessionMigrationSourceLock(ctx context.Context, migrationID int64, reason string) (*store.SessionMigrationLock, error) {
+	s.lockPrepareCalled = true
+	s.events = append(s.events, "lock_prepare")
+	return &store.SessionMigrationLock{
+		MigrationID: migrationID, SourceSessionID: "char_59_cid_source",
+		TargetSessionID: "char_59_cid_target", Locked: true,
+		LockStatus: "lock_pending_verification", Reason: reason,
+		LockedAt: time.Date(2026, 6, 18, 0, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+func (s *sessionMigrationPreviewStore) ReleaseSessionMigrationSourceLockFence(ctx context.Context, migrationID int64, reason string) error {
+	s.lockReleaseCalled = true
+	s.events = append(s.events, "lock_release")
+	return nil
 }
 
 func (s *sessionMigrationPreviewStore) GetSessionMigrationSourceLock(ctx context.Context, sourceSessionID string) (*store.SessionMigrationLock, error) {
@@ -221,9 +367,34 @@ func (s *sessionMigrationPreviewStore) PreviewSessionMigrationSourceCleanup(ctx 
 	}, nil
 }
 
+func (s *sessionMigrationPreviewStore) PrepareSessionMigrationSourceCleanup(ctx context.Context, migrationID int64, reason string) (*store.SessionMigrationCleanupPreview, error) {
+	s.cleanupPrepareCall = true
+	if s.cleanupPrepareErr != nil {
+		return nil, s.cleanupPrepareErr
+	}
+	if s.cleanupPrepare != nil {
+		return s.cleanupPrepare, nil
+	}
+	preview, err := s.PreviewSessionMigrationSourceCleanup(ctx, migrationID)
+	if err != nil {
+		return nil, err
+	}
+	copy := *preview
+	copy.Status = "cleanup_prepared"
+	return &copy, nil
+}
+
+func (s *sessionMigrationPreviewStore) MarkSessionMigrationSourceVectorCleanup(ctx context.Context, migrationID int64) error {
+	s.cleanupVectorMarked = true
+	return s.cleanupVectorErr
+}
+
 func (s *sessionMigrationPreviewStore) CleanupSessionMigrationSource(ctx context.Context, migrationID int64, reason string) (*store.SessionMigrationCleanupResult, error) {
 	s.cleanupCalled = true
 	s.cleanupReason = reason
+	if s.cleanupErr != nil {
+		return nil, s.cleanupErr
+	}
 	if s.cleanupResult != nil {
 		return s.cleanupResult, nil
 	}
@@ -246,8 +417,10 @@ type sessionMigrationPreviewVector struct {
 	upsertDocs        []vector.VectorDocument
 	deleteCalled      bool
 	deleteSessionID   string
+	deleteErr         error
 	deleteDocumentIDs []string
 	rebuildCalled     bool
+	listDocuments     []vector.VectorDocument
 }
 
 func (v *sessionMigrationPreviewVector) Search(ctx context.Context, sessionID string, embedding []float32, limit int, filter string) ([]vector.VectorDocument, error) {
@@ -268,7 +441,7 @@ func (v *sessionMigrationPreviewVector) Upsert(ctx context.Context, sessionID st
 func (v *sessionMigrationPreviewVector) DeleteSession(ctx context.Context, sessionID string) error {
 	v.deleteCalled = true
 	v.deleteSessionID = sessionID
-	return nil
+	return v.deleteErr
 }
 
 func (v *sessionMigrationPreviewVector) DeleteDocuments(ctx context.Context, ids []string) error {
@@ -293,6 +466,19 @@ func (v *sessionMigrationPreviewVector) Count(ctx context.Context, sessionID str
 }
 
 func (v *sessionMigrationPreviewVector) Close(ctx context.Context) error { return nil }
+
+func (v *sessionMigrationPreviewVector) ListDocuments(ctx context.Context, sessionID string) ([]vector.VectorDocument, error) {
+	if v.listDocuments != nil {
+		return append([]vector.VectorDocument(nil), v.listDocuments...), nil
+	}
+	out := []vector.VectorDocument{}
+	for _, doc := range v.upsertDocs {
+		if doc.ChatSessionID == sessionID {
+			out = append(out, doc)
+		}
+	}
+	return out, nil
+}
 
 func TestSessionMigratePreviewDryRunBlocksNonEmptyTarget(t *testing.T) {
 	sourceID := "char_59_cid_source"
@@ -431,7 +617,7 @@ func TestSessionMigratePreviewStillBlocksStarterPlusAnyOtherRow(t *testing.T) {
 	}
 }
 
-func TestSessionMigrateCompleteCopiesOnlyAfterEmptyTargetPreview(t *testing.T) {
+func TestSessionMigrateCompleteRunsFullManifestExecutorAndLeavesVectorPhasePending(t *testing.T) {
 	sourceID := "char_59_cid_source"
 	targetID := "char_59_cid_fresh"
 	st := &sessionMigrationPreviewStore{
@@ -459,23 +645,21 @@ func TestSessionMigrateCompleteCopiesOnlyAfterEmptyTargetPreview(t *testing.T) {
 	})
 
 	if !st.completeCalled {
-		t.Fatalf("expected CompleteSessionMigration to be called")
-	}
-	if st.completeRequest.OperatorNote != "fresh continuation" {
-		t.Fatalf("operator note = %q", st.completeRequest.OperatorNote)
+		t.Fatal("CompleteSessionMigration was not called")
 	}
 	if resp.Blocked || !resp.WriteAttempted || resp.VectorWriteAttempted || resp.LLMCallAttempted {
-		t.Fatalf("unexpected complete response flags: %+v", resp)
+		t.Fatalf("full manifest copy response flags: %+v", resp)
 	}
-	if resp.MigrationID != 99 || resp.MigrationStatus != "copied" || resp.RowMapCount != 3 {
-		t.Fatalf("unexpected migration result: %+v", resp)
+	if !resp.ReleaseBlocked || resp.ManifestParityVerified || !resp.ManifestExecutorComplete ||
+		resp.ManifestVersion != store.SessionMigrationManifestVersion || resp.ManifestDirectTables != 46 {
+		t.Fatalf("complete response did not disclose completed relational/pending vector phases: %+v", resp)
 	}
-	if !resp.ChromaReindexRequired || resp.ReadyForLive {
-		t.Fatalf("complete should remain pending Chroma reindex: %+v", resp)
+	if resp.MigrationID != 99 || resp.RowMapCount != 3 || !resp.ChromaReindexRequired {
+		t.Fatalf("complete durable ledger summary = %+v", resp)
 	}
 }
 
-func TestSessionMigrateCompleteCopyKeepSourcePassesMode(t *testing.T) {
+func TestSessionMigrateCompleteCopyKeepSourceRunsWithoutLockingSource(t *testing.T) {
 	sourceID := "char_59_cid_source"
 	targetID := "char_59_cid_copy"
 	st := &sessionMigrationPreviewStore{
@@ -503,19 +687,75 @@ func TestSessionMigrateCompleteCopyKeepSourcePassesMode(t *testing.T) {
 	})
 
 	if !st.completeCalled {
-		t.Fatalf("expected CompleteSessionMigration to be called")
-	}
-	if st.completeRequest.Mode != sessionMigrationModeCopyKeep {
-		t.Fatalf("mode = %q, want %q", st.completeRequest.Mode, sessionMigrationModeCopyKeep)
-	}
-	if st.completeRequest.OperatorNote != "manual copy" {
-		t.Fatalf("operator note = %q", st.completeRequest.OperatorNote)
+		t.Fatal("CompleteSessionMigration was not called")
 	}
 	if resp.Blocked || !resp.WriteAttempted || resp.Mode != sessionMigrationModeCopyKeep || resp.SourceLocked {
-		t.Fatalf("unexpected copy_keep_source complete response: %+v", resp)
+		t.Fatalf("copy_keep_source response: %+v", resp)
 	}
-	if resp.MigrationID != 100 || resp.RowMapCount != 2 {
-		t.Fatalf("unexpected migration result: %+v", resp)
+}
+
+func TestSessionMigrateCompletePostVectorResumeRevalidatesInsideFenceBeforeConsume(t *testing.T) {
+	sourceID := "char_59_cid_source"
+	targetID := "char_59_cid_target"
+	documentID := "memory:" + targetID + ":101"
+	st := &sessionMigrationPreviewStore{
+		chatLogs: []store.ChatLog{
+			{ID: 1, ChatSessionID: sourceID},
+			{ID: 11, ChatSessionID: targetID},
+		},
+		resumeContext: &store.SessionMigrationResumeContext{
+			MigrationID: 42, Status: "vector_reindexed",
+			SourceSessionID: sourceID, TargetSessionID: targetID,
+			Mode: sessionMigrationModeCopyLock,
+		},
+		vectorDocs: []store.SessionMigrationVectorDocument{
+			{ID: documentID, MigrationID: 42, ChatSessionID: targetID},
+		},
+		completeResult: &store.SessionMigrationCompleteResult{
+			MigrationID: 42, Status: "vector_reindexed",
+			SourceSessionID: sourceID, TargetSessionID: targetID,
+			Mode: sessionMigrationModeCopyLock,
+		},
+	}
+	vec := &sessionMigrationPreviewVector{
+		counts:        map[string]int{targetID: 1},
+		listDocuments: []vector.VectorDocument{{ID: documentID, ChatSessionID: targetID}},
+	}
+	resp := performSessionMigrationComplete(t, st, vec, map[string]string{
+		"source_session_id": sourceID, "target_session_id": targetID,
+	})
+	if resp.Blocked || !st.completeCalled {
+		t.Fatalf("post-vector resume response = %+v", resp)
+	}
+	wantEvents := []string{"resume_context", "verify:" + store.SessionMigrationProofOperationResume, "complete"}
+	if strings.Join(st.events, ",") != strings.Join(wantEvents, ",") {
+		t.Fatalf("resume events = %v, want %v", st.events, wantEvents)
+	}
+}
+
+func TestSessionMigrateCompletePostVectorResumeBlocksCurrentVectorDrift(t *testing.T) {
+	sourceID := "char_59_cid_source"
+	targetID := "char_59_cid_target"
+	st := &sessionMigrationPreviewStore{
+		chatLogs: []store.ChatLog{
+			{ID: 1, ChatSessionID: sourceID},
+			{ID: 11, ChatSessionID: targetID},
+		},
+		resumeContext: &store.SessionMigrationResumeContext{
+			MigrationID: 42, Status: "source_locked",
+			SourceSessionID: sourceID, TargetSessionID: targetID,
+			Mode: sessionMigrationModeCopyLock,
+		},
+		parityResult: &store.SessionMigrationVectorParityResult{
+			MigrationID: 42, Verified: false, MissingIDs: []string{"memory:target:101"},
+		},
+	}
+	resp := performSessionMigrationComplete(t, st, &sessionMigrationPreviewVector{}, map[string]string{
+		"source_session_id": sourceID, "target_session_id": targetID,
+	})
+	if !resp.Blocked || st.completeCalled ||
+		!sessionMigrationContainsString(resp.BlockedReasons, "current_vector_id_drift") {
+		t.Fatalf("vector-drift resume crossed complete boundary: %+v", resp)
 	}
 }
 
@@ -539,10 +779,14 @@ func TestSessionMigrateCompleteDoesNotWriteWhenPreviewBlocked(t *testing.T) {
 	}
 }
 
-func TestSessionMigrateReindexUpsertsTargetVectorsAndMarksLedger(t *testing.T) {
+func TestSessionMigrateReindexRejectsCandidateParityBeforeVectorWrite(t *testing.T) {
 	targetID := "char_59_cid_target"
 	sourceID := "char_59_cid_source"
 	st := &sessionMigrationPreviewStore{
+		parityContext: &store.SessionMigrationVectorParityContext{
+			MigrationID: 42, TargetSessionID: targetID,
+			ExpectedIDs: []string{"memory:" + targetID + ":101", "episode:" + targetID + ":201"},
+		},
 		vectorDocs: []store.SessionMigrationVectorDocument{
 			{
 				ID:                    "memory:" + targetID + ":101",
@@ -580,30 +824,27 @@ func TestSessionMigrateReindexUpsertsTargetVectorsAndMarksLedger(t *testing.T) {
 	vec := &sessionMigrationPreviewVector{counts: map[string]int{targetID: 0}}
 	resp := performSessionMigrationReindex(t, st, vec, map[string]any{"migration_id": float64(42)})
 
-	if resp.Blocked || resp.VerificationStatus != "verified" || !resp.ReadyForSourceLock || resp.ReadyForLive {
+	if !resp.Blocked || resp.VerificationStatus != "candidate_parity_failed" ||
+		resp.ReadyForSourceLock || resp.ReadyForLive || resp.ManifestParityVerified ||
+		resp.ManifestVersion != store.SessionMigrationManifestVersion ||
+		!sessionMigrationContainsString(resp.BlockedReasons, "vector_candidate_expected_id_mismatch") {
 		t.Fatalf("unexpected reindex response: %+v", resp)
 	}
-	if !vec.upsertCalled || vec.upsertSessionID != targetID || len(vec.upsertDocs) != 2 {
-		t.Fatalf("upsert call mismatch: called=%v sid=%q docs=%d", vec.upsertCalled, vec.upsertSessionID, len(vec.upsertDocs))
+	if vec.upsertCalled || st.vectorStatusCalled {
+		t.Fatalf("manifest-blocked reindex must not write vectors or migration status")
 	}
-	if vec.upsertDocs[0].MigrationID != 42 || vec.upsertDocs[0].MigratedFromSessionID != sourceID {
-		t.Fatalf("migration metadata missing from vector doc: %+v", vec.upsertDocs[0])
-	}
-	if !st.vectorStatusCalled || st.vectorStatus != "vector_reindexed" || st.vectorStatusCount != 2 || st.vectorStatusErrors != "[]" {
-		t.Fatalf("ledger update mismatch: called=%v status=%q count=%d errors=%q", st.vectorStatusCalled, st.vectorStatus, st.vectorStatusCount, st.vectorStatusErrors)
-	}
-	if resp.Candidates != 3 || resp.Upserted != 2 || resp.Skipped != 1 {
-		t.Fatalf("candidate/upsert/skip mismatch: %+v", resp)
+	if resp.Candidates != 3 || resp.Upserted != 0 || resp.Skipped != 0 {
+		t.Fatalf("candidate parity did not materialize exact expected set: %+v", resp)
 	}
 }
 
-func TestSessionMigrateReindexBlocksWithoutCandidates(t *testing.T) {
+func TestSessionMigrateReindexVerifiesExactEmptyExpectedSetWithoutVectorWrite(t *testing.T) {
 	st := &sessionMigrationPreviewStore{}
 	vec := &sessionMigrationPreviewVector{counts: map[string]int{}}
 	resp := performSessionMigrationReindex(t, st, vec, map[string]any{"migration_id": float64(123)})
 
-	if !resp.Blocked || !sessionMigrationContainsString(resp.BlockedReasons, "no_vector_candidates") {
-		t.Fatalf("expected no_vector_candidates block: %+v", resp)
+	if resp.Blocked || !resp.ManifestParityVerified || !resp.ReadyForSourceLock || resp.VerificationStatus != "exact_id_parity_verified" {
+		t.Fatalf("expected exact empty-set parity: %+v", resp)
 	}
 	if vec.upsertCalled || st.vectorStatusCalled {
 		t.Fatalf("unexpected side effect for no-vector-candidates")
@@ -632,13 +873,97 @@ func TestSessionMigrateLockSourceWritesMigrationLock(t *testing.T) {
 	}
 }
 
+func TestSessionMigrateLockSourceReleasesProvisionalFenceOnCurrentVectorDrift(t *testing.T) {
+	st := &sessionMigrationPreviewStore{
+		parityResult: &store.SessionMigrationVectorParityResult{
+			MigrationID: 42, Verified: false, MissingIDs: []string{"memory:target:101"},
+		},
+	}
+	resp := performSessionMigrationLockSource(t, st, &sessionMigrationPreviewVector{}, map[string]any{
+		"migration_id": float64(42),
+	})
+	if !resp.Blocked || !st.lockPrepareCalled || !st.lockReleaseCalled || st.lockCalled ||
+		!sessionMigrationContainsString(resp.BlockedReasons, "current_vector_id_drift") {
+		t.Fatalf("vector drift did not fail closed/release provisional fence: resp=%+v events=%v", resp, st.events)
+	}
+}
+
+func TestSessionMigrateLockSourceDrainsAcceptedFinalWorkerBeforeParityRevalidation(t *testing.T) {
+	const sourceID = "char_59_cid_source"
+	base := &sessionMigrationPreviewStore{}
+	st := &sourceLockDrainObservingStore{
+		sessionMigrationPreviewStore: base,
+		verifyStarted:                make(chan struct{}),
+	}
+	srv := &Server{
+		Store:  st,
+		Vector: vector.NewMutationFencedStore(&sessionMigrationPreviewVector{}),
+	}
+	srv.SourceAcceptances = newCompleteTurnSourceAcceptanceLedger()
+	decision := completeTurnSourceAcceptanceDecision{
+		Enabled: true, Accepted: true, Revision: "revision-migration-drain",
+	}
+	srv.SourceAcceptances.current[sourceAcceptanceStateKey(sourceID, 1)] = completeTurnSourceAcceptanceState{
+		SessionID: sourceID, TurnIndex: 1, Revision: decision.Revision,
+		ObservedAtMS: 1000, Lifecycle: "active_final",
+	}
+	workerCtx, releaseWorker := srv.completeTurnSourceAcceptanceProcessingContext(
+		context.Background(), decision, sourceID, 1,
+	)
+
+	body := bytes.NewBufferString(`{"migration_id":42,"reason":"drain before lock"}`)
+	req := httptest.NewRequest(http.MethodPost, "/sessions/migrate-lock-source", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		mux.ServeHTTP(rec, req)
+	}()
+
+	select {
+	case <-workerCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("provisional migration fence did not cancel the in-flight complete-turn worker")
+	}
+	select {
+	case <-st.verifyStarted:
+		t.Fatal("migration parity revalidation started before the canceled worker drained")
+	default:
+	}
+
+	releaseWorker()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("migration source lock did not resume after the complete-turn worker drained")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response sessionMigrationLockSourceResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Blocked || !response.SourceLocked || !base.lockCalled {
+		t.Fatalf("migration source lock response=%+v events=%v", response, base.events)
+	}
+	select {
+	case <-st.verifyStarted:
+	default:
+		t.Fatal("migration parity revalidation was not reached after drain")
+	}
+}
+
 func TestSessionMigrateRollbackDeletesTargetVectorsAndRows(t *testing.T) {
 	targetID := "char_59_cid_target"
 	st := &sessionMigrationPreviewStore{
 		vectorDocs: []store.SessionMigrationVectorDocument{
-			{ID: "memory:" + targetID + ":101", MigrationID: 42},
-			{ID: "episode:" + targetID + ":201", MigrationID: 42},
-			{ID: "memory:" + targetID + ":101", MigrationID: 42},
+			{ID: "memory:" + targetID + ":101", Tier: "memory", SourceRowID: "101", MigrationID: 42},
+			{ID: "episode:" + targetID + ":201", Tier: "episode", SourceRowID: "201", MigrationID: 42},
+			{ID: "memory:" + targetID + ":101", Tier: "memory", SourceRowID: "101", MigrationID: 42},
 		},
 	}
 	vec := &sessionMigrationPreviewVector{counts: map[string]int{targetID: 2}}
@@ -653,10 +978,12 @@ func TestSessionMigrateRollbackDeletesTargetVectorsAndRows(t *testing.T) {
 	if !st.rollbackCalled || st.rollbackReason != "operator rollback during live test" {
 		t.Fatalf("rollback store call mismatch: called=%v reason=%q", st.rollbackCalled, st.rollbackReason)
 	}
-	if len(vec.deleteDocumentIDs) != 2 {
-		t.Fatalf("DeleteDocuments ids = %#v, want two unique ids", vec.deleteDocumentIDs)
+	if len(vec.deleteDocumentIDs) != 4 ||
+		!sessionMigrationContainsString(vec.deleteDocumentIDs, "memory:101") ||
+		!sessionMigrationContainsString(vec.deleteDocumentIDs, "episode:201") {
+		t.Fatalf("DeleteDocuments ids = %#v, want canonical IDs plus two legacy aliases", vec.deleteDocumentIDs)
 	}
-	if !resp.RolledBack || !resp.SourceUnlocked || resp.TargetVectorDocumentsDeleted != 2 || resp.RowMapCount != 4 {
+	if !resp.RolledBack || !resp.SourceUnlocked || resp.TargetVectorDocumentsDeleted != 4 || resp.RowMapCount != 4 {
 		t.Fatalf("rollback response mismatch: %+v", resp)
 	}
 }
@@ -669,15 +996,24 @@ func TestSessionMigrateCleanupSourceDryRunDoesNotDelete(t *testing.T) {
 		"dry_run":      true,
 	})
 
-	if resp.Blocked || !resp.DryRun || resp.WriteAttempted || resp.VectorWriteAttempted || st.cleanupCalled || vec.deleteCalled {
+	if resp.Blocked || !resp.DryRun || !resp.ReadyForCleanup || resp.ReadyForLive || resp.WriteAttempted || resp.VectorWriteAttempted || st.cleanupCalled || vec.deleteCalled {
 		t.Fatalf("cleanup dry-run attempted side effects: resp=%+v cleanupCalled=%v deleteCalled=%v", resp, st.cleanupCalled, vec.deleteCalled)
 	}
-	if !resp.ReadyForCleanup || resp.SourceVectors != 3 || resp.SourceRows.ChatLogs != 2 {
+	if resp.ContractVersion != "sc-mig-cleanup.v2" {
+		t.Fatalf("cleanup contract version = %q, want sc-mig-cleanup.v2", resp.ContractVersion)
+	}
+	if resp.MigrationID != 42 || resp.SourceSessionID != "char_59_cid_source" || resp.TargetSessionID != "char_59_cid_target" {
+		t.Fatalf("cleanup dry-run lost migration coordinates: %+v", resp)
+	}
+	if len(resp.BlockedReasons) != 0 {
+		t.Fatalf("cleanup dry-run blockers = %#v, want none after durable parity", resp.BlockedReasons)
+	}
+	if resp.SourceVectors != 3 || resp.SourceRows.ChatLogs != 2 {
 		t.Fatalf("cleanup dry-run summary mismatch: %+v", resp)
 	}
 }
 
-func TestSessionMigrateCleanupSourceConfirmDeletesSourceVectorsAndRows(t *testing.T) {
+func TestSessionMigrateCleanupSourceConfirmDeletesVectorsBeforeVerifiedSourceRows(t *testing.T) {
 	st := &sessionMigrationPreviewStore{}
 	vec := &sessionMigrationPreviewVector{counts: map[string]int{"char_59_cid_source": 3}}
 	resp := performSessionMigrationCleanupSource(t, st, vec, map[string]any{
@@ -686,14 +1022,71 @@ func TestSessionMigrateCleanupSourceConfirmDeletesSourceVectorsAndRows(t *testin
 		"reason":                 "source abandoned after verified target",
 	})
 
-	if resp.Blocked || !resp.WriteAttempted || !resp.VectorWriteAttempted || !resp.SourceCleaned || !resp.ReadyForLive {
-		t.Fatalf("cleanup confirm response mismatch: %+v", resp)
+	if resp.Blocked || resp.DryRun || !resp.ReadyForCleanup || !resp.WriteAttempted || !resp.VectorWriteAttempted || !resp.SourceCleaned || !resp.ReadyForLive {
+		t.Fatalf("cleanup confirm did not complete verified cleanup: %+v", resp)
 	}
-	if !st.cleanupCalled || st.cleanupReason != "source abandoned after verified target" {
-		t.Fatalf("cleanup store call mismatch: called=%v reason=%q", st.cleanupCalled, st.cleanupReason)
+	if len(resp.BlockedReasons) != 0 {
+		t.Fatalf("cleanup confirm blockers = %#v", resp.BlockedReasons)
 	}
-	if !vec.deleteCalled || vec.deleteSessionID != "char_59_cid_source" {
-		t.Fatalf("source vector cleanup mismatch: called=%v sid=%q", vec.deleteCalled, vec.deleteSessionID)
+	if resp.MigrationID != 42 || resp.SourceSessionID != "char_59_cid_source" || resp.TargetSessionID != "char_59_cid_target" {
+		t.Fatalf("cleanup confirm lost migration coordinates: %+v", resp)
+	}
+	if !resp.CleanupPrepared || !st.cleanupPrepareCall || !st.cleanupVectorMarked || !st.cleanupCalled || !vec.deleteCalled || vec.deleteSessionID != "char_59_cid_source" {
+		t.Fatalf("cleanup confirm side effects: prepared=%v prepareCalled=%v vectorMarked=%v cleanupCalled=%v deleteCalled=%v session=%q",
+			resp.CleanupPrepared, st.cleanupPrepareCall, st.cleanupVectorMarked, st.cleanupCalled, vec.deleteCalled, vec.deleteSessionID)
+	}
+}
+
+func TestSessionMigrateCleanupSourceChangedDuringPrepareDoesNotDeleteVectors(t *testing.T) {
+	st := &sessionMigrationPreviewStore{
+		cleanupPrepare: &store.SessionMigrationCleanupPreview{
+			MigrationID: 42, SourceSessionID: "char_59_cid_source", TargetSessionID: "char_59_cid_target",
+			Status: "source_locked", SourceLocked: true,
+			BlockedReasons: []string{"session migration source cleanup blocked: source snapshot changed for memories"},
+		},
+	}
+	vec := &sessionMigrationPreviewVector{counts: map[string]int{}}
+	resp := performSessionMigrationCleanupSource(t, st, vec, map[string]any{
+		"migration_id": float64(42), "confirm_source_cleanup": true,
+	})
+	if !resp.Blocked || vec.deleteCalled || st.cleanupCalled || !st.cleanupPrepareCall {
+		t.Fatalf("source drift cleanup boundary failed: resp=%+v prepare=%v delete=%v cleanup=%v",
+			resp, st.cleanupPrepareCall, vec.deleteCalled, st.cleanupCalled)
+	}
+}
+
+func TestSessionMigrateCleanupVectorFailureLeavesRelationalFinalizePending(t *testing.T) {
+	st := &sessionMigrationPreviewStore{}
+	vec := &sessionMigrationPreviewVector{counts: map[string]int{}, deleteErr: errors.New("chroma unavailable")}
+	resp := performSessionMigrationCleanupSource(t, st, vec, map[string]any{
+		"migration_id": float64(42), "confirm_source_cleanup": true,
+	})
+	if !resp.CleanupPrepared || !resp.VectorWriteAttempted || st.cleanupVectorMarked || st.cleanupCalled || !vec.deleteCalled || len(resp.Errors) == 0 {
+		t.Fatalf("vector failure crossed relational finalize boundary: resp=%+v cleanup=%v", resp, st.cleanupCalled)
+	}
+}
+
+func TestSessionMigrateCleanupFinalizeFailureReportsRecoverablePreparedState(t *testing.T) {
+	st := &sessionMigrationPreviewStore{cleanupErr: errors.New("database commit failed")}
+	vec := &sessionMigrationPreviewVector{counts: map[string]int{}}
+	resp := performSessionMigrationCleanupSource(t, st, vec, map[string]any{
+		"migration_id": float64(42), "confirm_source_cleanup": true,
+	})
+	if !resp.CleanupPrepared || !resp.Blocked || !st.cleanupVectorMarked || !st.cleanupCalled || !vec.deleteCalled ||
+		len(resp.BlockedReasons) != 1 || resp.BlockedReasons[0] != "source_cleanup_finalize_failed_recovery_required" {
+		t.Fatalf("finalize failure is not recoverable/prepared: %+v", resp)
+	}
+}
+
+func TestSessionMigrateCleanupVectorMarkFailureDoesNotFinalizeRows(t *testing.T) {
+	st := &sessionMigrationPreviewStore{cleanupVectorErr: errors.New("saga commit failed")}
+	vec := &sessionMigrationPreviewVector{counts: map[string]int{}}
+	resp := performSessionMigrationCleanupSource(t, st, vec, map[string]any{
+		"migration_id": float64(42), "confirm_source_cleanup": true,
+	})
+	if !resp.CleanupPrepared || !resp.Blocked || !st.cleanupVectorMarked || st.cleanupCalled || !vec.deleteCalled ||
+		len(resp.BlockedReasons) != 1 || resp.BlockedReasons[0] != "source_vector_cleanup_mark_failed_recovery_required" {
+		t.Fatalf("vector mark failure crossed finalize boundary: %+v", resp)
 	}
 }
 
@@ -727,6 +1120,27 @@ func TestSessionMigrationSourceLockExcludesPrepareSearchAndCompleteTurn(t *testi
 	complete := performSessionMigrationCompleteTurn(t, st, vec, `{"chat_session_id":"`+sourceID+`","turn_index":9,"user_input":"u","assistant_content":"a"}`)
 	if complete["status"] != "blocked" || complete["save_ok"] != false || complete["save_error"] != "source_session_migrated_away" {
 		t.Fatalf("complete-turn source lock did not block writes: %+v", complete)
+	}
+}
+
+func TestCompleteTurnRechecksDurableMigrationFenceBeforeRawPersistence(t *testing.T) {
+	sourceID := "char_59_cid_source"
+	st := &delayedMigrationSourceLockStore{
+		sessionMigrationPreviewStore: &sessionMigrationPreviewStore{},
+	}
+	complete := performSessionMigrationCompleteTurn(
+		t,
+		st,
+		&sessionMigrationPreviewVector{},
+		`{"chat_session_id":"`+sourceID+`","turn_index":9,"user_input":"u","assistant_content":"a"}`,
+	)
+	if complete["status"] != "blocked" ||
+		complete["save_ok"] != false ||
+		complete["save_error"] != "source_session_migrated_away" {
+		t.Fatalf("complete-turn crossed delayed durable migration fence: %+v", complete)
+	}
+	if st.lockReads < 2 {
+		t.Fatalf("migration source lock reads=%d, want preflight plus persistence-boundary recheck", st.lockReads)
 	}
 }
 
@@ -774,7 +1188,7 @@ func performSessionMigrationPreview(t *testing.T, st store.Store, vec vector.Vec
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Store: st, Vector: vec}
+	srv := &Server{Store: st, Vector: vector.NewMutationFencedStore(vec)}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	req := httptest.NewRequest(http.MethodPost, "/sessions/migrate-preview", bytes.NewReader(body))
@@ -796,7 +1210,7 @@ func performSessionMigrationComplete(t *testing.T, st store.Store, vec vector.Ve
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Store: st, Vector: vec}
+	srv := &Server{Store: st, Vector: vector.NewMutationFencedStore(vec)}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	req := httptest.NewRequest(http.MethodPost, "/sessions/migrate-complete", bytes.NewReader(body))
@@ -821,7 +1235,7 @@ func performSessionMigrationReindex(t *testing.T, st store.Store, vec vector.Vec
 	srv := &Server{
 		Cfg:    config.Config{ChromaEndpoint: "http://127.0.0.1:8000"},
 		Store:  st,
-		Vector: vec,
+		Vector: vector.NewMutationFencedStore(vec),
 	}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -844,7 +1258,7 @@ func performSessionMigrationLockSource(t *testing.T, st store.Store, vec vector.
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Store: st, Vector: vec}
+	srv := &Server{Store: st, Vector: vector.NewMutationFencedStore(vec)}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	req := httptest.NewRequest(http.MethodPost, "/sessions/migrate-lock-source", bytes.NewReader(body))
@@ -869,7 +1283,7 @@ func performSessionMigrationRollback(t *testing.T, st store.Store, vec vector.Ve
 	srv := &Server{
 		Cfg:    config.Config{ChromaEndpoint: "http://127.0.0.1:8000"},
 		Store:  st,
-		Vector: vec,
+		Vector: vector.NewMutationFencedStore(vec),
 	}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -895,7 +1309,7 @@ func performSessionMigrationCleanupSource(t *testing.T, st store.Store, vec vect
 	srv := &Server{
 		Cfg:    config.Config{ChromaEndpoint: "http://127.0.0.1:8000"},
 		Store:  st,
-		Vector: vec,
+		Vector: vector.NewMutationFencedStore(vec),
 	}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)

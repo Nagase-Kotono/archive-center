@@ -12,7 +12,7 @@ import (
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
-func TestNormalizeNarrativeStateClaimsSeparatesFactAndBelief(t *testing.T) {
+func TestNormalizeNarrativeStateClaimsLeavesBeliefToPerspectiveMemory(t *testing.T) {
 	extraction := map[string]any{
 		"state_claims": []any{map[string]any{
 			"subject": "A", "subject_type": "character", "state_slot": "life_status", "value": "alive", "evidence_excerpt": "A opened their eyes.",
@@ -22,19 +22,16 @@ func TestNormalizeNarrativeStateClaimsSeparatesFactAndBelief(t *testing.T) {
 		}},
 	}
 	claims := normalizeNarrativeStateClaims(extraction)
-	if len(claims) != 2 {
-		t.Fatalf("claims=%d, want 2", len(claims))
+	if len(claims) != 1 {
+		t.Fatalf("claims=%d, want only objective state claim", len(claims))
 	}
 	if claims[0].ClaimScope != "objective" || claims[0].PerspectiveOwner != "" {
 		t.Fatalf("objective claim normalized incorrectly: %#v", claims[0])
 	}
-	if claims[1].ClaimScope != "belief" || claims[1].PerspectiveOwner != "B" {
-		t.Fatalf("belief claim normalized incorrectly: %#v", claims[1])
-	}
 }
 
 func TestSaveNarrativeStateKeepsOneCurrentValueAndLinksEvidence(t *testing.T) {
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), entityIdentitySourceContextKey{}, entityIdentitySourceContext{Revision: "source-revision-1"})
 	st := &turnRecordingStore{}
 	srv := &Server{Store: st}
 	now := time.Now().UTC()
@@ -54,6 +51,9 @@ func TestSaveNarrativeStateKeepsOneCurrentValueAndLinksEvidence(t *testing.T) {
 	ids, _ := evidencePayload["direct_evidence_ids"].([]any)
 	if len(ids) != 1 || int(ids[0].(float64)) != 77 {
 		t.Fatalf("evidence ids=%v, want [77]", evidencePayload["direct_evidence_ids"])
+	}
+	if evidencePayload["source_revision"] != "source-revision-1" || evidencePayload["current_projection"] != true {
+		t.Fatalf("narrative current value is not source-linked: %#v", evidencePayload)
 	}
 
 	evidence = append(evidence, store.DirectEvidence{ID: 88, ChatSessionID: "sess", TurnAnchor: 2, EvidenceText: "A returned alive."})
@@ -194,7 +194,7 @@ func TestSaveNarrativeStateHighConfidenceTransitionReplacesLowConfidenceCurrent(
 	}
 }
 
-func TestSaveNarrativeStateNonGoalClaimsKeepLegacyReplacementBehavior(t *testing.T) {
+func TestSaveNarrativeStateNonGoalClaimsDoNotOwnBeliefCurrentState(t *testing.T) {
 	st := &turnRecordingStore{}
 	srv := &Server{Store: st}
 	save := func(turn int, objectiveValue, beliefValue string, confidence float64) {
@@ -221,8 +221,8 @@ func TestSaveNarrativeStateNonGoalClaimsKeepLegacyReplacementBehavior(t *testing
 	}
 	save(1, "alive", "missing", 0.9)
 	save(2, "recovering", "alive", 0.2)
-	if len(st.savedStatusCurrent) != 4 || len(st.savedStatusEvents) != 4 {
-		t.Fatalf("goal-only lifecycle fence changed non-goal fact/belief writes: current=%d events=%d", len(st.savedStatusCurrent), len(st.savedStatusEvents))
+	if len(st.savedStatusCurrent) != 2 || len(st.savedStatusEvents) != 2 {
+		t.Fatalf("belief updates must not create generic narrative current/history owners: current=%d events=%d", len(st.savedStatusCurrent), len(st.savedStatusEvents))
 	}
 }
 
@@ -258,7 +258,7 @@ func TestContinuityCorrectionNewLifecycleCarryIsGoalOnly(t *testing.T) {
 	}
 }
 
-func TestNarrativeStateInjectionDropsOffSceneBelief(t *testing.T) {
+func TestNarrativeStateInjectionLeavesAllLegacyBeliefsToPerspectiveMemory(t *testing.T) {
 	values := []store.StatusCurrentValue{
 		narrativeTestCurrentValue("A", "life_status", "alive", "objective", "", 10),
 		narrativeTestCurrentValue("A", "life_status", "dead", "belief", "B", 9),
@@ -266,11 +266,8 @@ func TestNarrativeStateInjectionDropsOffSceneBelief(t *testing.T) {
 	}
 	chatLogs := []store.ChatLog{{TurnIndex: 10, Role: "assistant", Content: "A met B at the gate."}}
 	facts, perceptions, dropped := filterNarrativeCurrentStateViews(values, "B asks whether A survived.", chatLogs, nil)
-	if len(facts) != 1 || len(perceptions) != 1 || dropped != 1 {
+	if len(facts) != 1 || len(perceptions) != 0 || dropped != 2 {
 		t.Fatalf("facts=%d perceptions=%d dropped=%d", len(facts), len(perceptions), dropped)
-	}
-	if perceptions[0].Perspective != "B" {
-		t.Fatalf("perspective=%q, want B", perceptions[0].Perspective)
 	}
 }
 
@@ -514,6 +511,7 @@ func TestPendingThreadProducerMirrorsGoalIdentityIntoPrepareFilter(t *testing.T)
 			"title": "Production Goal", "subject": "Production Goal", "state_slot": "goal_status",
 			"thread_type": "open_question", "confidence": 0.9,
 		}}},
+		"",
 		completeTurnEmbeddingConfig{}, time.Now().UTC(), &result, nil, &cost,
 	)
 	if len(st.savedPendingThreads) != 1 || len(st.savedActiveStates) != 1 ||
@@ -566,6 +564,7 @@ func TestPendingThreadProducerIdentityMismatchFailsOpen(t *testing.T) {
 			"title": "Production Goal", "subject": "Different Goal", "state_slot": "goal_status",
 			"thread_type": "open_question", "confidence": 0.9,
 		}}},
+		"",
 		completeTurnEmbeddingConfig{}, time.Now().UTC(), &result, nil, &cost,
 	)
 	if len(st.savedPendingThreads) != 1 || len(st.savedActiveStates) != 1 ||
@@ -799,7 +798,7 @@ func TestPrepareTurnStateTransitionDoesNotSuppressUncertainOrReactivatedOpenArti
 	}
 }
 
-func TestRestoreNarrativeCurrentStateUsesLatestRemainingLedgerValue(t *testing.T) {
+func TestRestoreNarrativeCurrentStateExcludesDeletedTailLedgerValue(t *testing.T) {
 	st := &turnRecordingStore{}
 	claim := narrativeStateClaim{Subject: "A", SubjectType: "character", StateSlot: "life_status", ClaimScope: "objective"}
 	ownerID := narrativeStateOwnerID(claim)
@@ -811,7 +810,7 @@ func TestRestoreNarrativeCurrentStateUsesLatestRemainingLedgerValue(t *testing.T
 		{ID: 1, ChatSessionID: "sess", RegistryID: 9, StatusKey: narrativeStateStatusKey, OwnerScope: "entity", OwnerID: ownerID, EventKind: "set", NewValueJSON: mustCompactJSON(narrativeStateValuePayload(dead, "", 4)), EvidenceJSON: `{}`, SourceTurn: 4},
 		{ID: 2, ChatSessionID: "sess", RegistryID: 9, StatusKey: narrativeStateStatusKey, OwnerScope: "entity", OwnerID: ownerID, EventKind: "change", NewValueJSON: mustCompactJSON(narrativeStateValuePayload(alive, "dead", 8)), EvidenceJSON: `{}`, SourceTurn: 8},
 	}
-	restored, err := restoreNarrativeCurrentStatesAfterRollback(context.Background(), st, "sess")
+	restored, err := restoreNarrativeCurrentStatesAfterRollback(context.Background(), st, "sess", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,8 +821,12 @@ func TestRestoreNarrativeCurrentStateUsesLatestRemainingLedgerValue(t *testing.T
 	if err := json.Unmarshal([]byte(st.returnStatusCurrent[0].ValueJSON), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["value"] != "alive" || st.returnStatusCurrent[0].SourceTurn != 8 {
+	if payload["value"] != "dead" || st.returnStatusCurrent[0].SourceTurn != 4 {
 		t.Fatalf("restored payload=%v turn=%d", payload, st.returnStatusCurrent[0].SourceTurn)
+	}
+	st.returnStatusCurrent = nil
+	if restored, err = restoreNarrativeCurrentStatesAfterRollback(context.Background(), st, "sess", 0); err != nil || restored != 0 || len(st.returnStatusCurrent) != 0 {
+		t.Fatalf("turn-one deletion restored orphan current state: restored=%d current=%d err=%v", restored, len(st.returnStatusCurrent), err)
 	}
 }
 

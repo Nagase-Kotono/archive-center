@@ -39,6 +39,20 @@ func TestHandleHealth(t *testing.T) {
 	if resp.Status != "ok" {
 		t.Errorf("Status = %q, want %q", resp.Status, "ok")
 	}
+	if resp.BackendInstanceID == "" || resp.BackendInstanceID != srv.BackendInstanceID {
+		t.Fatalf("backend instance id = %q, want current server id %q", resp.BackendInstanceID, srv.BackendInstanceID)
+	}
+}
+
+func TestBackendInstanceIDChangesWithServerProcessInstance(t *testing.T) {
+	first := setupTestServer()
+	second := setupTestServer()
+	if first.BackendInstanceID == "" || second.BackendInstanceID == "" {
+		t.Fatal("backend instance id must not be empty")
+	}
+	if first.BackendInstanceID == second.BackendInstanceID {
+		t.Fatalf("separate server instances shared id %q", first.BackendInstanceID)
+	}
 }
 
 func TestReverseProxyBasePathRoutesArchiveEndpoints(t *testing.T) {
@@ -249,8 +263,8 @@ func TestHandleVersion(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp.Version != "2.0.0-dev" {
-		t.Errorf("Version = %q, want %q", resp.Version, "2.0.0-dev")
+	if resp.Version != "3.9.9-dev" {
+		t.Errorf("Version = %q, want %q", resp.Version, "3.9.9-dev")
 	}
 	if resp.Commit != "unknown" {
 		t.Errorf("Commit = %q, want %q", resp.Commit, "unknown")

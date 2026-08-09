@@ -8,10 +8,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,26 +24,86 @@ import (
 )
 
 type schemaReport struct {
-	Status                     string   `json:"status"`
-	SchemaPath                 string   `json:"schema_path"`
-	Executed                   bool     `json:"executed"`
-	GeneratedAt                string   `json:"generated_at"`
-	StatementsTotal            int      `json:"statements_total"`
-	StatementsRun              int      `json:"statements_run"`
-	CompatibilityStatementsRun int      `json:"compatibility_statements_run,omitempty"`
-	Errors                     []string `json:"errors,omitempty"`
+	Status                     string                             `json:"status"`
+	SchemaPath                 string                             `json:"schema_path"`
+	Executed                   bool                               `json:"executed"`
+	GeneratedAt                string                             `json:"generated_at"`
+	StatementsTotal            int                                `json:"statements_total"`
+	StatementsRun              int                                `json:"statements_run"`
+	MigrationFiles             []string                           `json:"migration_files,omitempty"`
+	CompatibilityStatementsRun int                                `json:"compatibility_statements_run,omitempty"`
+	ManagedBootstrap           bool                               `json:"managed_bootstrap,omitempty"`
+	VerifiedDataDir            string                             `json:"verified_datadir,omitempty"`
+	ManagedAccountVerified     bool                               `json:"managed_account_verified,omitempty"`
+	AppAccountProbeRequested   bool                               `json:"app_account_probe_requested,omitempty"`
+	AppAccountProbes           []*appAccountPermissionProbeReport `json:"app_account_probes,omitempty"`
+	ErrorCode                  string                             `json:"error_code,omitempty"`
+	ErrorClass                 string                             `json:"error_class,omitempty"`
+	ErrorStage                 string                             `json:"error_stage,omitempty"`
+	ErrorOperation             string                             `json:"error_operation,omitempty"`
+	Errors                     []string                           `json:"errors,omitempty"`
 }
 
 type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
+
+type managedAdminConnection interface {
+	sqlExecer
+	PingContext(ctx context.Context) error
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type managedBootstrapConfig struct {
+	Enabled         bool
+	Host            string
+	Port            int
+	ExpectedDataDir string
+}
+
+type managedBootstrapError struct {
+	Code string
+	Err  error
+}
+
+func (e *managedBootstrapError) Error() string {
+	if e == nil || e.Err == nil {
+		return ""
+	}
+	return e.Err.Error()
+}
+
+func (e *managedBootstrapError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+const (
+	managedErrInvalidConfig   = "managed_mariadb_invalid_config"
+	managedErrAdminAuth       = "managed_mariadb_admin_auth_failed"
+	managedErrDataDirQuery    = "managed_mariadb_datadir_query_failed"
+	managedErrDataDirMismatch = "managed_mariadb_datadir_mismatch"
+	managedErrPrivilegeSync   = "managed_mariadb_privilege_sync_failed"
+	managedErrApplicationAuth = "managed_mariadb_app_auth_failed"
+	managedDatabaseName       = "archive_center"
+	managedDatabaseUser       = "archive_center"
+	managedDatabasePassword   = "archive-center-local-pass"
+)
 
 func main() {
 	dsn := flag.String("dsn", os.Getenv("AC_MARIADB_DSN"), "MariaDB DSN. Defaults to AC_MARIADB_DSN.")
-	schemaPath := flag.String("schema", defaultSchemaPath(), "Path to schema SQL file.")
+	schemaPath := flag.String("schema", defaultSchemaPath(), "Path to the migrations directory or a schema SQL file.")
 	outPath := flag.String("out", "", "Path to write schema JSON report. Defaults to stdout.")
 	execute := flag.Bool("execute", false, "Required to apply schema statements.")
-	timeout := flag.Duration("timeout", 60*time.Second, "Schema apply timeout.")
+	timeout := flag.Duration("timeout", 0, "Schema apply timeout (0 = no local deadline).")
+	managedBootstrap := flag.Bool("managed-bootstrap", false, "Verify and repair the package-managed local MariaDB account before applying the schema.")
+	managedHost := flag.String("managed-host", "127.0.0.1", "Host for the package-managed local MariaDB instance.")
+	managedPort := flag.Int("managed-port", 3307, "Port for the package-managed local MariaDB instance.")
+	expectedDataDir := flag.String("expected-datadir", "", "Expected package-managed MariaDB data directory.")
+	appAccountProbe := flag.Bool("app-account-probe", false, "Before schema apply, explicitly verify local non-root application-account CRUD and DDL permissions with a temporary table.")
 	flag.Parse()
 	executeRequested := *execute || executeArgPresent(os.Args[1:])
 
@@ -51,7 +116,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	report, exitCode := run(absSchemaPath, *dsn, executeRequested, *timeout)
+	report, exitCode := runWithOptions(absSchemaPath, *dsn, executeRequested, *timeout, managedBootstrapConfig{
+		Enabled:         *managedBootstrap,
+		Host:            *managedHost,
+		Port:            *managedPort,
+		ExpectedDataDir: *expectedDataDir,
+	}, *appAccountProbe)
 	writeReport(report, *outPath)
 	os.Exit(exitCode)
 }
@@ -111,13 +181,20 @@ func newReport(schemaPath string, executed bool) *schemaReport {
 }
 
 func run(schemaPath, dsn string, execute bool, timeout time.Duration) (*schemaReport, int) {
+	return runWithOptions(schemaPath, dsn, execute, timeout, managedBootstrapConfig{}, false)
+}
+
+func runWithOptions(schemaPath, dsn string, execute bool, timeout time.Duration, managed managedBootstrapConfig, appAccountProbe bool) (*schemaReport, int) {
 	report := newReport(schemaPath, execute)
-	statements, err := loadStatements(schemaPath)
+	report.ManagedBootstrap = managed.Enabled
+	report.AppAccountProbeRequested = appAccountProbe
+	statements, migrationFiles, err := loadMigrationStatements(schemaPath)
 	if err != nil {
 		report.Status = "failed"
 		report.Errors = append(report.Errors, err.Error())
 		return report, 1
 	}
+	report.MigrationFiles = migrationFiles
 	report.StatementsTotal = len(statements)
 
 	if !execute {
@@ -130,6 +207,21 @@ func run(schemaPath, dsn string, execute bool, timeout time.Duration) (*schemaRe
 		report.Errors = append(report.Errors, "missing DSN: provide --dsn or AC_MARIADB_DSN")
 		return report, 2
 	}
+	if timeout < 0 {
+		report.Status = "failed"
+		report.Errors = append(report.Errors, "--timeout must not be negative")
+		return report, 2
+	}
+	var appAccountTargets []localAppAccountProbeTarget
+	if appAccountProbe {
+		appAccountTargets, err = localAppAccountProbeTargets(dsn)
+		if err != nil {
+			report.Status = "failed"
+			report.ErrorCode = "mariadb_app_account_probe_invalid_target"
+			report.Errors = append(report.Errors, err.Error())
+			return report, 2
+		}
+	}
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -139,9 +231,54 @@ func run(schemaPath, dsn string, execute bool, timeout time.Duration) (*schemaRe
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 
+	if managed.Enabled {
+		verifiedDataDir, err := runManagedBootstrap(ctx, managed)
+		if err != nil {
+			report.Status = "failed"
+			report.ErrorCode = managedBootstrapErrorCode(err)
+			report.Errors = append(report.Errors, err.Error())
+			return report, 1
+		}
+		report.VerifiedDataDir = verifiedDataDir
+		report.ManagedAccountVerified = true
+	}
+
+	if appAccountProbe {
+		var firstProbeError error
+		for _, target := range appAccountTargets {
+			probeDB, openErr := sql.Open("mysql", target.dsn)
+			if openErr != nil {
+				probeReport := newAppAccountPermissionProbeReport("")
+				probeReport.TargetHost = target.host
+				probeReport.Status = "failed"
+				probeReport.CleanupStatus = "not_created"
+				probeReport.Stages = append(probeReport.Stages, failedAppAccountProbeStage("connect", "OPEN", openErr))
+				report.AppAccountProbes = append(report.AppAccountProbes, probeReport)
+				if firstProbeError == nil {
+					firstProbeError = &appAccountPermissionProbeError{Stage: "connect", Operation: "OPEN", Err: openErr}
+				}
+				continue
+			}
+			probeReport, probeErr := runAppAccountPermissionProbe(ctx, probeDB, "")
+			probeReport.TargetHost = target.host
+			report.AppAccountProbes = append(report.AppAccountProbes, probeReport)
+			_ = probeDB.Close()
+			if probeErr != nil && firstProbeError == nil {
+				firstProbeError = probeErr
+			}
+		}
+		if firstProbeError != nil {
+			recordAppAccountProbeFailure(report, firstProbeError)
+			return report, 1
+		}
+	}
 	if err := applyStatements(ctx, db, statements, report); err != nil {
 		report.Status = "failed"
 		report.Errors = append(report.Errors, err.Error())
@@ -155,12 +292,199 @@ func run(schemaPath, dsn string, execute bool, timeout time.Duration) (*schemaRe
 	return report, 0
 }
 
+func recordAppAccountProbeFailure(report *schemaReport, err error) {
+	report.Status = "failed"
+	report.ErrorCode = "mariadb_app_account_probe_failed"
+	report.ErrorClass = appAccountProbeErrorClass(err)
+	var typed *appAccountPermissionProbeError
+	if errors.As(err, &typed) {
+		report.ErrorStage = typed.Stage
+		report.ErrorOperation = typed.Operation
+	}
+	report.Errors = append(report.Errors, err.Error())
+}
+
+func runManagedBootstrap(ctx context.Context, cfg managedBootstrapConfig) (string, error) {
+	host := strings.TrimSpace(cfg.Host)
+	if host == "" || cfg.Port < 1 || cfg.Port > 65535 || strings.TrimSpace(cfg.ExpectedDataDir) == "" {
+		return "", newManagedBootstrapError(managedErrInvalidConfig, "managed MariaDB bootstrap requires a valid host, port, and expected data directory", nil)
+	}
+
+	address := net.JoinHostPort(host, strconv.Itoa(cfg.Port))
+	adminDSN := fmt.Sprintf("root@tcp(%s)/", address)
+	adminDB, err := sql.Open("mysql", adminDSN)
+	if err != nil {
+		return "", newManagedBootstrapError(managedErrAdminAuth, "open managed MariaDB administrator connection", err)
+	}
+	defer adminDB.Close()
+
+	adminConn, err := adminDB.Conn(ctx)
+	if err != nil {
+		return "", newManagedBootstrapError(managedErrAdminAuth, "open dedicated managed MariaDB administrator connection", err)
+	}
+	defer adminConn.Close()
+
+	verifiedDataDir, err := bootstrapManagedDatabase(ctx, adminConn, cfg.ExpectedDataDir)
+	if err != nil {
+		return "", err
+	}
+
+	appDSN := fmt.Sprintf(
+		"%s:%s@tcp(%s)/%s?parseTime=true",
+		managedDatabaseUser,
+		managedDatabasePassword,
+		address,
+		managedDatabaseName,
+	)
+	appDB, err := sql.Open("mysql", appDSN)
+	if err != nil {
+		return "", newManagedBootstrapError(managedErrApplicationAuth, "open managed MariaDB application connection", err)
+	}
+	defer appDB.Close()
+	if err := appDB.PingContext(ctx); err != nil {
+		return "", newManagedBootstrapError(managedErrApplicationAuth, "verify managed MariaDB application account", err)
+	}
+
+	return verifiedDataDir, nil
+}
+
+func bootstrapManagedDatabase(ctx context.Context, adminDB managedAdminConnection, expectedDataDir string) (string, error) {
+	if err := adminDB.PingContext(ctx); err != nil {
+		return "", newManagedBootstrapError(managedErrAdminAuth, "verify managed MariaDB administrator account", err)
+	}
+
+	var actualDataDir string
+	if err := adminDB.QueryRowContext(ctx, "SELECT @@datadir").Scan(&actualDataDir); err != nil {
+		return "", newManagedBootstrapError(managedErrDataDirQuery, "read managed MariaDB data directory", err)
+	}
+
+	expectedCanonical, err := canonicalManagedDataDir(expectedDataDir)
+	if err != nil {
+		return "", newManagedBootstrapError(managedErrInvalidConfig, "resolve expected managed MariaDB data directory", err)
+	}
+	actualCanonical, err := canonicalManagedDataDir(actualDataDir)
+	if err != nil {
+		return "", newManagedBootstrapError(managedErrDataDirQuery, "resolve running MariaDB data directory", err)
+	}
+	if !managedDataDirsEqual(expectedCanonical, actualCanonical) {
+		return "", newManagedBootstrapError(
+			managedErrDataDirMismatch,
+			fmt.Sprintf("MariaDB port belongs to a different data directory: expected %q, got %q", expectedCanonical, actualCanonical),
+			nil,
+		)
+	}
+
+	statements := []string{
+		"CREATE DATABASE IF NOT EXISTS archive_center CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+		"CREATE USER IF NOT EXISTS 'archive_center'@'127.0.0.1' IDENTIFIED BY 'archive-center-local-pass'",
+		"ALTER USER 'archive_center'@'127.0.0.1' IDENTIFIED BY 'archive-center-local-pass'",
+		"GRANT ALL PRIVILEGES ON archive_center.* TO 'archive_center'@'127.0.0.1'",
+		"CREATE USER IF NOT EXISTS 'archive_center'@'localhost' IDENTIFIED BY 'archive-center-local-pass'",
+		"ALTER USER 'archive_center'@'localhost' IDENTIFIED BY 'archive-center-local-pass'",
+		"GRANT ALL PRIVILEGES ON archive_center.* TO 'archive_center'@'localhost'",
+		"FLUSH PRIVILEGES",
+	}
+	for index, statement := range statements {
+		if _, err := adminDB.ExecContext(ctx, statement); err != nil {
+			return "", newManagedBootstrapError(
+				managedErrPrivilegeSync,
+				fmt.Sprintf("synchronize managed MariaDB application privileges at statement %d", index+1),
+				err,
+			)
+		}
+	}
+	return actualCanonical, nil
+}
+
+func canonicalManagedDataDir(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("data directory is empty")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		absolute = resolved
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func managedDataDirsEqual(expected, actual string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(expected, actual)
+	}
+	return expected == actual
+}
+
+func newManagedBootstrapError(code, message string, cause error) error {
+	err := fmt.Errorf("%s", message)
+	if cause != nil {
+		err = fmt.Errorf("%s: %w", message, cause)
+	}
+	return &managedBootstrapError{Code: code, Err: err}
+}
+
+func managedBootstrapErrorCode(err error) string {
+	var typed *managedBootstrapError
+	if errors.As(err, &typed) {
+		return typed.Code
+	}
+	return ""
+}
+
 func loadStatements(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read schema: %w", err)
 	}
 	return splitSQLStatements(strings.TrimPrefix(string(data), "\ufeff")), nil
+}
+
+func loadMigrationStatements(path string) ([]string, []string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read migrations: %w", err)
+	}
+	if !info.IsDir() && !strings.EqualFold(filepath.Base(path), "001_schema.sql") {
+		statements, err := loadStatements(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		return statements, []string{path}, nil
+	}
+
+	dir := path
+	if !info.IsDir() {
+		dir = filepath.Dir(path)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read migrations directory: %w", err)
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".sql") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return filepath.ToSlash(paths[i]) < filepath.ToSlash(paths[j])
+	})
+	if len(paths) == 0 {
+		return nil, nil, fmt.Errorf("migrations directory contains no .sql files: %s", dir)
+	}
+	statements := make([]string, 0)
+	for _, migrationPath := range paths {
+		loaded, err := loadStatements(migrationPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		statements = append(statements, loaded...)
+	}
+	return statements, paths, nil
 }
 
 func splitSQLStatements(sqlText string) []string {
@@ -218,6 +542,9 @@ func applyStatements(ctx context.Context, db sqlExecer, statements []string, rep
 
 func compatibilityMigrationStatements() []string {
 	statements := []string{
+		"UPDATE chat_logs SET role = LOWER(TRIM(role)) WHERE role <> LOWER(TRIM(role))",
+		"DELETE duplicate FROM chat_logs duplicate INNER JOIN chat_logs keep ON duplicate.chat_session_id = keep.chat_session_id AND duplicate.turn_index = keep.turn_index AND duplicate.role = keep.role AND duplicate.id > keep.id AND BINARY TRIM(duplicate.content) = BINARY TRIM(keep.content)",
+		"ALTER TABLE chat_logs ADD UNIQUE INDEX IF NOT EXISTS uq_chat_logs_turn_role (chat_session_id, turn_index, role)",
 		"ALTER TABLE storylines ADD COLUMN IF NOT EXISTS confidence DOUBLE",
 		"ALTER TABLE storylines ADD COLUMN IF NOT EXISTS evidence_count INT",
 		"ALTER TABLE storylines ADD COLUMN IF NOT EXISTS last_evidence_turn INT",
@@ -249,12 +576,34 @@ func compatibilityMigrationStatements() []string {
 	}
 	statements = append(statements, referenceLibrarySchemaStatements()...)
 	statements = append(statements, canonPackStorageSchemaStatements()...)
+	statements = append(statements, entityIdentitySchemaStatements()...)
+	statements = append(statements, preciseMemorySchemaStatements()...)
+	statements = append(statements, memoryDerivationSchemaStatements()...)
 	statements = append(statements, "ALTER TABLE session_reference_bindings ADD COLUMN IF NOT EXISTS injection_enabled BOOLEAN NOT NULL DEFAULT FALSE AFTER enabled")
 	statements = append(statements, "ALTER TABLE session_reference_bindings ADD COLUMN IF NOT EXISTS reference_mode VARCHAR(50) NOT NULL DEFAULT 'supplement' AFTER binding_role")
 	return statements
 }
 
 func applyCompatibilityMigrations(ctx context.Context, db sqlExecer, report *schemaReport) error {
+	var conflictingChatLogs int
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM chat_logs a
+			INNER JOIN chat_logs b
+				ON a.chat_session_id = b.chat_session_id
+				AND a.turn_index = b.turn_index
+				AND LOWER(TRIM(a.role)) = LOWER(TRIM(b.role))
+				AND a.id < b.id
+			WHERE NOT (BINARY TRIM(a.content) <=> BINARY TRIM(b.content))
+			LIMIT 1
+		)
+	`).Scan(&conflictingChatLogs); err != nil {
+		return fmt.Errorf("chat_logs uniqueness preflight failed: %w", err)
+	}
+	if conflictingChatLogs != 0 {
+		return errors.New("chat_logs uniqueness preflight found conflicting content for the same session, turn, and role")
+	}
 	statements := compatibilityMigrationStatements()
 	for i, stmt := range statements {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {

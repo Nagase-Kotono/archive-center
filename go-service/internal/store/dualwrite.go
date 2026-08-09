@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // dualWriteStore wraps a primary Store and a shadow Store.
@@ -73,6 +74,28 @@ func (d *dualWriteStore) ReplaceLogicalTurn(ctx context.Context, replacement Log
 	}
 	if shadowOK {
 		if err := shadow.ReplaceLogicalTurn(ctx, replacement); err != nil {
+			d.recordShadowErr(err)
+			if !primaryOK {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (d *dualWriteStore) RollbackCanonicalTail(ctx context.Context, rollback LogicalTurnRollback) error {
+	primary, primaryOK := d.primary.(LogicalTurnReplacementStore)
+	shadow, shadowOK := d.shadow.(LogicalTurnReplacementStore)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := primary.RollbackCanonicalTail(ctx, rollback); err != nil {
+			return err
+		}
+	}
+	if shadowOK {
+		if err := shadow.RollbackCanonicalTail(ctx, rollback); err != nil {
 			d.recordShadowErr(err)
 			if !primaryOK {
 				return err
@@ -416,6 +439,442 @@ func (d *dualWriteStore) SaveEntity(ctx context.Context, e *Entity) error {
 		SaveEntity(context.Context, *Entity) error
 	}); ok {
 		if err := shadow.SaveEntity(ctx, e); err != nil {
+			d.recordShadowErr(err)
+		}
+	}
+	return nil
+}
+
+func (d *dualWriteStore) SaveEntityIdentity(ctx context.Context, item *EntityIdentity) error {
+	return d.writeEntityIdentityExtension(ctx, func(writer EntityIdentityWriter) error {
+		return writer.SaveEntityIdentity(ctx, item)
+	})
+}
+
+func (d *dualWriteStore) SaveEntityIdentitySurface(ctx context.Context, item *EntityIdentitySurface) error {
+	return d.writeEntityIdentityExtension(ctx, func(writer EntityIdentityWriter) error {
+		return writer.SaveEntityIdentitySurface(ctx, item)
+	})
+}
+
+func (d *dualWriteStore) SaveEntityIdentityArtifactBinding(ctx context.Context, item *EntityIdentityArtifactBinding) error {
+	return d.writeEntityIdentityExtension(ctx, func(writer EntityIdentityWriter) error {
+		return writer.SaveEntityIdentityArtifactBinding(ctx, item)
+	})
+}
+
+func (d *dualWriteStore) SaveSpeakerAttribution(ctx context.Context, item *SpeakerAttribution) error {
+	return d.writeEntityIdentityExtension(ctx, func(writer EntityIdentityWriter) error {
+		return writer.SaveSpeakerAttribution(ctx, item)
+	})
+}
+
+func (d *dualWriteStore) SaveEntityIdentityLink(ctx context.Context, item *EntityIdentityLink) error {
+	primary, primaryOK := d.primary.(EntityIdentityLinkWriter)
+	shadow, shadowOK := d.shadow.(EntityIdentityLinkWriter)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := primary.SaveEntityIdentityLink(ctx, item); err != nil {
+			return err
+		}
+	}
+	if shadowOK {
+		if err := shadow.SaveEntityIdentityLink(ctx, item); err != nil {
+			d.recordShadowErr(err)
+		}
+	}
+	return nil
+}
+
+func (d *dualWriteStore) EntityIdentityWritesEnabled() bool {
+	_, primaryOK := d.primary.(EntityIdentityWriter)
+	_, shadowOK := d.shadow.(EntityIdentityWriter)
+	return primaryOK || shadowOK
+}
+
+func (d *dualWriteStore) ResolveReviewedCanonicalEntityID(ctx context.Context, chatSessionID, sourceEntityID string) (string, error) {
+	if primary, ok := d.primary.(ReviewedEntityIdentityResolver); ok {
+		return primary.ResolveReviewedCanonicalEntityID(ctx, chatSessionID, sourceEntityID)
+	}
+	if shadow, ok := d.shadow.(ReviewedEntityIdentityResolver); ok {
+		return shadow.ResolveReviewedCanonicalEntityID(ctx, chatSessionID, sourceEntityID)
+	}
+	return "", ErrNotEnabled
+}
+
+func (d *dualWriteStore) ResolveUniqueActiveEntityIDBySurface(ctx context.Context, chatSessionID, normalizedSurface string) (string, error) {
+	if primary, ok := d.primary.(UniqueActiveEntitySurfaceResolver); ok {
+		return primary.ResolveUniqueActiveEntityIDBySurface(ctx, chatSessionID, normalizedSurface)
+	}
+	if shadow, ok := d.shadow.(UniqueActiveEntitySurfaceResolver); ok {
+		return shadow.ResolveUniqueActiveEntityIDBySurface(ctx, chatSessionID, normalizedSurface)
+	}
+	return "", ErrNotEnabled
+}
+
+func (d *dualWriteStore) ResolveUniqueActiveEntityIdentityBySurface(ctx context.Context, chatSessionID, normalizedSurface string) (ResolvedEntityIdentity, error) {
+	if primary, ok := d.primary.(UniqueActiveEntitySurfaceIdentityResolver); ok {
+		return primary.ResolveUniqueActiveEntityIdentityBySurface(ctx, chatSessionID, normalizedSurface)
+	}
+	if shadow, ok := d.shadow.(UniqueActiveEntitySurfaceIdentityResolver); ok {
+		return shadow.ResolveUniqueActiveEntityIdentityBySurface(ctx, chatSessionID, normalizedSurface)
+	}
+	return ResolvedEntityIdentity{}, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListCharacterPerspectiveMemoryUnits(ctx context.Context, chatSessionID, knowledgeHolderEntityID string) ([]PreciseMemoryUnit, error) {
+	if primary, ok := d.primary.(CharacterPerspectiveMemoryReader); ok {
+		return primary.ListCharacterPerspectiveMemoryUnits(ctx, chatSessionID, knowledgeHolderEntityID)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListActiveInteractionMemoryUnits(ctx context.Context, chatSessionID string) ([]PreciseMemoryUnit, error) {
+	if primary, ok := d.primary.(ActiveInteractionMemoryReader); ok {
+		return primary.ListActiveInteractionMemoryUnits(ctx, chatSessionID)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) SavePreciseMemoryUnit(ctx context.Context, item *PreciseMemoryUnit) (bool, error) {
+	primary, primaryOK := preciseMemoryWriterForStore(d.primary)
+	shadow, shadowOK := preciseMemoryWriterForStore(d.shadow)
+	if !primaryOK && !shadowOK {
+		return false, ErrNotEnabled
+	}
+	if primaryOK {
+		inserted, err := primary.SavePreciseMemoryUnit(ctx, item)
+		if err != nil {
+			return false, err
+		}
+		if shadowOK {
+			if _, err := shadow.SavePreciseMemoryUnit(ctx, item); err != nil {
+				d.recordShadowErr(err)
+			}
+		}
+		return inserted, nil
+	}
+	inserted, err := shadow.SavePreciseMemoryUnit(ctx, item)
+	if err != nil {
+		d.recordShadowErr(err)
+		return false, nil
+	}
+	return inserted, nil
+}
+
+func (d *dualWriteStore) PreciseMemoryWritesEnabled() bool {
+	_, primaryOK := preciseMemoryWriterForStore(d.primary)
+	_, shadowOK := preciseMemoryWriterForStore(d.shadow)
+	return primaryOK || shadowOK
+}
+
+func preciseMemoryWriterForStore(st Store) (PreciseMemoryWriter, bool) {
+	writer, ok := st.(PreciseMemoryWriter)
+	if !ok {
+		return nil, false
+	}
+	if availability, ok := st.(PreciseMemoryWriteAvailability); ok && !availability.PreciseMemoryWritesEnabled() {
+		return nil, false
+	}
+	return writer, true
+}
+
+func (d *dualWriteStore) CommitMemoryAdmission(ctx context.Context, admission *MemoryAdmission) (MemoryAdmissionResult, error) {
+	primary, primaryOK := memoryAdmissionWriterForStore(d.primary)
+	shadow, shadowOK := memoryAdmissionWriterForStore(d.shadow)
+	if !primaryOK && !shadowOK {
+		return MemoryAdmissionResult{}, ErrNotEnabled
+	}
+	if primaryOK {
+		result, err := primary.CommitMemoryAdmission(ctx, admission)
+		if err != nil {
+			return MemoryAdmissionResult{}, err
+		}
+		if shadowOK {
+			if _, err := shadow.CommitMemoryAdmission(ctx, admission); err != nil {
+				d.recordShadowErr(err)
+			}
+		}
+		return result, nil
+	}
+	result, err := shadow.CommitMemoryAdmission(ctx, admission)
+	if err != nil {
+		d.recordShadowErr(err)
+		return MemoryAdmissionResult{}, nil
+	}
+	return result, nil
+}
+
+func (d *dualWriteStore) MemoryAdmissionWritesEnabled() bool {
+	_, primaryOK := memoryAdmissionWriterForStore(d.primary)
+	_, shadowOK := memoryAdmissionWriterForStore(d.shadow)
+	return primaryOK || shadowOK
+}
+
+func memoryAdmissionWriterForStore(st Store) (MemoryAdmissionWriter, bool) {
+	writer, ok := st.(MemoryAdmissionWriter)
+	if !ok {
+		return nil, false
+	}
+	if availability, ok := st.(MemoryAdmissionWriteAvailability); ok &&
+		!availability.MemoryAdmissionWritesEnabled() {
+		return nil, false
+	}
+	return writer, true
+}
+
+func (d *dualWriteStore) MemoryDerivationLifecycleEnabled() bool {
+	_, primaryOK := memoryLifecycleSourceStore(d.primary)
+	_, shadowOK := memoryLifecycleSourceStore(d.shadow)
+	return primaryOK || shadowOK
+}
+
+func memoryLifecycleSourceStore(st Store) (SourceRevisionStore, bool) {
+	writer, ok := st.(SourceRevisionStore)
+	if !ok {
+		return nil, false
+	}
+	if availability, ok := st.(MemoryDerivationLifecycleAvailability); ok &&
+		!availability.MemoryDerivationLifecycleEnabled() {
+		return nil, false
+	}
+	return writer, true
+}
+
+func (d *dualWriteStore) RegisterAcceptedSourceRevision(ctx context.Context, source *MemorySourceRevision) (SourceRevisionRegistration, error) {
+	primary, primaryOK := memoryLifecycleSourceStore(d.primary)
+	shadow, shadowOK := memoryLifecycleSourceStore(d.shadow)
+	if !primaryOK && !shadowOK {
+		return SourceRevisionRegistration{}, ErrNotEnabled
+	}
+	if primaryOK {
+		result, err := primary.RegisterAcceptedSourceRevision(ctx, source)
+		if err != nil {
+			return SourceRevisionRegistration{}, err
+		}
+		if shadowOK {
+			if _, err := shadow.RegisterAcceptedSourceRevision(ctx, source); err != nil {
+				d.recordShadowErr(err)
+			}
+		}
+		return result, nil
+	}
+	result, err := shadow.RegisterAcceptedSourceRevision(ctx, source)
+	if err != nil {
+		d.recordShadowErr(err)
+		return SourceRevisionRegistration{}, nil
+	}
+	return result, nil
+}
+
+func (d *dualWriteStore) IsSourceRevisionActive(ctx context.Context, sid, revision string) (bool, error) {
+	if primary, ok := memoryLifecycleSourceStore(d.primary); ok {
+		return primary.IsSourceRevisionActive(ctx, sid, revision)
+	}
+	if shadow, ok := memoryLifecycleSourceStore(d.shadow); ok {
+		return shadow.IsSourceRevisionActive(ctx, sid, revision)
+	}
+	return false, ErrNotEnabled
+}
+
+func (d *dualWriteStore) GetSourceRevision(ctx context.Context, sid, revision string) (*MemorySourceRevision, error) {
+	if primary, ok := memoryLifecycleSourceStore(d.primary); ok {
+		return primary.GetSourceRevision(ctx, sid, revision)
+	}
+	if shadow, ok := memoryLifecycleSourceStore(d.shadow); ok {
+		return shadow.GetSourceRevision(ctx, sid, revision)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) SaveCriticInputSnapshot(
+	ctx context.Context,
+	sid string,
+	revision string,
+	snapshotJSON string,
+	snapshotHash string,
+	updatedAt time.Time,
+) error {
+	primary, primaryOK := d.primary.(CriticInputSnapshotStore)
+	shadow, shadowOK := d.shadow.(CriticInputSnapshotStore)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := primary.SaveCriticInputSnapshot(ctx, sid, revision, snapshotJSON, snapshotHash, updatedAt); err != nil {
+			return err
+		}
+		if shadowOK {
+			if err := shadow.SaveCriticInputSnapshot(ctx, sid, revision, snapshotJSON, snapshotHash, updatedAt); err != nil {
+				d.recordShadowErr(err)
+			}
+		}
+		return nil
+	}
+	if err := shadow.SaveCriticInputSnapshot(ctx, sid, revision, snapshotJSON, snapshotHash, updatedAt); err != nil {
+		d.recordShadowErr(err)
+	}
+	return nil
+}
+
+func (d *dualWriteStore) ListActiveSourceRevisions(
+	ctx context.Context,
+	sid string,
+	fromTurn int,
+	toTurn int,
+) ([]MemorySourceRevision, error) {
+	if reader, ok := d.primary.(ActiveSourceRevisionLister); ok {
+		return reader.ListActiveSourceRevisions(ctx, sid, fromTurn, toTurn)
+	}
+	if reader, ok := d.shadow.(ActiveSourceRevisionLister); ok {
+		return reader.ListActiveSourceRevisions(ctx, sid, fromTurn, toTurn)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) InvalidateSourceRevisions(ctx context.Context, sid string, fromTurn int, lifecycleState, reason string, invalidatedAt time.Time) error {
+	primary, primaryOK := memoryLifecycleSourceStore(d.primary)
+	shadow, shadowOK := memoryLifecycleSourceStore(d.shadow)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := primary.InvalidateSourceRevisions(ctx, sid, fromTurn, lifecycleState, reason, invalidatedAt); err != nil {
+			return err
+		}
+	}
+	if shadowOK {
+		if err := shadow.InvalidateSourceRevisions(ctx, sid, fromTurn, lifecycleState, reason, invalidatedAt); err != nil {
+			d.recordShadowErr(err)
+			if !primaryOK {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (d *dualWriteStore) EnqueueMemoryReprocessingJob(ctx context.Context, job *MemoryReprocessingJob) (bool, error) {
+	return dualEnqueueMemoryWork(d, func(st Store) (bool, error) {
+		writer, ok := st.(MemoryReprocessingJobStore)
+		if !ok {
+			return false, ErrNotEnabled
+		}
+		return writer.EnqueueMemoryReprocessingJob(ctx, job)
+	})
+}
+
+func (d *dualWriteStore) ClaimMemoryReprocessingJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*MemoryReprocessingJob, error) {
+	if primary, ok := d.primary.(MemoryReprocessingJobStore); ok {
+		return primary.ClaimMemoryReprocessingJob(ctx, owner, now, lease)
+	}
+	if shadow, ok := d.shadow.(MemoryReprocessingJobStore); ok {
+		return shadow.ClaimMemoryReprocessingJob(ctx, owner, now, lease)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) CompleteMemoryReprocessingJob(ctx context.Context, id int64, owner string, now time.Time) error {
+	if primary, ok := d.primary.(MemoryReprocessingJobStore); ok {
+		return primary.CompleteMemoryReprocessingJob(ctx, id, owner, now)
+	}
+	if shadow, ok := d.shadow.(MemoryReprocessingJobStore); ok {
+		return shadow.CompleteMemoryReprocessingJob(ctx, id, owner, now)
+	}
+	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) FailMemoryReprocessingJob(ctx context.Context, id int64, owner string, now, retryAfter time.Time, permanent bool, failure string) error {
+	if primary, ok := d.primary.(MemoryReprocessingJobStore); ok {
+		return primary.FailMemoryReprocessingJob(ctx, id, owner, now, retryAfter, permanent, failure)
+	}
+	if shadow, ok := d.shadow.(MemoryReprocessingJobStore); ok {
+		return shadow.FailMemoryReprocessingJob(ctx, id, owner, now, retryAfter, permanent, failure)
+	}
+	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) EnqueueMemoryVectorOperation(ctx context.Context, item *MemoryVectorOutboxItem) (bool, error) {
+	return dualEnqueueMemoryWork(d, func(st Store) (bool, error) {
+		writer, ok := st.(MemoryVectorOutboxStore)
+		if !ok {
+			return false, ErrNotEnabled
+		}
+		return writer.EnqueueMemoryVectorOperation(ctx, item)
+	})
+}
+
+func dualEnqueueMemoryWork(d *dualWriteStore, enqueue func(Store) (bool, error)) (bool, error) {
+	_, primarySourceOK := memoryLifecycleSourceStore(d.primary)
+	_, shadowSourceOK := memoryLifecycleSourceStore(d.shadow)
+	if !primarySourceOK && !shadowSourceOK {
+		return false, ErrNotEnabled
+	}
+	if primarySourceOK {
+		inserted, err := enqueue(d.primary)
+		if err != nil {
+			return false, err
+		}
+		if shadowSourceOK {
+			if _, err := enqueue(d.shadow); err != nil {
+				d.recordShadowErr(err)
+			}
+		}
+		return inserted, nil
+	}
+	inserted, err := enqueue(d.shadow)
+	if err != nil {
+		d.recordShadowErr(err)
+		return false, nil
+	}
+	return inserted, nil
+}
+
+func (d *dualWriteStore) ClaimMemoryVectorOperation(ctx context.Context, owner string, now time.Time, lease time.Duration) (*MemoryVectorOutboxItem, error) {
+	if primary, ok := d.primary.(MemoryVectorOutboxStore); ok {
+		return primary.ClaimMemoryVectorOperation(ctx, owner, now, lease)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorOutboxStore); ok {
+		return shadow.ClaimMemoryVectorOperation(ctx, owner, now, lease)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) CompleteMemoryVectorOperation(ctx context.Context, id int64, owner string, now time.Time) error {
+	if primary, ok := d.primary.(MemoryVectorOutboxStore); ok {
+		return primary.CompleteMemoryVectorOperation(ctx, id, owner, now)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorOutboxStore); ok {
+		return shadow.CompleteMemoryVectorOperation(ctx, id, owner, now)
+	}
+	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) FailMemoryVectorOperation(ctx context.Context, id int64, owner string, now, retryAfter time.Time, permanent bool, failure string) error {
+	if primary, ok := d.primary.(MemoryVectorOutboxStore); ok {
+		return primary.FailMemoryVectorOperation(ctx, id, owner, now, retryAfter, permanent, failure)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorOutboxStore); ok {
+		return shadow.FailMemoryVectorOperation(ctx, id, owner, now, retryAfter, permanent, failure)
+	}
+	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) writeEntityIdentityExtension(ctx context.Context, write func(EntityIdentityWriter) error) error {
+	primary, primaryOK := d.primary.(EntityIdentityWriter)
+	shadow, shadowOK := d.shadow.(EntityIdentityWriter)
+	if !primaryOK && !shadowOK {
+		return ErrNotEnabled
+	}
+	if primaryOK {
+		if err := write(primary); err != nil {
+			return err
+		}
+	}
+	if shadowOK {
+		if err := write(shadow); err != nil {
 			d.recordShadowErr(err)
 		}
 	}
@@ -1096,6 +1555,73 @@ func (d *dualWriteStore) SaveStatusChangeEvent(ctx context.Context, event Status
 		}
 	}
 	return saved, nil
+}
+
+func (d *dualWriteStore) GetStatusChangeEventBySourceRevision(ctx context.Context, chatSessionID, statusKey, sourceRevision string, sourceTurn int) (StatusChangeEvent, error) {
+	primary, ok := d.primary.(StatusChangeEventSourceLookupStore)
+	if !ok {
+		return StatusChangeEvent{}, ErrNotEnabled
+	}
+	return primary.GetStatusChangeEventBySourceRevision(ctx, chatSessionID, statusKey, sourceRevision, sourceTurn)
+}
+
+func (d *dualWriteStore) GetLatestCurrentProjectionStatusChangeEvent(ctx context.Context, chatSessionID, statusKey string) (StatusChangeEvent, error) {
+	primary, ok := d.primary.(StatusChangeEventSourceLookupStore)
+	if !ok {
+		return StatusChangeEvent{}, ErrNotEnabled
+	}
+	return primary.GetLatestCurrentProjectionStatusChangeEvent(ctx, chatSessionID, statusKey)
+}
+
+func (d *dualWriteStore) ApplyReversibleStatusTransition(ctx context.Context, transition ReversibleStatusTransition) (ReversibleStatusTransitionResult, error) {
+	primary, primaryOK := d.primary.(ReversibleStatusTransitionStore)
+	shadow, shadowOK := d.shadow.(ReversibleStatusTransitionStore)
+	if !primaryOK && !shadowOK {
+		return ReversibleStatusTransitionResult{}, ErrNotEnabled
+	}
+	if !primaryOK {
+		return shadow.ApplyReversibleStatusTransition(ctx, transition)
+	}
+	result, err := primary.ApplyReversibleStatusTransition(ctx, transition)
+	if err != nil {
+		return result, err
+	}
+	if shadowOK {
+		if _, shadowErr := shadow.ApplyReversibleStatusTransition(ctx, transition); shadowErr != nil {
+			d.recordShadowErr(shadowErr)
+		}
+	}
+	return result, nil
+}
+
+func (d *dualWriteStore) GetReversibleStatusEventBySourceUnit(ctx context.Context, chatSessionID, sourceRevision, sourceUnitID string) (StatusChangeEvent, error) {
+	if primary, ok := d.primary.(ReversibleStatusTransitionStore); ok {
+		return primary.GetReversibleStatusEventBySourceUnit(ctx, chatSessionID, sourceRevision, sourceUnitID)
+	}
+	if shadow, ok := d.shadow.(ReversibleStatusTransitionStore); ok {
+		return shadow.GetReversibleStatusEventBySourceUnit(ctx, chatSessionID, sourceRevision, sourceUnitID)
+	}
+	return StatusChangeEvent{}, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListReversibleStatusCurrentValues(ctx context.Context, chatSessionID, ownerScope string, statusKeys []string) ([]StatusCurrentValue, error) {
+	if primary, ok := d.primary.(ReversibleStatusTransitionStore); ok {
+		return primary.ListReversibleStatusCurrentValues(ctx, chatSessionID, ownerScope, statusKeys)
+	}
+	if shadow, ok := d.shadow.(ReversibleStatusTransitionStore); ok {
+		return shadow.ListReversibleStatusCurrentValues(ctx, chatSessionID, ownerScope, statusKeys)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListLatestReversibleCurrentProjectionEvents(ctx context.Context, chatSessionID string, statusKeys []string) ([]StatusChangeEvent, error) {
+	if primary, ok := d.primary.(ReversibleStatusTransitionStore); ok {
+		return primary.ListLatestReversibleCurrentProjectionEvents(ctx, chatSessionID, statusKeys)
+	}
+	if shadow, ok := d.shadow.(ReversibleStatusTransitionStore); ok {
+		return shadow.ListLatestReversibleCurrentProjectionEvents(ctx, chatSessionID, statusKeys)
+	}
+	return nil, ErrNotEnabled
 }
 
 func (d *dualWriteStore) ListStatusEffects(ctx context.Context, chatSessionID, ownerScope, ownerID, effectState string, limit int) ([]StatusEffect, error) {

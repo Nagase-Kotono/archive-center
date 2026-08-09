@@ -2,6 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -9,15 +12,31 @@ import (
 	"sync"
 	"time"
 
+	"github.com/risulongmemory/archive-center-go/internal/config"
 	"github.com/risulongmemory/archive-center-go/internal/dto"
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
 const (
-	turnWorkflowHUDContractVersion = "turn_workflow_hud.v1"
-	turnWorkflowHUDEntryTTL        = 15 * time.Minute
-	turnWorkflowHUDMaxEntries      = 512
-	turnWorkflowHUDMaxWait         = 20 * time.Second
+	turnWorkflowHUDContractVersion                  = "turn_workflow_hud.v3"
+	turnWorkflowHUDNoticeObservationContractVersion = "turn_workflow_notice_observation.v1"
+	turnWorkflowHUDRecoveryRequestContractVersion   = "turn_workflow_recovery_request.v1"
+	turnWorkflowHUDMaxEntries                       = 512
+)
+
+const (
+	turnWorkflowHUDRecoveryRetryDerivedTurn = "retry_derived_turn"
+)
+
+const (
+	turnWorkflowHUDSeverityNormal  = "normal"
+	turnWorkflowHUDSeverityNotice  = "notice"
+	turnWorkflowHUDSeverityWarning = "warning"
+	turnWorkflowHUDSeverityError   = "error"
+
+	turnWorkflowHUDDismissNone    = "none"
+	turnWorkflowHUDDismissCardOrX = "card_or_x"
+	turnWorkflowHUDDismissXOnly   = "x_only"
 )
 
 const (
@@ -68,14 +87,32 @@ var turnWorkflowHUDCountTemplates = []turnWorkflowHUDCount{
 	{Key: "raw_assistant", LabelKey: "turn_hud.count.raw_assistant"},
 	{Key: "effective_input", LabelKey: "turn_hud.count.effective_input"},
 	{Key: "turn_summary", LabelKey: "turn_hud.count.turn_summary"},
+	{Key: "precise_memory", LabelKey: "turn_hud.count.precise_memory"},
 	{Key: "direct_evidence", LabelKey: "turn_hud.count.direct_evidence"},
-	{Key: "relationship_knowledge", LabelKey: "turn_hud.count.relationship_knowledge"},
+	{Key: "knowledge_graph", LabelKey: "turn_hud.count.knowledge_graph"},
+	{Key: "relationship_state", LabelKey: "turn_hud.count.relationship_state"},
+	{Key: "entity_identity", LabelKey: "turn_hud.count.entity_identity"},
+	{Key: "identity_surface", LabelKey: "turn_hud.count.identity_surface"},
+	{Key: "identity_binding", LabelKey: "turn_hud.count.identity_binding"},
+	{Key: "speaker_attribution", LabelKey: "turn_hud.count.speaker_attribution"},
 	{Key: "subjective_memory", LabelKey: "turn_hud.count.subjective_memory"},
 	{Key: "world_rule", LabelKey: "turn_hud.count.world_rule"},
 	{Key: "character_state", LabelKey: "turn_hud.count.character_state"},
 	{Key: "narrative_state", LabelKey: "turn_hud.count.narrative_state"},
 	{Key: "episode_summary", LabelKey: "turn_hud.count.episode_summary"},
 	{Key: "vector_index", LabelKey: "turn_hud.count.vector_index"},
+}
+
+var turnWorkflowHUDFactTemplates = []turnWorkflowHUDFact{
+	{Key: "host_observation", Owner: "risu_host", Scope: "current_request", Status: "unobserved", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "backend_processing", Owner: "go_backend", Scope: "current_request", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "context_selection", Owner: "go_backend", Scope: "current_request", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "narrative_guidance", Owner: "go_backend", Scope: "current_request", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "payload_delivery", Owner: "risu_host", Scope: "current_request", Status: "unobserved", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "finality", Owner: "go_backend", Scope: "current_request", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "raw_persistence", Owner: "canonical_store", Scope: "current_turn", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "derived_memory", Owner: "canonical_store", Scope: "current_turn", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
+	{Key: "vector_index", Owner: "vector_store", Scope: "current_turn", Status: "pending", Severity: turnWorkflowHUDSeverityNormal},
 }
 
 type turnWorkflowHUDStage struct {
@@ -97,56 +134,152 @@ type turnWorkflowHUDNotice struct {
 	StageKey   string `json:"stage_key,omitempty"`
 }
 
+type turnWorkflowHUDFact struct {
+	Key         string `json:"key"`
+	Owner       string `json:"owner"`
+	Scope       string `json:"scope"`
+	Status      string `json:"status"`
+	Disposition string `json:"disposition,omitempty"`
+	ReasonCode  string `json:"reason_code,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Severity    string `json:"severity"`
+	Count       *int   `json:"count,omitempty"`
+}
+
+type turnWorkflowHUDTurnAlignment struct {
+	HostTurn    int    `json:"host_turn,omitempty"`
+	BackendTurn int    `json:"backend_turn,omitempty"`
+	State       string `json:"state"`
+	ReasonCode  string `json:"reason_code"`
+}
+
+type turnWorkflowHUDMemoryItem struct {
+	SourceRowID   string `json:"source_row_id"`
+	TurnIndex     int    `json:"turn_index,omitempty"`
+	SelectionLane string `json:"selection_lane,omitempty"`
+	Disposition   string `json:"disposition"`
+	ReasonCode    string `json:"reason_code"`
+	Protected     bool   `json:"protected"`
+	Preview       string `json:"preview,omitempty"`
+}
+
+type turnWorkflowHUDMemoryLane struct {
+	Key               string `json:"key"`
+	EligibleCount     int    `json:"eligible_count"`
+	SelectedCount     int    `json:"selected_count"`
+	DeferredCount     int    `json:"deferred_count"`
+	DeduplicatedCount int    `json:"deduplicated_count"`
+}
+
+type turnWorkflowHUDMemorySelection struct {
+	ContractVersion      string                      `json:"contract_version"`
+	Status               string                      `json:"status"`
+	TopKDefinition       string                      `json:"top_k_definition"`
+	VectorCandidateLimit int                         `json:"vector_candidate_limit"`
+	CoreObjective        map[string]any              `json:"core_objective_memory"`
+	DeliveredCount       int                         `json:"delivered_count"`
+	DeferredCount        int                         `json:"deferred_count"`
+	ExclusionReasons     map[string]int              `json:"exclusion_reasons"`
+	Lanes                []turnWorkflowHUDMemoryLane `json:"lanes"`
+	Items                []turnWorkflowHUDMemoryItem `json:"items"`
+	PrivateTextExposed   bool                        `json:"private_text_exposed"`
+}
+
 type turnWorkflowHUDError struct {
-	Code            string                 `json:"code"`
-	MessageKey      string                 `json:"message_key"`
-	StageKey        string                 `json:"stage_key"`
-	Retryable       bool                   `json:"retryable"`
-	PreservedCounts []turnWorkflowHUDCount `json:"preserved_counts"`
+	Code            string                          `json:"code"`
+	MessageKey      string                          `json:"message_key"`
+	StageKey        string                          `json:"stage_key"`
+	Retryable       bool                            `json:"retryable"`
+	PreservedCounts []turnWorkflowHUDCount          `json:"preserved_counts"`
+	Details         []turnWorkflowHUDDetail         `json:"details,omitempty"`
+	RecoveryActions []turnWorkflowHUDRecoveryAction `json:"recovery_actions,omitempty"`
+}
+
+type turnWorkflowHUDRecoveryAction struct {
+	ID                string `json:"id"`
+	LabelKey          string `json:"label_key"`
+	ConfirmTitleKey   string `json:"confirm_title_key"`
+	ConfirmMessageKey string `json:"confirm_message_key"`
+	Status            string `json:"status"`
+	StatusMessageKey  string `json:"status_message_key,omitempty"`
+}
+
+type turnWorkflowHUDDetail struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type turnWorkflowHUDRecoveryRequest struct {
+	ContractVersion string `json:"contract_version"`
+	RequestID       string `json:"request_id"`
+	ActionID        string `json:"action_id"`
 }
 
 type turnWorkflowHUDViewModel struct {
-	ContractVersion string                  `json:"contract_version"`
-	RequestID       string                  `json:"request_id"`
-	ChatSessionID   string                  `json:"chat_session_id"`
-	LogicalTurn     int                     `json:"logical_turn"`
-	Attempt         int                     `json:"attempt"`
-	Revision        int64                   `json:"revision"`
-	Status          string                  `json:"status"`
-	Severity        string                  `json:"severity"`
-	StartedAt       time.Time               `json:"started_at"`
-	UpdatedAt       time.Time               `json:"updated_at"`
-	EndedAt         *time.Time              `json:"ended_at,omitempty"`
-	CurrentStage    *turnWorkflowHUDStage   `json:"current_stage,omitempty"`
-	Stages          []turnWorkflowHUDStage  `json:"stages"`
-	Counts          []turnWorkflowHUDCount  `json:"counts"`
-	Warnings        []turnWorkflowHUDNotice `json:"warnings"`
-	Error           *turnWorkflowHUDError   `json:"error,omitempty"`
+	ContractVersion  string                          `json:"contract_version"`
+	RequestID        string                          `json:"request_id"`
+	ChatSessionID    string                          `json:"chat_session_id"`
+	LogicalTurn      int                             `json:"logical_turn"`
+	HostTurn         int                             `json:"host_turn,omitempty"`
+	BackendTurn      int                             `json:"backend_turn,omitempty"`
+	TurnAlignment    turnWorkflowHUDTurnAlignment    `json:"turn_alignment"`
+	Attempt          int                             `json:"attempt"`
+	Revision         int64                           `json:"revision"`
+	Status           string                          `json:"status"`
+	Severity         string                          `json:"severity"`
+	DismissalPolicy  string                          `json:"dismissal_policy"`
+	StartedAt        time.Time                       `json:"started_at"`
+	UpdatedAt        time.Time                       `json:"updated_at"`
+	EndedAt          *time.Time                      `json:"ended_at,omitempty"`
+	CurrentStage     *turnWorkflowHUDStage           `json:"current_stage,omitempty"`
+	Stages           []turnWorkflowHUDStage          `json:"stages"`
+	Counts           []turnWorkflowHUDCount          `json:"counts"`
+	Facts            []turnWorkflowHUDFact           `json:"facts"`
+	MemorySelection  *turnWorkflowHUDMemorySelection `json:"memory_selection,omitempty"`
+	Warnings         []turnWorkflowHUDNotice         `json:"warnings"`
+	Error            *turnWorkflowHUDError           `json:"error,omitempty"`
+	DisplayMode      string                          `json:"display_mode,omitempty"`
+	TitleKey         string                          `json:"title_key,omitempty"`
+	MessageKey       string                          `json:"message_key,omitempty"`
+	NoticeCode       string                          `json:"notice_code,omitempty"`
+	NoticeKind       string                          `json:"notice_kind,omitempty"`
+	PresentationTone string                          `json:"presentation_tone,omitempty"`
 }
 
 type turnWorkflowHUDEntry struct {
 	view       turnWorkflowHUDViewModel
+	history    []turnWorkflowHUDViewModel
 	changed    chan struct{}
 	attemptKey string
+	sequence   uint64
+}
+
+type turnWorkflowHUDNoticeObservation struct {
+	ContractVersion string `json:"contract_version"`
+	Kind            string `json:"kind"`
+	RequestID       string `json:"request_id"`
+	ChatSessionID   string `json:"chat_session_id"`
+	HostTurn        int    `json:"host_turn,omitempty"`
 }
 
 type turnWorkflowHUDLedger struct {
 	mu              sync.Mutex
 	entries         map[string]*turnWorkflowHUDEntry
+	entryAdded      chan struct{}
 	activeBySession map[string]string
 	latestByTurn    map[string]string
 	attemptByTurn   map[string]int
-	ttl             time.Duration
 	maxEntries      int
+	nextSequence    uint64
 }
 
 func newTurnWorkflowHUDLedger() *turnWorkflowHUDLedger {
 	return &turnWorkflowHUDLedger{
 		entries:         map[string]*turnWorkflowHUDEntry{},
+		entryAdded:      make(chan struct{}),
 		activeBySession: map[string]string{},
 		latestByTurn:    map[string]string{},
 		attemptByTurn:   map[string]int{},
-		ttl:             turnWorkflowHUDEntryTTL,
 		maxEntries:      turnWorkflowHUDMaxEntries,
 	}
 }
@@ -155,6 +288,12 @@ func newTurnWorkflowHUDCounts() []turnWorkflowHUDCount {
 	counts := make([]turnWorkflowHUDCount, len(turnWorkflowHUDCountTemplates))
 	copy(counts, turnWorkflowHUDCountTemplates)
 	return counts
+}
+
+func newTurnWorkflowHUDFacts() []turnWorkflowHUDFact {
+	facts := make([]turnWorkflowHUDFact, len(turnWorkflowHUDFactTemplates))
+	copy(facts, turnWorkflowHUDFactTemplates)
+	return facts
 }
 
 func newTurnWorkflowHUDStages() []turnWorkflowHUDStage {
@@ -181,10 +320,11 @@ func (l *turnWorkflowHUDLedger) begin(requestID, sessionID string, logicalTurn i
 	now := time.Now().UTC()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.pruneLocked(now)
 	if existing := l.entries[requestID]; existing != nil {
 		if logicalTurn > 0 && existing.view.LogicalTurn <= 0 {
 			existing.view.LogicalTurn = logicalTurn
+			existing.view.BackendTurn = logicalTurn
+			syncTurnWorkflowHUDAlignment(&existing.view)
 			l.touchLocked(existing, now)
 		}
 		snapshot := cloneTurnWorkflowHUDView(existing.view)
@@ -205,20 +345,36 @@ func (l *turnWorkflowHUDLedger) begin(requestID, sessionID string, logicalTurn i
 			RequestID:       requestID,
 			ChatSessionID:   sessionID,
 			LogicalTurn:     logicalTurn,
+			BackendTurn:     logicalTurn,
+			TurnAlignment: turnWorkflowHUDTurnAlignment{
+				BackendTurn: logicalTurn,
+				State:       "unobserved",
+				ReasonCode:  "host_turn_unobserved",
+			},
 			Attempt:         1,
 			Revision:        1,
 			Status:          "running",
-			Severity:        "info",
+			Severity:        turnWorkflowHUDSeverityNormal,
+			DismissalPolicy: turnWorkflowHUDDismissNone,
 			StartedAt:       now,
 			UpdatedAt:       now,
 			Stages:          stages,
 			Counts:          newTurnWorkflowHUDCounts(),
+			Facts:           newTurnWorkflowHUDFacts(),
 			Warnings:        []turnWorkflowHUDNotice{},
 		},
 		changed: make(chan struct{}),
 	}
 	entry.view.CurrentStage = cloneTurnWorkflowHUDStage(&entry.view.Stages[0])
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "running", ReasonCode: "prepare_started", Severity: turnWorkflowHUDSeverityNormal,
+	})
+	entry.history = append(entry.history, cloneTurnWorkflowHUDView(entry.view))
 	l.entries[requestID] = entry
+	close(l.entryAdded)
+	l.entryAdded = make(chan struct{})
+	l.advanceSequenceLocked(entry)
 	l.resolveAttemptLocked(entry, now)
 	l.activeBySession[sessionID] = requestID
 	snapshot := cloneTurnWorkflowHUDView(entry.view)
@@ -239,9 +395,140 @@ func (l *turnWorkflowHUDLedger) setLogicalTurn(requestID string, logicalTurn int
 		return
 	}
 	entry.view.LogicalTurn = logicalTurn
+	entry.view.BackendTurn = logicalTurn
+	syncTurnWorkflowHUDAlignment(&entry.view)
 	now := time.Now().UTC()
 	l.resolveAttemptLocked(entry, now)
 	l.touchLocked(entry, now)
+}
+
+func (l *turnWorkflowHUDLedger) setHostTurn(requestID string, hostTurn int, observed bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil {
+		return
+	}
+	if observed && hostTurn > 0 {
+		entry.view.HostTurn = hostTurn
+	} else {
+		entry.view.HostTurn = 0
+	}
+	syncTurnWorkflowHUDAlignment(&entry.view)
+	l.touchLocked(entry, time.Now().UTC())
+}
+
+func (l *turnWorkflowHUDLedger) setFact(requestID string, fact turnWorkflowHUDFact) {
+	if l == nil || strings.TrimSpace(fact.Key) == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil {
+		return
+	}
+	for _, existing := range entry.view.Facts {
+		if existing.Key == fact.Key && turnWorkflowHUDFactsEqual(existing, fact) {
+			return
+		}
+	}
+	setTurnWorkflowHUDFactValue(&entry.view, fact)
+	syncTurnWorkflowHUDPresentation(&entry.view)
+	l.touchLocked(entry, time.Now().UTC())
+}
+
+func turnWorkflowHUDFactsEqual(left, right turnWorkflowHUDFact) bool {
+	if left.Key != right.Key ||
+		left.Owner != right.Owner ||
+		left.Scope != right.Scope ||
+		left.Status != right.Status ||
+		left.Disposition != right.Disposition ||
+		left.ReasonCode != right.ReasonCode ||
+		left.Detail != right.Detail ||
+		left.Severity != right.Severity {
+		return false
+	}
+	if left.Count == nil || right.Count == nil {
+		return left.Count == nil && right.Count == nil
+	}
+	return *left.Count == *right.Count
+}
+
+func (l *turnWorkflowHUDLedger) setPersistenceFacts(
+	requestID string,
+	rawStatus string,
+	rawCount int,
+	derivedStatus string,
+	derivedCount int,
+	vectorStatus string,
+	vectorCount int,
+) {
+	if l == nil {
+		return
+	}
+	for _, fact := range []turnWorkflowHUDFact{
+		turnWorkflowHUDPersistenceFact("raw_persistence", "canonical_store", rawStatus, rawCount),
+		turnWorkflowHUDPersistenceFact("derived_memory", "canonical_store", derivedStatus, derivedCount),
+		turnWorkflowHUDPersistenceFact("vector_index", "vector_store", vectorStatus, vectorCount),
+	} {
+		l.setFact(requestID, fact)
+	}
+}
+
+func (l *turnWorkflowHUDLedger) setPersistenceFailureDetail(
+	requestID, key, reasonCode, detail string,
+	committedCount int,
+) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil {
+		return
+	}
+	for index := range entry.view.Facts {
+		fact := &entry.view.Facts[index]
+		if fact.Key != strings.TrimSpace(key) {
+			continue
+		}
+		fact.Status = "failed"
+		fact.Disposition = "dropped"
+		fact.ReasonCode = strings.TrimSpace(reasonCode)
+		fact.Detail = strings.TrimSpace(detail)
+		fact.Severity = turnWorkflowHUDSeverityError
+		fact.Count = intValuePtr(maxInt(0, committedCount))
+		break
+	}
+	syncTurnWorkflowHUDPresentation(&entry.view)
+	l.touchLocked(entry, time.Now().UTC())
+}
+
+func (l *turnWorkflowHUDLedger) addNotice(requestID, code, messageKey, stageKey string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil || turnWorkflowHUDTerminal(entry.view.Status) {
+		return
+	}
+	notice := turnWorkflowHUDNotice{
+		Code: strings.TrimSpace(code), MessageKey: strings.TrimSpace(messageKey), StageKey: strings.TrimSpace(stageKey),
+	}
+	for _, existing := range entry.view.Warnings {
+		if existing.Code == notice.Code && existing.StageKey == notice.StageKey {
+			return
+		}
+	}
+	entry.view.Warnings = append(entry.view.Warnings, notice)
+	l.touchLocked(entry, time.Now().UTC())
 }
 
 func (l *turnWorkflowHUDLedger) startStage(requestID, stageKey string) {
@@ -331,7 +618,7 @@ func (l *turnWorkflowHUDLedger) addWarning(requestID, code, messageKey, stageKey
 		}
 	}
 	entry.view.Warnings = append(entry.view.Warnings, notice)
-	entry.view.Severity = "warning"
+	entry.view.Severity = turnWorkflowHUDSeverityWarning
 	l.touchLocked(entry, time.Now().UTC())
 }
 
@@ -347,10 +634,29 @@ func (l *turnWorkflowHUDLedger) awaitFinal(requestID string) {
 		return
 	}
 	entry.view.Status = "awaiting_final_output"
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "awaiting_final_output", Disposition: "deferred", ReasonCode: "awaiting_risu_host_final", Severity: turnWorkflowHUDSeverityNotice,
+	})
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "waiting", Disposition: "deferred", ReasonCode: "awaiting_risu_host_final", Severity: turnWorkflowHUDSeverityNotice,
+	})
+	if entry.view.Severity == turnWorkflowHUDSeverityNormal {
+		entry.view.Severity = turnWorkflowHUDSeverityNotice
+	}
 	l.touchLocked(entry, time.Now().UTC())
 }
 
 func (l *turnWorkflowHUDLedger) fail(requestID, code, messageKey, stageKey string, retryable bool) {
+	l.failWithDetails(requestID, code, messageKey, stageKey, retryable, nil)
+}
+
+func (l *turnWorkflowHUDLedger) failWithDetails(
+	requestID, code, messageKey, stageKey string,
+	retryable bool,
+	details []turnWorkflowHUDDetail,
+) {
 	if l == nil {
 		return
 	}
@@ -374,16 +680,90 @@ func (l *turnWorkflowHUDLedger) fail(requestID, code, messageKey, stageKey strin
 		entry.view.CurrentStage = cloneTurnWorkflowHUDStage(stage)
 	}
 	entry.view.Status = "failed"
-	entry.view.Severity = "error"
+	entry.view.Severity = turnWorkflowHUDSeverityError
+	failureDetail := turnWorkflowHUDDetailsText(details)
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "failed", Disposition: "dropped", ReasonCode: strings.TrimSpace(code), Detail: failureDetail, Severity: turnWorkflowHUDSeverityError,
+	})
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "failed", Disposition: "dropped", ReasonCode: strings.TrimSpace(code), Detail: failureDetail, Severity: turnWorkflowHUDSeverityError,
+	})
 	entry.view.EndedAt = timePtr(now)
 	entry.view.Error = &turnWorkflowHUDError{
 		Code: strings.TrimSpace(code), MessageKey: strings.TrimSpace(messageKey), StageKey: strings.TrimSpace(stageKey),
 		Retryable: retryable, PreservedCounts: cloneTurnWorkflowHUDCounts(entry.view.Counts),
+		Details: cloneTurnWorkflowHUDDetails(details),
+		RecoveryActions: turnWorkflowHUDRecoveryActions(
+			code,
+			entry.view.ChatSessionID,
+			entry.view.LogicalTurn,
+			details,
+		),
 	}
 	if l.activeBySession[entry.view.ChatSessionID] == entry.view.RequestID {
 		delete(l.activeBySession, entry.view.ChatSessionID)
 	}
 	l.touchLocked(entry, now)
+}
+
+func turnWorkflowHUDRecoveryActions(
+	code string,
+	chatSessionID string,
+	logicalTurn int,
+	details []turnWorkflowHUDDetail,
+) []turnWorkflowHUDRecoveryAction {
+	if strings.TrimSpace(code) == "" ||
+		strings.TrimSpace(chatSessionID) == "" || logicalTurn <= 0 ||
+		!turnWorkflowHUDDetailMatches(details, "reprocessing", "queued") {
+		return nil
+	}
+	return []turnWorkflowHUDRecoveryAction{
+		{
+			ID:                turnWorkflowHUDRecoveryRetryDerivedTurn,
+			LabelKey:          "turn_hud.recovery.retry_derived_turn",
+			ConfirmTitleKey:   "turn_hud.recovery.confirm_title",
+			ConfirmMessageKey: "turn_hud.recovery.confirm_retry_derived_turn",
+			Status:            "available",
+		},
+	}
+}
+
+func turnWorkflowHUDDetailMatches(details []turnWorkflowHUDDetail, key, value string) bool {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	for _, detail := range details {
+		if strings.TrimSpace(detail.Key) == key && strings.TrimSpace(detail.Value) == value {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *turnWorkflowHUDLedger) setRecoveryActionStatus(
+	requestID, actionID, status, statusMessageKey string,
+) (turnWorkflowHUDViewModel, bool) {
+	if l == nil {
+		return turnWorkflowHUDViewModel{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil || entry.view.Error == nil {
+		return turnWorkflowHUDViewModel{}, false
+	}
+	for index := range entry.view.Error.RecoveryActions {
+		action := &entry.view.Error.RecoveryActions[index]
+		if action.ID != strings.TrimSpace(actionID) {
+			continue
+		}
+		action.Status = strings.TrimSpace(status)
+		action.StatusMessageKey = strings.TrimSpace(statusMessageKey)
+		l.touchLocked(entry, time.Now().UTC())
+		return cloneTurnWorkflowHUDView(entry.view), true
+	}
+	return turnWorkflowHUDViewModel{}, false
 }
 
 func (l *turnWorkflowHUDLedger) invalidate(requestID, reasonCode string) {
@@ -432,7 +812,26 @@ func (l *turnWorkflowHUDLedger) setCounts(requestID string, values map[string]in
 	l.touchLocked(entry, time.Now().UTC())
 }
 
+func (l *turnWorkflowHUDLedger) setMemorySelection(requestID string, selection turnWorkflowHUDMemorySelection) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[strings.TrimSpace(requestID)]
+	if entry == nil {
+		return
+	}
+	copyValue := cloneTurnWorkflowHUDMemorySelection(&selection)
+	entry.view.MemorySelection = copyValue
+	l.touchLocked(entry, time.Now().UTC())
+}
+
 func (l *turnWorkflowHUDLedger) complete(requestID string) {
+	l.completeWithNotice(requestID, "", "", "")
+}
+
+func (l *turnWorkflowHUDLedger) completeWithNotice(requestID, titleKey, messageKey, noticeCode string) {
 	if l == nil {
 		return
 	}
@@ -441,6 +840,19 @@ func (l *turnWorkflowHUDLedger) complete(requestID string) {
 	entry := l.entries[strings.TrimSpace(requestID)]
 	if entry == nil || entry.view.Status == "failed" || entry.view.Status == "invalidated" {
 		return
+	}
+	if strings.TrimSpace(titleKey) != "" || strings.TrimSpace(messageKey) != "" || strings.TrimSpace(noticeCode) != "" {
+		entry.view.DisplayMode = "notice"
+		entry.view.TitleKey = strings.TrimSpace(titleKey)
+		entry.view.MessageKey = strings.TrimSpace(messageKey)
+		entry.view.NoticeCode = strings.TrimSpace(noticeCode)
+		entry.view.NoticeKind = turnWorkflowHUDNoticeKind(noticeCode)
+		if entry.view.NoticeKind == "ooc" {
+			entry.view.PresentationTone = "attention"
+		}
+		if entry.view.Severity == turnWorkflowHUDSeverityNormal {
+			entry.view.Severity = turnWorkflowHUDSeverityNotice
+		}
 	}
 	now := time.Now().UTC()
 	for index := range entry.view.Stages {
@@ -462,11 +874,39 @@ func (l *turnWorkflowHUDLedger) complete(requestID string) {
 		stage.DurationMS = turnWorkflowHUDDurationMS(stage.StartedAt, stage.EndedAt)
 		entry.view.CurrentStage = cloneTurnWorkflowHUDStage(stage)
 	}
+	priorSeverity := normalizeTurnWorkflowHUDSeverity(entry.view.Severity)
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "completed", Disposition: "delivered", ReasonCode: "workflow_completed", Severity: turnWorkflowHUDSeverityNormal,
+	})
+	finalityStatus := "accepted"
+	finalityDisposition := "delivered"
+	finalityReason := "active_final_accepted"
+	finalitySeverity := turnWorkflowHUDSeverityNormal
+	switch entry.view.NoticeKind {
+	case "ooc":
+		finalityStatus = "cancelled"
+		finalityDisposition = "dropped"
+		finalityReason = "ooc_input_cancelled"
+		finalitySeverity = turnWorkflowHUDSeverityNotice
+	case "duplicate":
+		finalityStatus = "existing_preserved"
+		finalityDisposition = "dropped"
+		finalityReason = strings.ToLower(strings.TrimSpace(entry.view.NoticeCode))
+		finalitySeverity = normalizeTurnWorkflowHUDSeverity(entry.view.Severity)
+		if finalitySeverity == turnWorkflowHUDSeverityNormal {
+			finalitySeverity = turnWorkflowHUDSeverityNotice
+		}
+	}
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: finalityStatus, Disposition: finalityDisposition, ReasonCode: finalityReason, Severity: finalitySeverity,
+	})
+	completionSeverity := turnWorkflowHUDCompletionSeverity(entry.view, priorSeverity)
 	entry.view.Status = "completed"
-	entry.view.Severity = "info"
-	if len(entry.view.Warnings) > 0 {
+	entry.view.Severity = completionSeverity
+	if completionSeverity == turnWorkflowHUDSeverityWarning {
 		entry.view.Status = "completed_with_warning"
-		entry.view.Severity = "warning"
 	}
 	entry.view.EndedAt = timePtr(now)
 	if l.activeBySession[entry.view.ChatSessionID] == entry.view.RequestID {
@@ -481,7 +921,6 @@ func (l *turnWorkflowHUDLedger) snapshot(requestID string) (turnWorkflowHUDViewM
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.pruneLocked(time.Now().UTC())
 	entry := l.entries[strings.TrimSpace(requestID)]
 	if entry == nil {
 		return turnWorkflowHUDViewModel{}, false
@@ -507,14 +946,10 @@ func (l *turnWorkflowHUDLedger) waitSnapshot(ctx context.Context, requestID stri
 	if wait < 0 {
 		wait = 0
 	}
-	if wait > turnWorkflowHUDMaxWait {
-		wait = turnWorkflowHUDMaxWait
-	}
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	for {
 		l.mu.Lock()
-		l.pruneLocked(time.Now().UTC())
 		entry := l.entries[strings.TrimSpace(requestID)]
 		if entry == nil {
 			l.mu.Unlock()
@@ -537,11 +972,76 @@ func (l *turnWorkflowHUDLedger) waitSnapshot(ctx context.Context, requestID stri
 	}
 }
 
+func (l *turnWorkflowHUDLedger) streamSnapshots(
+	ctx context.Context,
+	requestID string,
+	afterRevision int64,
+	emit func(turnWorkflowHUDViewModel) error,
+) (bool, error) {
+	if l == nil || emit == nil {
+		return false, nil
+	}
+	requestID = strings.TrimSpace(requestID)
+	var entry *turnWorkflowHUDEntry
+	for entry == nil {
+		l.mu.Lock()
+		entry = l.entries[requestID]
+		entryAdded := l.entryAdded
+		l.mu.Unlock()
+		if entry != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-entryAdded:
+		}
+	}
+	for {
+		l.mu.Lock()
+		pending := make([]turnWorkflowHUDViewModel, 0)
+		for _, historical := range entry.history {
+			if historical.Revision > afterRevision {
+				pending = append(pending, cloneTurnWorkflowHUDView(historical))
+			}
+		}
+		changed := entry.changed
+		terminal := turnWorkflowHUDTerminal(entry.view.Status)
+		l.mu.Unlock()
+
+		for _, snapshot := range pending {
+			if err := emit(snapshot); err != nil {
+				return true, err
+			}
+			afterRevision = snapshot.Revision
+			if turnWorkflowHUDTerminal(snapshot.Status) {
+				return true, nil
+			}
+		}
+		if terminal {
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
 func (l *turnWorkflowHUDLedger) touchLocked(entry *turnWorkflowHUDEntry, now time.Time) {
+	syncTurnWorkflowHUDPresentation(&entry.view)
 	entry.view.Revision++
 	entry.view.UpdatedAt = now
+	l.advanceSequenceLocked(entry)
+	entry.history = append(entry.history, cloneTurnWorkflowHUDView(entry.view))
 	close(entry.changed)
 	entry.changed = make(chan struct{})
+}
+
+func (l *turnWorkflowHUDLedger) advanceSequenceLocked(entry *turnWorkflowHUDEntry) {
+	l.nextSequence++
+	entry.sequence = l.nextSequence
 }
 
 func (l *turnWorkflowHUDLedger) invalidateLocked(entry *turnWorkflowHUDEntry, reasonCode string, now time.Time) {
@@ -559,7 +1059,11 @@ func (l *turnWorkflowHUDLedger) invalidateLocked(entry *turnWorkflowHUDEntry, re
 		}
 	}
 	entry.view.Status = "invalidated"
-	entry.view.Severity = "warning"
+	entry.view.Severity = turnWorkflowHUDSeverityWarning
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "invalidated", Disposition: "dropped", ReasonCode: strings.TrimSpace(reasonCode), Severity: turnWorkflowHUDSeverityWarning,
+	})
 	entry.view.EndedAt = timePtr(now)
 	if l.activeBySession[entry.view.ChatSessionID] == entry.view.RequestID {
 		delete(l.activeBySession, entry.view.ChatSessionID)
@@ -601,8 +1105,16 @@ func (l *turnWorkflowHUDLedger) supersedeAttemptLocked(entry *turnWorkflowHUDEnt
 		entry.view.CurrentStage = cloneTurnWorkflowHUDStage(stage)
 	}
 	entry.view.Status = "invalidated"
-	entry.view.Severity = "warning"
+	entry.view.Severity = turnWorkflowHUDSeverityWarning
 	entry.view.Error = nil
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "invalidated", Disposition: "dropped", ReasonCode: strings.TrimSpace(reasonCode), Severity: turnWorkflowHUDSeverityWarning,
+	})
+	setTurnWorkflowHUDFactValue(&entry.view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "invalidated", Disposition: "dropped", ReasonCode: strings.TrimSpace(reasonCode), Severity: turnWorkflowHUDSeverityWarning,
+	})
 	entry.view.EndedAt = timePtr(now)
 	if l.activeBySession[entry.view.ChatSessionID] == entry.view.RequestID {
 		delete(l.activeBySession, entry.view.ChatSessionID)
@@ -614,37 +1126,24 @@ func turnWorkflowHUDAttemptKey(sessionID string, logicalTurn int) string {
 	return strings.TrimSpace(sessionID) + "\x00" + strconv.Itoa(logicalTurn)
 }
 
-func (l *turnWorkflowHUDLedger) pruneLocked(now time.Time) {
-	for requestID, entry := range l.entries {
-		if !turnWorkflowHUDTerminal(entry.view.Status) && now.Sub(entry.view.UpdatedAt) > l.ttl {
-			l.invalidateLocked(entry, "workflow_expired", now)
-			continue
-		}
-		if turnWorkflowHUDTerminal(entry.view.Status) && now.Sub(entry.view.UpdatedAt) > l.ttl {
-			l.deleteEntryLocked(requestID)
-		}
-	}
-}
-
 func (l *turnWorkflowHUDLedger) ensureCapacityLocked(now time.Time) {
-	l.pruneLocked(now)
 	for len(l.entries) >= l.maxEntries {
 		oldestID := ""
-		var oldest time.Time
+		var oldestSequence uint64
 		for requestID, entry := range l.entries {
 			if !turnWorkflowHUDTerminal(entry.view.Status) {
 				continue
 			}
-			if oldestID == "" || entry.view.UpdatedAt.Before(oldest) {
+			if oldestID == "" || entry.sequence < oldestSequence {
 				oldestID = requestID
-				oldest = entry.view.UpdatedAt
+				oldestSequence = entry.sequence
 			}
 		}
 		if oldestID == "" {
 			for requestID, entry := range l.entries {
-				if oldestID == "" || entry.view.UpdatedAt.Before(oldest) {
+				if oldestID == "" || entry.sequence < oldestSequence {
 					oldestID = requestID
-					oldest = entry.view.UpdatedAt
+					oldestSequence = entry.sequence
 				}
 			}
 		}
@@ -680,6 +1179,169 @@ func turnWorkflowHUDTerminal(status string) bool {
 	}
 }
 
+func normalizeTurnWorkflowHUDSeverity(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case turnWorkflowHUDSeverityError, "fail", "failed":
+		return turnWorkflowHUDSeverityError
+	case turnWorkflowHUDSeverityWarning, "warn":
+		return turnWorkflowHUDSeverityWarning
+	case turnWorkflowHUDSeverityNotice, "info", "informational":
+		return turnWorkflowHUDSeverityNotice
+	default:
+		return turnWorkflowHUDSeverityNormal
+	}
+}
+
+func syncTurnWorkflowHUDPresentation(view *turnWorkflowHUDViewModel) {
+	if view == nil {
+		return
+	}
+	view.Severity = normalizeTurnWorkflowHUDSeverity(view.Severity)
+	switch {
+	case !turnWorkflowHUDTerminal(view.Status):
+		view.DismissalPolicy = turnWorkflowHUDDismissNone
+	case view.Severity == turnWorkflowHUDSeverityWarning || view.Severity == turnWorkflowHUDSeverityError:
+		view.DismissalPolicy = turnWorkflowHUDDismissXOnly
+	default:
+		view.DismissalPolicy = turnWorkflowHUDDismissCardOrX
+	}
+}
+
+func syncTurnWorkflowHUDAlignment(view *turnWorkflowHUDViewModel) {
+	if view == nil {
+		return
+	}
+	view.LogicalTurn = view.BackendTurn
+	alignment := turnWorkflowHUDTurnAlignment{
+		HostTurn: view.HostTurn, BackendTurn: view.BackendTurn,
+		State: "unobserved", ReasonCode: "turn_alignment_observation_incomplete",
+	}
+	switch {
+	case view.HostTurn <= 0:
+		alignment.ReasonCode = "host_turn_unobserved"
+	case view.BackendTurn <= 0:
+		alignment.ReasonCode = "backend_turn_unobserved"
+	case view.HostTurn == view.BackendTurn:
+		alignment.State = "aligned"
+		alignment.ReasonCode = "host_backend_turn_aligned"
+	case view.HostTurn > view.BackendTurn:
+		alignment.State = "host_ahead"
+		alignment.ReasonCode = "host_turn_ahead_of_backend"
+	default:
+		alignment.State = "backend_ahead"
+		alignment.ReasonCode = "backend_turn_ahead_of_host"
+	}
+	view.TurnAlignment = alignment
+}
+
+func setTurnWorkflowHUDFactValue(view *turnWorkflowHUDViewModel, fact turnWorkflowHUDFact) {
+	if view == nil {
+		return
+	}
+	fact.Key = strings.TrimSpace(fact.Key)
+	if fact.Key == "" {
+		return
+	}
+	if strings.TrimSpace(fact.Owner) == "" {
+		fact.Owner = "go_backend"
+	}
+	if strings.TrimSpace(fact.Scope) == "" {
+		fact.Scope = "current_request"
+	}
+	if strings.TrimSpace(fact.Status) == "" {
+		fact.Status = "unobserved"
+	}
+	switch fact.Disposition {
+	case "", "eligible", "selected", "delivered", "deferred", "dropped":
+	default:
+		fact.Disposition = "deferred"
+		fact.ReasonCode = firstNonEmpty(fact.ReasonCode, "invalid_disposition_normalized")
+	}
+	fact.Severity = normalizeTurnWorkflowHUDSeverity(fact.Severity)
+	if turnWorkflowHUDSeverityRank(fact.Severity) > turnWorkflowHUDSeverityRank(view.Severity) {
+		view.Severity = fact.Severity
+	}
+	for index := range view.Facts {
+		if view.Facts[index].Key == fact.Key {
+			view.Facts[index] = fact
+			return
+		}
+	}
+	view.Facts = append(view.Facts, fact)
+}
+
+func turnWorkflowHUDSeverityRank(value string) int {
+	switch normalizeTurnWorkflowHUDSeverity(value) {
+	case turnWorkflowHUDSeverityError:
+		return 3
+	case turnWorkflowHUDSeverityWarning:
+		return 2
+	case turnWorkflowHUDSeverityNotice:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func turnWorkflowHUDCompletionSeverity(view turnWorkflowHUDViewModel, priorSeverity string) string {
+	severity := turnWorkflowHUDSeverityNormal
+	if strings.TrimSpace(view.NoticeCode) != "" {
+		severity = turnWorkflowHUDSeverityNotice
+	}
+	for _, fact := range view.Facts {
+		if turnWorkflowHUDSeverityRank(fact.Severity) > turnWorkflowHUDSeverityRank(severity) {
+			severity = normalizeTurnWorkflowHUDSeverity(fact.Severity)
+		}
+	}
+	priorSeverity = normalizeTurnWorkflowHUDSeverity(priorSeverity)
+	if priorSeverity == turnWorkflowHUDSeverityWarning || priorSeverity == turnWorkflowHUDSeverityError {
+		if turnWorkflowHUDSeverityRank(priorSeverity) > turnWorkflowHUDSeverityRank(severity) {
+			severity = priorSeverity
+		}
+	}
+	if view.Error != nil {
+		severity = turnWorkflowHUDSeverityError
+	}
+	return severity
+}
+
+func intValuePtr(value int) *int {
+	out := value
+	return &out
+}
+
+func turnWorkflowHUDPersistenceFact(key, owner, status string, count int) turnWorkflowHUDFact {
+	status = strings.ToLower(strings.TrimSpace(status))
+	fact := turnWorkflowHUDFact{
+		Key: key, Owner: owner, Scope: "current_turn", Status: firstNonEmpty(status, "unobserved"),
+		ReasonCode: firstNonEmpty(status, "persistence_status_unobserved"),
+		Severity:   turnWorkflowHUDSeverityNormal,
+		Count:      intValuePtr(maxInt(0, count)),
+	}
+	switch {
+	case status == "ok" || status == "saved" || status == "upserted" || status == "empty" || status == "existing":
+		fact.Disposition = "delivered"
+	case status == "delayed" || status == "queued" || status == "pending" || status == "not_requested":
+		fact.Disposition = "deferred"
+		fact.Severity = turnWorkflowHUDSeverityNotice
+	case status == "skipped":
+		fact.Disposition = "dropped"
+		fact.Severity = turnWorkflowHUDSeverityNotice
+	case status == "vector_not_configured" || status == "missing_embedding_config" || status == "missing_config" ||
+		status == "missing_embedding" || status == "empty_embedding" || status == "missing_source_row_id" ||
+		status == "not_checked_no_raw":
+		fact.Disposition = "dropped"
+		fact.Severity = turnWorkflowHUDSeverityWarning
+	case status == "error" || strings.HasPrefix(status, "error:") || status == "failed":
+		fact.Disposition = "dropped"
+		fact.Severity = turnWorkflowHUDSeverityError
+	default:
+		fact.Disposition = "deferred"
+		fact.Severity = turnWorkflowHUDSeverityNotice
+	}
+	return fact
+}
+
 func turnWorkflowHUDStageIndex(stages []turnWorkflowHUDStage, key string) int {
 	for index, stage := range stages {
 		if stage.Key == key {
@@ -687,6 +1349,54 @@ func turnWorkflowHUDStageIndex(stages []turnWorkflowHUDStage, key string) int {
 		}
 	}
 	return -1
+}
+
+func (l *turnWorkflowHUDLedger) latestSnapshotForSession(sessionID string) (turnWorkflowHUDViewModel, bool) {
+	if l == nil || strings.TrimSpace(sessionID) == "" {
+		return turnWorkflowHUDViewModel{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var latest *turnWorkflowHUDEntry
+	for _, entry := range l.entries {
+		if entry == nil || entry.view.ChatSessionID != strings.TrimSpace(sessionID) {
+			continue
+		}
+		if latest == nil || entry.view.UpdatedAt.After(latest.view.UpdatedAt) {
+			latest = entry
+		}
+	}
+	if latest == nil {
+		return turnWorkflowHUDViewModel{}, false
+	}
+	return cloneTurnWorkflowHUDView(latest.view), true
+}
+
+func (l *turnWorkflowHUDLedger) recordOperation(view turnWorkflowHUDViewModel) turnWorkflowHUDViewModel {
+	if l == nil || strings.TrimSpace(view.RequestID) == "" || strings.TrimSpace(view.ChatSessionID) == "" {
+		return view
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now().UTC()
+	if existing := l.entries[view.RequestID]; existing != nil &&
+		existing.view.ChatSessionID == view.ChatSessionID &&
+		existing.view.NoticeCode == view.NoticeCode {
+		return cloneTurnWorkflowHUDView(existing.view)
+	}
+	view = cloneTurnWorkflowHUDView(view)
+	view.UpdatedAt = now
+	entry := &turnWorkflowHUDEntry{
+		view:    view,
+		history: []turnWorkflowHUDViewModel{cloneTurnWorkflowHUDView(view)},
+		changed: make(chan struct{}),
+	}
+	l.entries[view.RequestID] = entry
+	close(l.entryAdded)
+	l.entryAdded = make(chan struct{})
+	l.advanceSequenceLocked(entry)
+	l.ensureCapacityLocked(now)
+	return cloneTurnWorkflowHUDView(view)
 }
 
 func turnWorkflowHUDCountIndex(counts []turnWorkflowHUDCount, key string) int {
@@ -702,18 +1412,193 @@ func cloneTurnWorkflowHUDView(source turnWorkflowHUDViewModel) turnWorkflowHUDVi
 	out := source
 	out.Stages = append([]turnWorkflowHUDStage(nil), source.Stages...)
 	out.Counts = cloneTurnWorkflowHUDCounts(source.Counts)
+	out.Facts = append([]turnWorkflowHUDFact(nil), source.Facts...)
+	for index := range out.Facts {
+		if source.Facts[index].Count != nil {
+			out.Facts[index].Count = intValuePtr(*source.Facts[index].Count)
+		}
+	}
 	out.Warnings = append([]turnWorkflowHUDNotice(nil), source.Warnings...)
+	out.MemorySelection = cloneTurnWorkflowHUDMemorySelection(source.MemorySelection)
 	out.CurrentStage = cloneTurnWorkflowHUDStage(source.CurrentStage)
 	if source.Error != nil {
 		errorCopy := *source.Error
 		errorCopy.PreservedCounts = cloneTurnWorkflowHUDCounts(source.Error.PreservedCounts)
+		errorCopy.Details = cloneTurnWorkflowHUDDetails(source.Error.Details)
+		errorCopy.RecoveryActions = append(
+			[]turnWorkflowHUDRecoveryAction(nil),
+			source.Error.RecoveryActions...,
+		)
 		out.Error = &errorCopy
 	}
 	return out
 }
 
+func cloneTurnWorkflowHUDMemorySelection(source *turnWorkflowHUDMemorySelection) *turnWorkflowHUDMemorySelection {
+	if source == nil {
+		return nil
+	}
+	out := *source
+	out.Items = append([]turnWorkflowHUDMemoryItem(nil), source.Items...)
+	out.Lanes = append([]turnWorkflowHUDMemoryLane(nil), source.Lanes...)
+	out.ExclusionReasons = map[string]int{}
+	for key, value := range source.ExclusionReasons {
+		out.ExclusionReasons[key] = value
+	}
+	out.CoreObjective = map[string]any{}
+	for key, value := range source.CoreObjective {
+		out.CoreObjective[key] = value
+	}
+	return &out
+}
+
+func buildTurnWorkflowHUDMemorySelection(lineage, plan map[string]any) turnWorkflowHUDMemorySelection {
+	rawCore := mapFromAny(plan["core_objective_memory"])
+	core := map[string]any{}
+	for _, key := range []string{
+		"contract_version", "status", "requested_max_items", "eligible_distinct_count",
+		"candidate_count", "delivered_count", "deferred_by_limit_count",
+		"deferred_by_budget_count", "missing_to_limit", "gap_reason", "garbage_fill",
+		"top_k_reinterpreted", "counted_lane", "all_lanes_remain_char_budgeted",
+	} {
+		if value, exists := rawCore[key]; exists {
+			core[key] = value
+		}
+	}
+	out := turnWorkflowHUDMemorySelection{
+		ContractVersion:      "turn_workflow_memory_selection.v1",
+		Status:               extractionStringFromAny(lineage["status"]),
+		TopKDefinition:       "vector_memory_search_limit_only",
+		VectorCandidateLimit: intFromAny(lineage["top_k_memory_target"], 0),
+		CoreObjective:        core,
+		ExclusionReasons:     map[string]int{},
+		Lanes:                []turnWorkflowHUDMemoryLane{},
+		Items:                []turnWorkflowHUDMemoryItem{},
+		PrivateTextExposed:   false,
+	}
+	for _, raw := range prepareTurnMemoryLineageSlice(plan["classes"]) {
+		class := mapFromAny(raw)
+		out.Lanes = append(out.Lanes, turnWorkflowHUDMemoryLane{
+			Key:               extractionStringFromAny(class["key"]),
+			EligibleCount:     intFromAny(class["eligible_count"], 0),
+			SelectedCount:     intFromAny(class["selected_count"], 0),
+			DeferredCount:     intFromAny(class["deferred_count"], 0),
+			DeduplicatedCount: intFromAny(class["deduplicated_count"], 0),
+		})
+	}
+	for _, raw := range prepareTurnMemoryLineageSlice(lineage["items"]) {
+		item := mapFromAny(raw)
+		delivered := boolFromAny(item["delivered"])
+		disposition := "deferred"
+		if delivered {
+			disposition = "delivered"
+			out.DeliveredCount++
+		} else {
+			out.DeferredCount++
+		}
+		reason := extractionFirstNonEmpty(
+			extractionStringFromAny(item["reason_code"]),
+			extractionStringFromAny(item["delivery_status"]),
+		)
+		if reason == "" {
+			reason = map[bool]string{true: "selected_within_final_delivery_plan", false: "not_selected"}[delivered]
+		}
+		if !delivered {
+			out.ExclusionReasons[reason]++
+		}
+		protected := boolFromAny(item["protected_guard"])
+		preview := ""
+		if delivered && !protected {
+			preview = compactPrepareTurnLine(extractionStringFromAny(item["final_text"]), 140)
+		}
+		sourceRowID := ""
+		if item["source_row_id"] != nil {
+			sourceRowID = strings.TrimSpace(fmt.Sprint(item["source_row_id"]))
+		}
+		out.Items = append(out.Items, turnWorkflowHUDMemoryItem{
+			SourceRowID:   sourceRowID,
+			TurnIndex:     intFromAny(item["turn_index"], 0),
+			SelectionLane: extractionStringFromAny(item["selection_lane"]),
+			Disposition:   disposition,
+			ReasonCode:    reason,
+			Protected:     protected,
+			Preview:       preview,
+		})
+	}
+	for _, key := range []string{"pre_render_protected_duplicates", "protected_relevance_dropped"} {
+		for _, raw := range prepareTurnMemoryLineageSlice(lineage[key]) {
+			item := mapFromAny(raw)
+			reason := extractionFirstNonEmpty(extractionStringFromAny(item["reason_code"]), extractionStringFromAny(item["reason"]))
+			if reason == "" {
+				reason = "not_selected"
+			}
+			out.ExclusionReasons[reason]++
+		}
+	}
+	if out.Status == "" {
+		out.Status = "empty"
+	}
+	return out
+}
+
+func buildTurnWorkflowHUDNarrativeGuidanceFact(status, reasonCode string) turnWorkflowHUDFact {
+	status = strings.TrimSpace(status)
+	fact := turnWorkflowHUDFact{
+		Key:         "narrative_guidance",
+		Owner:       "go_backend",
+		Scope:       "current_request",
+		Status:      status,
+		Disposition: "deferred",
+		ReasonCode:  status,
+		Severity:    turnWorkflowHUDSeverityNotice,
+	}
+	switch status {
+	case "applied":
+		fact.Disposition = "delivered"
+		fact.ReasonCode = "supervisor_source_backed_guidance_delivered"
+		fact.Severity = turnWorkflowHUDSeverityNormal
+	case "valid_empty":
+		fact.Disposition = "selected"
+		fact.ReasonCode = "supervisor_valid_empty"
+		fact.Severity = turnWorkflowHUDSeverityNormal
+	case "unsupported_rejected":
+		fact.Disposition = "dropped"
+		fact.ReasonCode = "supervisor_unsupported_proposal_rejected"
+	case "malformed_failed_open", "failed_open":
+		fact.Disposition = "dropped"
+		fact.Severity = turnWorkflowHUDSeverityWarning
+	case "disabled":
+		fact.Disposition = "dropped"
+		fact.Severity = turnWorkflowHUDSeverityNormal
+	}
+	if reasonCode = strings.TrimSpace(reasonCode); reasonCode != "" {
+		fact.ReasonCode = reasonCode
+	}
+	return fact
+}
+
 func cloneTurnWorkflowHUDCounts(source []turnWorkflowHUDCount) []turnWorkflowHUDCount {
 	return append([]turnWorkflowHUDCount(nil), source...)
+}
+
+func cloneTurnWorkflowHUDDetails(source []turnWorkflowHUDDetail) []turnWorkflowHUDDetail {
+	return append([]turnWorkflowHUDDetail(nil), source...)
+}
+
+func turnWorkflowHUDDetailsText(details []turnWorkflowHUDDetail) string {
+	parts := make([]string, 0, len(details))
+	for _, detail := range details {
+		key := strings.TrimSpace(detail.Key)
+		value := strings.TrimSpace(detail.Value)
+		if value == "" {
+			continue
+		}
+		if key == "" {
+			key = "detail"
+		}
+		parts = append(parts, key+"="+value)
+	}
+	return strings.Join(parts, " / ")
 }
 
 func cloneTurnWorkflowHUDStage(source *turnWorkflowHUDStage) *turnWorkflowHUDStage {
@@ -736,6 +1621,226 @@ func turnWorkflowHUDDurationMS(startedAt, endedAt *time.Time) int64 {
 	return endedAt.Sub(*startedAt).Milliseconds()
 }
 
+func (s *Server) handleTurnWorkflowHUDRecovery(w http.ResponseWriter, r *http.Request) {
+	var req turnWorkflowHUDRecoveryRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid turn workflow recovery request")
+		return
+	}
+	req.ContractVersion = strings.TrimSpace(req.ContractVersion)
+	req.RequestID = strings.TrimSpace(req.RequestID)
+	req.ActionID = strings.TrimSpace(req.ActionID)
+	if req.ContractVersion != turnWorkflowHUDRecoveryRequestContractVersion {
+		writeError(w, http.StatusBadRequest, "unsupported_contract", "unsupported turn workflow recovery contract")
+		return
+	}
+	if req.RequestID == "" || req.ActionID == "" {
+		writeError(w, http.StatusBadRequest, "missing_param", "request_id and action_id are required")
+		return
+	}
+	if s == nil || s.TurnWorkflows == nil {
+		writeError(w, http.StatusNotFound, "unknown_workflow", "turn workflow not found")
+		return
+	}
+	view, ok := s.TurnWorkflows.snapshot(req.RequestID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown_workflow", "turn workflow not found")
+		return
+	}
+	action, actionOK := turnWorkflowHUDRecoveryActionByID(view.Error, req.ActionID)
+	if !actionOK || req.ActionID != turnWorkflowHUDRecoveryRetryDerivedTurn {
+		writeError(w, http.StatusConflict, "recovery_action_unavailable", "turn workflow recovery action is unavailable")
+		return
+	}
+	if action.Status != "available" {
+		if action.Status == "requested" || action.Status == "running" {
+			s.wakeMemoryWorkers()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":            "ok",
+			"recovery_state":    action.Status,
+			"request_id":        req.RequestID,
+			"chat_session_id":   view.ChatSessionID,
+			"turn_index":        view.LogicalTurn,
+			"turn_workflow_hud": view,
+		})
+		return
+	}
+	if s.Cfg.StoreMode != config.StoreModeMariaDBAuthority || s.Store == nil {
+		writeError(w, http.StatusConflict, "recovery_store_unavailable", "derived-memory recovery requires the MariaDB authority store")
+		return
+	}
+	if availability, ok := s.Store.(store.MemoryDerivationLifecycleAvailability); !ok ||
+		!availability.MemoryDerivationLifecycleEnabled() {
+		writeError(w, http.StatusConflict, "recovery_lifecycle_unavailable", "derived-memory recovery lifecycle is unavailable")
+		return
+	}
+	if !s.runtimeConfigSnapshot().Synced {
+		writeError(w, http.StatusConflict, "runtime_config_not_synced", "runtime model configuration is not synchronized")
+		return
+	}
+	if !s.completeTurnExtractionConfig(nil).Critic.hasConfig() {
+		writeError(w, http.StatusConflict, "critic_config_missing", "critic configuration is unavailable")
+		return
+	}
+	lister, listOK := s.Store.(store.ActiveSourceRevisionLister)
+	sources, sourceOK := s.Store.(store.SourceRevisionStore)
+	jobs, jobsOK := s.Store.(store.MemoryReprocessingJobStore)
+	reopener, reopenOK := s.Store.(store.MemoryReprocessingJobReopener)
+	if !listOK || !sourceOK || !jobsOK || !reopenOK {
+		writeError(w, http.StatusConflict, "recovery_capability_unavailable", "scoped derived-memory recovery is unavailable")
+		return
+	}
+	candidates, err := lister.ListActiveSourceRevisions(
+		r.Context(),
+		view.ChatSessionID,
+		view.LogicalTurn,
+		view.LogicalTurn,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "recovery_source_lookup_failed", err.Error())
+		return
+	}
+	exact := make([]store.MemorySourceRevision, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.ChatSessionID == view.ChatSessionID && candidate.TurnIndex == view.LogicalTurn {
+			exact = append(exact, candidate)
+		}
+	}
+	if len(exact) != 1 {
+		writeError(w, http.StatusConflict, "recovery_source_not_unique", "exactly one active source revision is required for this turn")
+		return
+	}
+	source, err := sources.GetSourceRevision(r.Context(), view.ChatSessionID, exact[0].SourceRevision)
+	if err != nil || source == nil {
+		if err == nil {
+			err = store.ErrNotFound
+		}
+		writeError(w, http.StatusConflict, "recovery_source_unavailable", err.Error())
+		return
+	}
+	projectionComplete, err := s.adminRescanSourceProjectionComplete(r.Context(), source)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "recovery_projection_check_failed", err.Error())
+		return
+	}
+	if projectionComplete {
+		updated, _ := s.TurnWorkflows.setRecoveryActionStatus(
+			req.RequestID,
+			req.ActionID,
+			"completed",
+			"turn_hud.recovery.completed",
+		)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":            "ok",
+			"recovery_state":    "completed",
+			"request_id":        req.RequestID,
+			"chat_session_id":   view.ChatSessionID,
+			"turn_index":        view.LogicalTurn,
+			"turn_workflow_hud": updated,
+		})
+		return
+	}
+	idempotencyKey := completeTurnReprocessingIdempotencyKey(
+		source.ChatSessionID,
+		source.SourceRevision,
+		store.MemoryAdmissionContract,
+		completeTurnCriticPipelineVersion,
+		memoryAdmissionIndexVersion,
+	)
+	recoveryState := "requested"
+	reopened, reopenErr := reopener.ReopenMemoryReprocessingJob(
+		r.Context(),
+		idempotencyKey,
+		source.ChatSessionID,
+		source.SourceRevision,
+		time.Now().UTC(),
+	)
+	switch {
+	case reopenErr == nil && reopened:
+		s.wakeMemoryWorkers()
+	case errors.Is(reopenErr, store.ErrMemoryReprocessingLeased):
+		recoveryState = "running"
+	case errors.Is(reopenErr, store.ErrNotFound):
+		inserted, enqueueErr := s.enqueueSourceRevisionReprocessingJob(
+			r.Context(),
+			jobs,
+			source,
+			"turn_workflow_hud_recovery_requested",
+			time.Now().UTC(),
+		)
+		if enqueueErr != nil {
+			writeError(w, http.StatusInternalServerError, "recovery_enqueue_failed", enqueueErr.Error())
+			return
+		}
+		if !inserted {
+			recoveryState = "running"
+			s.wakeMemoryWorkers()
+		}
+	case reopenErr != nil:
+		writeError(w, http.StatusInternalServerError, "recovery_reopen_failed", reopenErr.Error())
+		return
+	default:
+		recoveryState = "running"
+		s.wakeMemoryWorkers()
+	}
+	statusMessageKey := "turn_hud.recovery.requested"
+	if recoveryState == "running" {
+		statusMessageKey = "turn_hud.recovery.running"
+	}
+	updated, updatedOK := s.TurnWorkflows.setRecoveryActionStatus(
+		req.RequestID,
+		req.ActionID,
+		recoveryState,
+		statusMessageKey,
+	)
+	if !updatedOK {
+		writeError(w, http.StatusConflict, "recovery_action_stale", "turn workflow recovery action is no longer available")
+		return
+	}
+	s.saveAuditLogBestEffort(r.Context(), &store.AuditLog{
+		ChatSessionID: view.ChatSessionID,
+		EventType:     "turn_workflow_recovery_requested",
+		TargetType:    "turn",
+		TargetID:      int64(view.LogicalTurn),
+		Summary:       "Requested scoped Critic-derived memory recovery",
+		DetailsJSON: mustCompactJSON(map[string]any{
+			"request_id":      req.RequestID,
+			"action_id":       req.ActionID,
+			"source_revision": source.SourceRevision,
+			"recovery_state":  recoveryState,
+			"raw_preserved":   true,
+		}),
+		Source:    s.storeWriteSource(),
+		CreatedAt: time.Now().UTC(),
+	})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":            "accepted",
+		"recovery_state":    recoveryState,
+		"request_id":        req.RequestID,
+		"chat_session_id":   view.ChatSessionID,
+		"turn_index":        view.LogicalTurn,
+		"turn_workflow_hud": updated,
+	})
+}
+
+func turnWorkflowHUDRecoveryActionByID(
+	hudError *turnWorkflowHUDError,
+	actionID string,
+) (turnWorkflowHUDRecoveryAction, bool) {
+	if hudError == nil {
+		return turnWorkflowHUDRecoveryAction{}, false
+	}
+	actionID = strings.TrimSpace(actionID)
+	for _, action := range hudError.RecoveryActions {
+		if action.ID == actionID {
+			return action, true
+		}
+	}
+	return turnWorkflowHUDRecoveryAction{}, false
+}
+
 func (s *Server) handleTurnWorkflowHUDStatus(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimSpace(r.URL.Query().Get("request_id"))
 	if requestID == "" {
@@ -746,9 +1851,6 @@ func (s *Server) handleTurnWorkflowHUDStatus(w http.ResponseWriter, r *http.Requ
 	waitMS, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("wait_ms")))
 	if waitMS < 0 {
 		waitMS = 0
-	}
-	if waitMS > int(turnWorkflowHUDMaxWait/time.Millisecond) {
-		waitMS = int(turnWorkflowHUDMaxWait / time.Millisecond)
 	}
 	if s.TurnWorkflows == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -766,6 +1868,98 @@ func (s *Server) handleTurnWorkflowHUDStatus(w http.ResponseWriter, r *http.Requ
 			"request_id":       requestID,
 		})
 		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) handleTurnWorkflowHUDEvents(w http.ResponseWriter, r *http.Request) {
+	requestID := strings.TrimSpace(r.URL.Query().Get("request_id"))
+	if requestID == "" {
+		writeError(w, http.StatusBadRequest, "missing_param", "request_id is required")
+		return
+	}
+	if s.TurnWorkflows == nil {
+		writeError(w, http.StatusNotFound, "unknown_workflow", "turn workflow not found")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "stream_transport_unavailable", "streaming response is unavailable")
+		return
+	}
+	afterRevision, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("after_revision")), 10, 64)
+	waitMS, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("wait_ms")))
+	if waitMS < 0 {
+		waitMS = 0
+	}
+	ctx := r.Context()
+	if waitMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(waitMS)*time.Millisecond)
+		defer cancel()
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	encoder := json.NewEncoder(w)
+	_, err := s.TurnWorkflows.streamSnapshots(ctx, requestID, afterRevision, func(view turnWorkflowHUDViewModel) error {
+		if err := encoder.Encode(view); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	})
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+}
+
+func (s *Server) handleTurnWorkflowHUDNotice(w http.ResponseWriter, r *http.Request) {
+	var observation turnWorkflowHUDNoticeObservation
+	if err := json.NewDecoder(r.Body).Decode(&observation); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid turn workflow notice observation")
+		return
+	}
+	if strings.TrimSpace(observation.ContractVersion) != turnWorkflowHUDNoticeObservationContractVersion {
+		writeError(w, http.StatusBadRequest, "unsupported_contract", "unsupported turn workflow notice observation contract")
+		return
+	}
+	if strings.TrimSpace(observation.RequestID) == "" || strings.TrimSpace(observation.ChatSessionID) == "" {
+		writeError(w, http.StatusBadRequest, "missing_param", "request_id and chat_session_id are required")
+		return
+	}
+	if strings.TrimSpace(observation.Kind) != "ooc_input_cancelled" {
+		writeError(w, http.StatusBadRequest, "unsupported_notice_kind", "unsupported turn workflow notice kind")
+		return
+	}
+	view := newTurnWorkflowHUDOperationNotice(
+		observation.RequestID,
+		observation.ChatSessionID,
+		0,
+		"completed",
+		turnWorkflowHUDSeverityNotice,
+		"turn_hud.notice.ooc_recognized",
+		"turn_hud.notice.ooc_recognized_detail",
+		"OOC_INPUT_CANCELLED",
+	)
+	view.HostTurn = maxInt(0, observation.HostTurn)
+	view.BackendTurn = 0
+	setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+		Key: "host_observation", Owner: "risu_host", Scope: "current_request",
+		Status: "observed", Disposition: "dropped", ReasonCode: "ooc_input_cancelled", Severity: turnWorkflowHUDSeverityNotice,
+	})
+	setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: "skipped", Disposition: "dropped", ReasonCode: "ooc_input_cancelled", Severity: turnWorkflowHUDSeverityNotice,
+	})
+	setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: "cancelled", Disposition: "dropped", ReasonCode: "ooc_input_cancelled", Severity: turnWorkflowHUDSeverityNotice,
+	})
+	syncTurnWorkflowHUDAlignment(&view)
+	syncTurnWorkflowHUDPresentation(&view)
+	if s.TurnWorkflows != nil {
+		view = s.TurnWorkflows.recordOperation(view)
 	}
 	writeJSON(w, http.StatusOK, view)
 }
@@ -880,6 +2074,7 @@ func turnWorkflowHUDCountsFromComplete(
 	rawAssistantDurable bool,
 	effectiveInputSaved int,
 	memoriesSaved int,
+	preciseMemoryUnitsSaved int,
 	evidenceSaved int,
 	kgTriplesSaved int,
 	subjectiveEntityMemoriesSaved int,
@@ -893,11 +2088,17 @@ func turnWorkflowHUDCountsFromComplete(
 	storylinesSaved int,
 	narrativeCurrentStatesSaved int,
 	narrativeStateEventsSaved int,
+	relationshipCurrentStatesSaved int,
+	relationshipStateEventsSaved int,
 	pendingThreadsSaved int,
 	activeStatesSaved int,
 	canonicalStateLayersSaved int,
 	entitiesSaved int,
 	trustStatesSaved int,
+	entityIdentitiesSaved int,
+	identitySurfacesSaved int,
+	identityBindingsSaved int,
+	speakerAttributionsSaved int,
 	episodeSummariesSaved int,
 	vectorsUpserted int,
 ) map[string]int {
@@ -908,14 +2109,20 @@ func turnWorkflowHUDCountsFromComplete(
 		return 0
 	}
 	return map[string]int{
-		"raw_user":               boolCount(rawUserDurable),
-		"raw_assistant":          boolCount(rawAssistantDurable),
-		"effective_input":        maxInt(0, effectiveInputSaved),
-		"turn_summary":           maxInt(0, memoriesSaved),
-		"direct_evidence":        maxInt(0, evidenceSaved),
-		"relationship_knowledge": maxInt(0, kgTriplesSaved),
-		"subjective_memory":      maxInt(0, subjectiveEntityMemoriesSaved),
-		"world_rule":             maxInt(0, worldRulesSaved),
+		"raw_user":            boolCount(rawUserDurable),
+		"raw_assistant":       boolCount(rawAssistantDurable),
+		"effective_input":     maxInt(0, effectiveInputSaved),
+		"turn_summary":        maxInt(0, memoriesSaved),
+		"precise_memory":      maxInt(0, preciseMemoryUnitsSaved),
+		"direct_evidence":     maxInt(0, evidenceSaved),
+		"knowledge_graph":     maxInt(0, kgTriplesSaved),
+		"relationship_state":  maxInt(0, relationshipCurrentStatesSaved+relationshipStateEventsSaved),
+		"entity_identity":     maxInt(0, entityIdentitiesSaved),
+		"identity_surface":    maxInt(0, identitySurfacesSaved),
+		"identity_binding":    maxInt(0, identityBindingsSaved),
+		"speaker_attribution": maxInt(0, speakerAttributionsSaved),
+		"subjective_memory":   maxInt(0, subjectiveEntityMemoriesSaved),
+		"world_rule":          maxInt(0, worldRulesSaved),
 		"character_state": maxInt(0,
 			characterStatesSaved+physicalConditionsSaved+entityConditionsSaved+statusSchemaDefinitionsSaved+statusEffectsSaved),
 		"narrative_state": maxInt(0,
@@ -923,5 +2130,195 @@ func turnWorkflowHUDCountsFromComplete(
 				pendingThreadsSaved+activeStatesSaved+canonicalStateLayersSaved+entitiesSaved+trustStatesSaved),
 		"episode_summary": maxInt(0, episodeSummariesSaved),
 		"vector_index":    maxInt(0, vectorsUpserted),
+	}
+}
+
+func (s *Server) completeTurnWorkflowHUDDuplicate(
+	requestID string,
+	sessionID string,
+	logicalTurn int,
+	reasonCode string,
+	warningCode string,
+	warningMessageKey string,
+	noticeMessageKey string,
+) any {
+	requestID = strings.TrimSpace(requestID)
+	if s == nil || s.TurnWorkflows == nil || requestID == "" {
+		return nil
+	}
+	if _, ok := s.TurnWorkflows.snapshot(requestID); !ok {
+		s.TurnWorkflows.begin(requestID, strings.TrimSpace(sessionID), logicalTurn)
+	}
+	s.TurnWorkflows.setLogicalTurn(requestID, logicalTurn)
+	s.TurnWorkflows.finishStage(requestID, turnWorkflowStageFinalAccepted, "succeeded", "")
+	s.TurnWorkflows.finishStage(requestID, turnWorkflowStageRawPersist, "skipped", reasonCode)
+	s.TurnWorkflows.finishStage(requestID, turnWorkflowStageCriticLLM, "skipped", reasonCode)
+	s.TurnWorkflows.finishStage(requestID, turnWorkflowStageDerivedPersist, "skipped", reasonCode)
+	s.TurnWorkflows.finishStage(requestID, turnWorkflowStageCheckpoints, "skipped", reasonCode)
+	s.TurnWorkflows.setCounts(requestID, turnWorkflowHUDCountsFromComplete(
+		false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	))
+	s.TurnWorkflows.setPersistenceFacts(requestID, "existing", 0, "existing", 0, "not_requested", 0)
+	if strings.Contains(strings.ToUpper(strings.TrimSpace(warningCode)), "CONFLICT") {
+		s.TurnWorkflows.addWarning(requestID, warningCode, warningMessageKey, turnWorkflowStageRawPersist)
+	} else {
+		s.TurnWorkflows.addNotice(requestID, warningCode, warningMessageKey, turnWorkflowStageRawPersist)
+	}
+	s.TurnWorkflows.completeWithNotice(
+		requestID,
+		"turn_hud.notice.duplicate_suspected",
+		noticeMessageKey,
+		warningCode,
+	)
+	return s.turnWorkflowHUDSnapshot(requestID)
+}
+
+func newTurnWorkflowHUDOperationNotice(
+	requestID string,
+	sessionID string,
+	logicalTurn int,
+	status string,
+	severity string,
+	titleKey string,
+	messageKey string,
+	noticeCode string,
+) turnWorkflowHUDViewModel {
+	now := time.Now().UTC()
+	view := turnWorkflowHUDViewModel{
+		ContractVersion: turnWorkflowHUDContractVersion,
+		RequestID:       strings.TrimSpace(requestID),
+		ChatSessionID:   strings.TrimSpace(sessionID),
+		LogicalTurn:     logicalTurn,
+		BackendTurn:     logicalTurn,
+		Attempt:         1,
+		Revision:        1,
+		Status:          strings.TrimSpace(status),
+		Severity:        normalizeTurnWorkflowHUDSeverity(severity),
+		StartedAt:       now,
+		UpdatedAt:       now,
+		EndedAt:         timePtr(now),
+		Stages:          []turnWorkflowHUDStage{},
+		Counts:          []turnWorkflowHUDCount{},
+		Warnings:        []turnWorkflowHUDNotice{},
+		Facts:           newTurnWorkflowHUDFacts(),
+		DisplayMode:     "notice",
+		TitleKey:        strings.TrimSpace(titleKey),
+		MessageKey:      strings.TrimSpace(messageKey),
+		NoticeCode:      strings.TrimSpace(noticeCode),
+		NoticeKind:      turnWorkflowHUDNoticeKind(noticeCode),
+	}
+	if view.NoticeKind == "ooc" {
+		view.PresentationTone = "attention"
+	}
+	operationDisposition := "delivered"
+	operationStatus := "completed"
+	operationSeverity := view.Severity
+	deleteDetected := strings.EqualFold(strings.TrimSpace(noticeCode), "ASSISTANT_OUTPUT_DELETE_DETECTED")
+	if deleteDetected {
+		operationDisposition = "deferred"
+		operationStatus = "running"
+		view.EndedAt = nil
+	}
+	if view.Status == "failed" || view.Severity == turnWorkflowHUDSeverityError {
+		operationDisposition = "dropped"
+		operationStatus = "failed"
+		operationSeverity = turnWorkflowHUDSeverityError
+	}
+	setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+		Key: "backend_processing", Owner: "go_backend", Scope: "current_request",
+		Status: operationStatus, Disposition: operationDisposition, ReasonCode: strings.TrimSpace(noticeCode), Severity: operationSeverity,
+	})
+	setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+		Key: "finality", Owner: "go_backend", Scope: "current_request",
+		Status: operationStatus, Disposition: operationDisposition, ReasonCode: strings.TrimSpace(noticeCode), Severity: operationSeverity,
+	})
+	switch view.NoticeKind {
+	case "ooc":
+		setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+			Key: "finality", Owner: "go_backend", Scope: "current_request",
+			Status: "cancelled", Disposition: "dropped", ReasonCode: "ooc_input_cancelled", Severity: turnWorkflowHUDSeverityNotice,
+		})
+		for _, fact := range []turnWorkflowHUDFact{
+			turnWorkflowHUDPersistenceFact("raw_persistence", "canonical_store", "skipped", 0),
+			turnWorkflowHUDPersistenceFact("derived_memory", "canonical_store", "skipped", 0),
+			turnWorkflowHUDPersistenceFact("vector_index", "vector_store", "not_requested", 0),
+		} {
+			setTurnWorkflowHUDFactValue(&view, fact)
+		}
+	case "delete":
+		setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+			Key: "host_observation", Owner: "risu_host", Scope: "current_request",
+			Status: "observed", Disposition: "eligible", ReasonCode: strings.ToLower(strings.TrimSpace(noticeCode)), Severity: operationSeverity,
+		})
+		if deleteDetected {
+			setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+				Key: "finality", Owner: "go_backend", Scope: "current_request",
+				Status: "pending", Disposition: "deferred", ReasonCode: strings.ToLower(strings.TrimSpace(noticeCode)), Severity: operationSeverity,
+			})
+		} else {
+			setTurnWorkflowHUDFactValue(&view, turnWorkflowHUDFact{
+				Key: "finality", Owner: "go_backend", Scope: "current_request",
+				Status: "deleted", Disposition: "dropped", ReasonCode: strings.ToLower(strings.TrimSpace(noticeCode)), Severity: operationSeverity,
+			})
+		}
+	}
+	syncTurnWorkflowHUDAlignment(&view)
+	syncTurnWorkflowHUDPresentation(&view)
+	if view.Status == "failed" || view.Severity == turnWorkflowHUDSeverityError {
+		view.Status = "failed"
+		view.Severity = turnWorkflowHUDSeverityError
+		view.Error = &turnWorkflowHUDError{
+			Code:            view.NoticeCode,
+			MessageKey:      view.MessageKey,
+			StageKey:        "",
+			Retryable:       true,
+			PreservedCounts: []turnWorkflowHUDCount{},
+		}
+	}
+	syncTurnWorkflowHUDPresentation(&view)
+	return view
+}
+
+func (s *Server) turnWorkflowHUDOperationNotice(
+	requestID string,
+	sessionID string,
+	logicalTurn int,
+	status string,
+	severity string,
+	titleKey string,
+	messageKey string,
+	noticeCode string,
+) turnWorkflowHUDViewModel {
+	view := newTurnWorkflowHUDOperationNotice(
+		requestID,
+		sessionID,
+		logicalTurn,
+		status,
+		severity,
+		titleKey,
+		messageKey,
+		noticeCode,
+	)
+	if s != nil && s.TurnWorkflows != nil {
+		view = s.TurnWorkflows.recordOperation(view)
+	}
+	return view
+}
+
+func turnWorkflowHUDNoticeKind(code string) string {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "OOC_INPUT_CANCELLED", "OOC_TURN_SKIPPED":
+		return "ooc"
+	case "ASSISTANT_OUTPUT_DELETE_DETECTED", "ASSISTANT_OUTPUT_DELETE_CONFIRMED", "ASSISTANT_OUTPUT_DELETE_SYNC_PARTIAL":
+		return "delete"
+	case "LOGICAL_TURN_REPLACED":
+		return "reroll"
+	case "DUPLICATE_PAIR_REPLAY", "DUPLICATE_EXISTING_PAIR":
+		return "duplicate"
+	default:
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(code)), "DUPLICATE_") {
+			return "duplicate"
+		}
+		return "operation"
 	}
 }

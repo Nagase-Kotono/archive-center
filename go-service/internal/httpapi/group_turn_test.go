@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/risulongmemory/archive-center-go/internal/config"
 	"github.com/risulongmemory/archive-center-go/internal/store"
@@ -18,55 +21,115 @@ import (
 // turnRecordingStore implements store.Store and records all save/read calls.
 type turnRecordingStore struct {
 	memoryFakeStore
-	savedChatLogs           []*store.ChatLog
-	savedEffectiveInputs    []*store.EffectiveInput
-	savedAuditLogs          []*store.AuditLog
-	savedCriticFeedback     []*store.CriticFeedback
-	returnMemories          []store.Memory
-	savedMemories           []*store.Memory
-	updatedImportance       map[int64]float64
-	savedEvidence           []*store.DirectEvidence
-	savedKGTriples          []*store.KGTriple
-	savedStorylines         []*store.Storyline
-	savedWorldRules         []*store.WorldRule
-	savedEntities           []*store.Entity
-	savedTrusts             []*store.Trust
-	savedCharacterEvents    []*store.CharacterEvent
-	savedCharacterStates    []*store.CharacterState
-	returnStatusDefinitions []store.StatusSchemaDefinition
-	savedStatusDefinitions  []store.StatusSchemaDefinition
-	returnStatusCurrent     []store.StatusCurrentValue
-	savedStatusCurrent      []store.StatusCurrentValue
-	savedStatusEvents       []store.StatusChangeEvent
-	savedStatusEffects      []store.StatusEffect
-	savedPendingThreads     []*store.PendingThread
-	savedActiveStates       []*store.ActiveState
-	savedCanonicalLayers    []*store.CanonicalStateLayer
-	returnKGTriples         []store.KGTriple
-	returnEvidence          []store.DirectEvidence
-	returnChatLogs          []store.ChatLog
-	returnResumePack        *store.ResumePack
-	returnStorylines        []store.Storyline
-	returnWorldRules        []store.WorldRule
-	returnCharStates        []store.CharacterState
-	returnPendingThreads    []store.PendingThread
-	returnActiveStates      []store.ActiveState
-	returnCanonicalLayers   []store.CanonicalStateLayer
-	returnEpisodeSums       []store.EpisodeSummary
-	returnPersonaEntries    []store.PersonaMemoryEntry
-	returnEntityMemories    []store.ProtagonistEntityMemory
-	returnEntityOwners      []store.ProtagonistEntityMemoryOwner
-	lastEpisodeLimit        int
-	lastPersonaLimit        int
-	lastEntityMemoryLimit   int
-	entityMemoryReadCount   int
-	entityMemoryFilters     []store.ProtagonistEntityMemoryFilter
-	savedEntityMemories     []*store.ProtagonistEntityMemory
-	createdPersonaCapsules  []*store.PersonaMemoryCapsule
-	createdPersonaEntries   []store.PersonaMemoryEntry
-	deletedStorylineIDs     []int64
-	deletedWorldRuleIDs     []int64
-	logicalTurnReplacements []store.LogicalTurnReplacement
+	savedChatLogs             []*store.ChatLog
+	savedEffectiveInputs      []*store.EffectiveInput
+	savedAuditLogs            []*store.AuditLog
+	savedCriticFeedback       []*store.CriticFeedback
+	returnMemories            []store.Memory
+	savedMemories             []*store.Memory
+	updatedImportance         map[int64]float64
+	savedEvidence             []*store.DirectEvidence
+	savedKGTriples            []*store.KGTriple
+	savedStorylines           []*store.Storyline
+	savedWorldRules           []*store.WorldRule
+	savedEntities             []*store.Entity
+	savedTrusts               []*store.Trust
+	savedCharacterEvents      []*store.CharacterEvent
+	savedCharacterStates      []*store.CharacterState
+	returnStatusDefinitions   []store.StatusSchemaDefinition
+	savedStatusDefinitions    []store.StatusSchemaDefinition
+	returnStatusCurrent       []store.StatusCurrentValue
+	savedStatusCurrent        []store.StatusCurrentValue
+	savedStatusEvents         []store.StatusChangeEvent
+	savedStatusEffects        []store.StatusEffect
+	savedPendingThreads       []*store.PendingThread
+	savedActiveStates         []*store.ActiveState
+	savedCanonicalLayers      []*store.CanonicalStateLayer
+	returnKGTriples           []store.KGTriple
+	returnEvidence            []store.DirectEvidence
+	returnChatLogs            []store.ChatLog
+	returnResumePack          *store.ResumePack
+	returnStorylines          []store.Storyline
+	returnWorldRules          []store.WorldRule
+	returnCharStates          []store.CharacterState
+	returnPendingThreads      []store.PendingThread
+	returnActiveStates        []store.ActiveState
+	returnCanonicalLayers     []store.CanonicalStateLayer
+	returnEpisodeSums         []store.EpisodeSummary
+	returnPersonaEntries      []store.PersonaMemoryEntry
+	returnEntityMemories      []store.ProtagonistEntityMemory
+	returnEntityOwners        []store.ProtagonistEntityMemoryOwner
+	returnActiveInteractions  []store.PreciseMemoryUnit
+	lastEpisodeLimit          int
+	lastPersonaLimit          int
+	lastEntityMemoryLimit     int
+	entityMemoryReadCount     int
+	entityMemoryFilters       []store.ProtagonistEntityMemoryFilter
+	savedEntityMemories       []*store.ProtagonistEntityMemory
+	createdPersonaCapsules    []*store.PersonaMemoryCapsule
+	createdPersonaEntries     []store.PersonaMemoryEntry
+	deletedStorylineIDs       []int64
+	deletedWorldRuleIDs       []int64
+	logicalTurnReplacements   []store.LogicalTurnReplacement
+	logicalTurnRollbacks      []store.LogicalTurnRollback
+	savedCriticInputSnapshots map[string]struct {
+		JSON string
+		Hash string
+	}
+	criticInputSnapshotErr error
+}
+
+func (f *turnRecordingStore) SaveCriticInputSnapshot(
+	_ context.Context,
+	_ string,
+	revision string,
+	snapshotJSON string,
+	snapshotHash string,
+	_ time.Time,
+) error {
+	if f.criticInputSnapshotErr != nil {
+		return f.criticInputSnapshotErr
+	}
+	if f.savedCriticInputSnapshots == nil {
+		f.savedCriticInputSnapshots = map[string]struct {
+			JSON string
+			Hash string
+		}{}
+	}
+	f.savedCriticInputSnapshots[revision] = struct {
+		JSON string
+		Hash string
+	}{JSON: snapshotJSON, Hash: snapshotHash}
+	return nil
+}
+
+func (f *turnRecordingStore) ListActiveInteractionMemoryUnits(_ context.Context, chatSessionID string) ([]store.PreciseMemoryUnit, error) {
+	out := make([]store.PreciseMemoryUnit, 0, len(f.returnActiveInteractions))
+	for _, unit := range f.returnActiveInteractions {
+		if unit.ChatSessionID == "" || unit.ChatSessionID == chatSessionID {
+			out = append(out, unit)
+		}
+	}
+	return out, nil
+}
+
+type auditFailingTurnStore struct {
+	*turnRecordingStore
+}
+
+func (f *auditFailingTurnStore) SaveAuditLog(context.Context, *store.AuditLog) error {
+	return errors.New("audit store unavailable")
+}
+
+type maintenanceAuditFailingTurnStore struct {
+	*turnRecordingStore
+}
+
+func (f *maintenanceAuditFailingTurnStore) SaveAuditLog(ctx context.Context, item *store.AuditLog) error {
+	if item != nil && item.EventType == "maintenance_audit_recorded" {
+		return errors.New("maintenance audit store unavailable")
+	}
+	return f.turnRecordingStore.SaveAuditLog(ctx, item)
 }
 
 func (f *turnRecordingStore) ReplaceLogicalTurn(ctx context.Context, replacement store.LogicalTurnReplacement) error {
@@ -89,10 +152,24 @@ func (f *turnRecordingStore) ReplaceLogicalTurn(ctx context.Context, replacement
 	return nil
 }
 
+func (f *turnRecordingStore) RollbackCanonicalTail(_ context.Context, rollback store.LogicalTurnRollback) error {
+	f.logicalTurnRollbacks = append(f.logicalTurnRollbacks, rollback)
+	fromTurn := rollback.TurnIndex
+	kept := f.returnChatLogs[:0]
+	for _, item := range f.returnChatLogs {
+		if item.TurnIndex < fromTurn {
+			kept = append(kept, item)
+		}
+	}
+	f.returnChatLogs = kept
+	return nil
+}
+
 type turnRecordingVectorStore struct {
 	docs                []vector.VectorDocument
 	deletedDocumentIDs  []string
 	upsertErr           error
+	deleteErr           error
 	upsertCalls         int
 	deleteSessionCalls  int
 	deleteDocumentCalls int
@@ -119,6 +196,9 @@ func (f *turnRecordingVectorStore) DeleteSession(ctx context.Context, sessionID 
 
 func (f *turnRecordingVectorStore) DeleteDocuments(ctx context.Context, ids []string) error {
 	f.deleteDocumentCalls++
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	f.deletedDocumentIDs = append(f.deletedDocumentIDs, ids...)
 	remove := map[string]bool{}
 	for _, id := range ids {
@@ -160,6 +240,20 @@ func (f *turnRecordingVectorStore) ListDocuments(ctx context.Context, sessionID 
 	out := []vector.VectorDocument{}
 	for _, doc := range f.docs {
 		if sessionID == "" || doc.ChatSessionID == sessionID {
+			out = append(out, doc)
+		}
+	}
+	return out, nil
+}
+
+func (f *turnRecordingVectorStore) GetDocuments(_ context.Context, ids []string) ([]vector.VectorDocument, error) {
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	out := []vector.VectorDocument{}
+	for _, doc := range f.docs {
+		if wanted[doc.ID] {
 			out = append(out, doc)
 		}
 	}
@@ -510,6 +604,131 @@ func (f *turnRecordingStore) SaveStatusChangeEvent(ctx context.Context, event st
 	return event, nil
 }
 
+func (f *turnRecordingStore) ApplyReversibleStatusTransition(_ context.Context, transition store.ReversibleStatusTransition) (store.ReversibleStatusTransitionResult, error) {
+	if existing, err := f.GetReversibleStatusEventBySourceUnit(context.Background(), transition.Event.ChatSessionID, transition.SourceRevision, transition.SourceUnitID); err == nil {
+		return store.ReversibleStatusTransitionResult{Event: existing, Replayed: true}, nil
+	}
+	result := store.ReversibleStatusTransitionResult{}
+	if transition.CurrentValue != nil {
+		current, err := f.SaveStatusCurrentValue(context.Background(), *transition.CurrentValue)
+		if err != nil {
+			return result, err
+		}
+		result.CurrentValue = current
+		transition.Event.StatusValueID = current.ID
+	}
+	event, err := f.SaveStatusChangeEvent(context.Background(), transition.Event)
+	if err != nil {
+		return store.ReversibleStatusTransitionResult{}, err
+	}
+	result.Event = event
+	return result, nil
+}
+
+func (f *turnRecordingStore) GetReversibleStatusEventBySourceUnit(_ context.Context, chatSessionID, sourceRevision, sourceUnitID string) (store.StatusChangeEvent, error) {
+	for index := len(f.savedStatusEvents) - 1; index >= 0; index-- {
+		event := f.savedStatusEvents[index]
+		if event.ChatSessionID != chatSessionID {
+			continue
+		}
+		evidence := map[string]any{}
+		_ = json.Unmarshal([]byte(event.EvidenceJSON), &evidence)
+		if extractionStringFromAny(evidence["source_revision"]) == sourceRevision &&
+			extractionStringFromAny(evidence["source_unit_id"]) == sourceUnitID {
+			return event, nil
+		}
+	}
+	return store.StatusChangeEvent{}, store.ErrNotFound
+}
+
+func (f *turnRecordingStore) ListReversibleStatusCurrentValues(_ context.Context, chatSessionID, ownerScope string, statusKeys []string) ([]store.StatusCurrentValue, error) {
+	allowed := map[string]bool{}
+	for _, key := range statusKeys {
+		allowed[key] = true
+	}
+	out := []store.StatusCurrentValue{}
+	for _, value := range f.returnStatusCurrent {
+		if value.ChatSessionID == chatSessionID && value.OwnerScope == ownerScope &&
+			allowed[value.StatusKey] && value.WriteState == "current" {
+			out = append(out, value)
+		}
+	}
+	return out, nil
+}
+
+func (f *turnRecordingStore) ListLatestReversibleCurrentProjectionEvents(_ context.Context, chatSessionID string, statusKeys []string) ([]store.StatusChangeEvent, error) {
+	allowed := map[string]bool{}
+	for _, key := range statusKeys {
+		allowed[key] = true
+	}
+	latest := map[string]store.StatusChangeEvent{}
+	for _, event := range f.savedStatusEvents {
+		if event.ChatSessionID != chatSessionID || !allowed[event.StatusKey] {
+			continue
+		}
+		evidence := map[string]any{}
+		_ = json.Unmarshal([]byte(event.EvidenceJSON), &evidence)
+		currentProjection, _ := evidence["current_projection"].(bool)
+		if !currentProjection {
+			continue
+		}
+		key := event.StatusKey + "\x00" + event.OwnerScope + "\x00" + event.OwnerID
+		if previous, ok := latest[key]; !ok || event.SourceTurn > previous.SourceTurn ||
+			(event.SourceTurn == previous.SourceTurn && event.ID > previous.ID) {
+			latest[key] = event
+		}
+	}
+	out := make([]store.StatusChangeEvent, 0, len(latest))
+	for _, event := range latest {
+		out = append(out, event)
+	}
+	return out, nil
+}
+
+func (f *turnRecordingStore) GetStatusChangeEventBySourceRevision(_ context.Context, chatSessionID, statusKey, sourceRevision string, sourceTurn int) (store.StatusChangeEvent, error) {
+	var latest store.StatusChangeEvent
+	for _, event := range f.savedStatusEvents {
+		if event.ChatSessionID != chatSessionID || event.StatusKey != statusKey || event.SourceTurn != sourceTurn {
+			continue
+		}
+		evidence := map[string]any{}
+		_ = json.Unmarshal([]byte(event.EvidenceJSON), &evidence)
+		if extractionStringFromAny(evidence["source_revision"]) != sourceRevision {
+			continue
+		}
+		if event.ID > latest.ID {
+			latest = event
+		}
+	}
+	if latest.ID == 0 {
+		return store.StatusChangeEvent{}, store.ErrNotFound
+	}
+	return latest, nil
+}
+
+func (f *turnRecordingStore) GetLatestCurrentProjectionStatusChangeEvent(_ context.Context, chatSessionID, statusKey string) (store.StatusChangeEvent, error) {
+	var latest store.StatusChangeEvent
+	for _, event := range f.savedStatusEvents {
+		if event.ChatSessionID != chatSessionID || event.StatusKey != statusKey {
+			continue
+		}
+		evidence := map[string]any{}
+		_ = json.Unmarshal([]byte(event.EvidenceJSON), &evidence)
+		currentProjection, _ := evidence["current_projection"].(bool)
+		if !currentProjection {
+			continue
+		}
+		if latest.ID == 0 || event.SourceTurn > latest.SourceTurn ||
+			(event.SourceTurn == latest.SourceTurn && event.ID > latest.ID) {
+			latest = event
+		}
+	}
+	if latest.ID == 0 {
+		return store.StatusChangeEvent{}, store.ErrNotFound
+	}
+	return latest, nil
+}
+
 func (f *turnRecordingStore) ListStatusEffects(ctx context.Context, chatSessionID, ownerScope, ownerID, effectState string, limit int) ([]store.StatusEffect, error) {
 	out := []store.StatusEffect{}
 	for _, item := range f.savedStatusEffects {
@@ -717,14 +936,17 @@ func TestCompleteTurnDualShadowWritesAll(t *testing.T) {
 	if resp["chat_logs_saved"] != float64(2) {
 		t.Errorf("chat_logs_saved = %v, want 2", resp["chat_logs_saved"])
 	}
-	if resp["effective_input_saved"] != float64(1) {
-		t.Errorf("effective_input_saved = %v, want 1", resp["effective_input_saved"])
+	if resp["effective_input_saved"] != float64(0) {
+		t.Errorf("effective_input_saved = %v, want 0 without a verified final-payload observation", resp["effective_input_saved"])
 	}
-	if resp["audit_saved"] != float64(2) {
-		t.Errorf("audit_saved = %v, want 2", resp["audit_saved"])
+	if len(fake.savedEffectiveInputs) != 0 {
+		t.Fatalf("complete-turn fabricated effective input from raw user/assistant text: %+v", fake.savedEffectiveInputs)
 	}
-	if resp["store_write_attempted"] != float64(6) {
-		t.Errorf("store_write_attempted = %v, want 6", resp["store_write_attempted"])
+	if resp["audit_saved"] != float64(1) {
+		t.Errorf("audit_saved = %v, want 1", resp["audit_saved"])
+	}
+	if resp["store_write_attempted"] != float64(4) {
+		t.Errorf("store_write_attempted = %v, want 4", resp["store_write_attempted"])
 	}
 	if resp["memories_saved"] != float64(0) {
 		t.Errorf("memories_saved = %v, want 0 without critic config", resp["memories_saved"])
@@ -768,6 +990,99 @@ func TestCompleteTurnDualShadowWritesAll(t *testing.T) {
 	}
 }
 
+func TestCompleteTurnRawSaveSurvivesDerivedAuditFailure(t *testing.T) {
+	base := &turnRecordingStore{}
+	fake := &auditFailingTurnStore{turnRecordingStore: base}
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeDualShadow
+	srv := NewServer(cfg)
+	srv.Store = fake
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	body := `{"chat_session_id":"sess-derived-fail","turn_index":4,"user_input":"user text",` +
+		`"assistant_content":"assistant text","client_meta":{"idempotency_key":"derived-fail-key"}}`
+	for attempt := 0; attempt < 2; attempt++ {
+		req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("attempt %d status=%d body=%s", attempt+1, rec.Code, rec.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("attempt %d decode: %v", attempt+1, err)
+		}
+		for field, want := range map[string]any{
+			"status":                  "ok",
+			"save_ok":                 true,
+			"raw_committed":           true,
+			"commit_state":            "committed",
+			"derived_retry_required":  false,
+			"reconciliation_required": false,
+			"queue_action":            "",
+			"retryable":               false,
+		} {
+			if got := resp[field]; got != want {
+				t.Fatalf("attempt %d %s=%v, want %v; body=%s", attempt+1, field, got, want, rec.Body.String())
+			}
+		}
+	}
+	if len(base.savedChatLogs) != 2 {
+		t.Fatalf("idempotent retry replayed raw logs: saved=%d, want 2", len(base.savedChatLogs))
+	}
+}
+
+func TestCompleteTurnMaintenanceAuditFailureDoesNotBecomeDerivedPersistenceFailure(t *testing.T) {
+	base := &turnRecordingStore{}
+	fake := &maintenanceAuditFailingTurnStore{turnRecordingStore: base}
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	srv := NewServer(cfg)
+	srv.Store = fake
+	srv.StoreOpenError = nil
+	srv.TurnWorkflows.begin("maintenance-audit-hud", "sess-maintenance-audit-fail", 4)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	body := `{"chat_session_id":"sess-maintenance-audit-fail","turn_index":4,"user_input":"user text",` +
+		`"assistant_content":"assistant text","client_meta":{"turn_workflow_request_id":"maintenance-audit-hud"}}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
+	req.Header.Set("Content-Type", "application/json")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	pipeline, _ := resp["persistence_pipeline"].(map[string]any)
+	derived, _ := pipeline["derived"].(map[string]any)
+	if derived["status"] != "delayed" {
+		t.Fatalf("maintenance audit failure changed derived persistence status: response=%#v", resp)
+	}
+	hud, _ := resp["turn_workflow_hud"].(map[string]any)
+	facts, _ := hud["facts"].([]any)
+	var derivedFact map[string]any
+	for _, item := range facts {
+		fact, _ := item.(map[string]any)
+		if fact["key"] == "derived_memory" {
+			derivedFact = fact
+			break
+		}
+	}
+	if derivedFact["status"] != "delayed" || derivedFact["disposition"] != "deferred" || derivedFact["severity"] != "notice" {
+		t.Fatalf("maintenance audit failure changed derived HUD fact: hud=%#v", hud)
+	}
+	if hud["severity"] != "warning" || hud["dismissal_policy"] != "x_only" {
+		t.Fatalf("maintenance audit failure must remain a separate warning: hud=%#v", hud)
+	}
+}
+
 func TestCompleteTurnMariaDBAuthorityWritesAll(t *testing.T) {
 	fake := &turnRecordingStore{}
 	cfg := config.Default()
@@ -779,7 +1094,12 @@ func TestCompleteTurnMariaDBAuthorityWritesAll(t *testing.T) {
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	body := `{"chat_session_id":"sess-auth","turn_index":5,"user_input":"authority input","assistant_content":"authority reply","improvement_trace":{"score":9}}`
+	verifiedEffectiveInput := "verified assembled input"
+	body := fmt.Sprintf(
+		`{"chat_session_id":"sess-auth","turn_index":5,"user_input":"authority input","assistant_content":"authority reply","improvement_trace":{"score":9},"client_meta":{"effective_input_observation":{"contract_version":"effective_input_observation.v1","status":"verified","capture_stage":"before_request_return","effective_input":%q,"effective_input_hash":%q,"hash_algorithm":"or1c_utf16_djb2.v1","payload_content_match":true}}}`,
+		verifiedEffectiveInput,
+		prepareOR1CHash(verifiedEffectiveInput),
+	)
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -805,6 +1125,9 @@ func TestCompleteTurnMariaDBAuthorityWritesAll(t *testing.T) {
 	}
 	if resp["effective_input_saved"] != float64(1) {
 		t.Errorf("effective_input_saved = %v, want 1", resp["effective_input_saved"])
+	}
+	if len(fake.savedEffectiveInputs) != 1 || fake.savedEffectiveInputs[0].EffectiveInput != verifiedEffectiveInput {
+		t.Fatalf("verified effective input was not persisted exactly: %+v", fake.savedEffectiveInputs)
 	}
 	if resp["memories_saved"] != float64(0) {
 		t.Errorf("memories_saved = %v, want 0 without critic config", resp["memories_saved"])
@@ -868,7 +1191,7 @@ func TestCompleteTurnIdempotentReplaySkipsDuplicateDerivedWrites(t *testing.T) {
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
-	body := `{"chat_session_id":"sess-retry","turn_index":5,"user_input":"retry user","assistant_content":"retry assistant","client_meta":{"critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai"}}}`
+	body := `{"chat_session_id":"sess-retry","turn_index":5,"user_input":"retry user","assistant_content":"retry assistant","client_meta":{"critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai","timeout_ms":45000}}}`
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -917,7 +1240,7 @@ func TestCompleteTurnExistingRawWithoutDerivedRetriesCriticWithoutDuplicateLogs(
 		"turn_summary":      "Mina found a brass key and gave it to Rowan.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"Mina found a brass key."},
-		"kg_triples":        []any{map[string]any{"subject": "Mina", "predicate": "gave", "object": "brass key", "valid_from": 3}},
+		"kg_triples":        []any{testEntityScalarKG("item_fact", "Mina", "character", "found", "a brass key", "string", "Mina found a brass key.")},
 		"entities":          map[string]any{"characters": []any{map[string]any{"name": "Mina"}}, "items": []any{map[string]any{"name": "brass key"}}},
 	}
 	extractionBytes, _ := json.Marshal(extraction)
@@ -937,7 +1260,7 @@ func TestCompleteTurnExistingRawWithoutDerivedRetriesCriticWithoutDuplicateLogs(
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
-	body := `{"chat_session_id":"sess-raw-only","turn_index":3,"user_input":"Mina found a brass key.","assistant_content":"Mina gave Rowan the brass key.","client_meta":{"critic":{"api_key":"k","endpoint":"https://api.example.com/v1/chat/completions","model":"critic-model","provider":"openai"}}}`
+	body := `{"chat_session_id":"sess-raw-only","turn_index":3,"user_input":"Mina found a brass key.","assistant_content":"Mina gave Rowan the brass key.","client_meta":{"critic":{"api_key":"k","endpoint":"https://api.example.com/v1/chat/completions","model":"critic-model","provider":"openai","timeout_ms":45000}}}`
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1017,7 +1340,7 @@ func TestCompleteTurnConflictingExistingRawPairWithoutPreserveDoesNotDuplicateAr
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
-	body := `{"chat_session_id":"sess-native-conflict","turn_index":14,"user_input":"new user text","assistant_content":"new assistant text","client_meta":{"critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai"}}}`
+	body := `{"chat_session_id":"sess-native-conflict","turn_index":14,"user_input":"new user text","assistant_content":"new assistant text","client_meta":{"critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai","timeout_ms":45000}}}`
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1135,7 +1458,7 @@ func TestCompleteTurnExactPairAlreadyPersistedOnAnotherTurnSkipsDuplicate(t *tes
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
-	body := `{"chat_session_id":"sess-pair-replay","turn_index":8,"user_input":"same user text","assistant_content":"same assistant text","client_meta":{"critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai"}}}`
+	body := `{"chat_session_id":"sess-pair-replay","turn_index":8,"user_input":"same user text","assistant_content":"same assistant text","client_meta":{"turn_workflow_request_id":"duplicate-pair-hud","critic":{"api_key":"k","endpoint":"https://example.test/v1/chat/completions","model":"m","provider":"openai","timeout_ms":45000}}}`
 	req := httptest.NewRequest(http.MethodPost, "/complete-turn", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1159,6 +1482,20 @@ func TestCompleteTurnExactPairAlreadyPersistedOnAnotherTurnSkipsDuplicate(t *tes
 	trace, _ := resp["trace_handoff"].(map[string]any)
 	if trace["duplicate_guard"] != "same_session_exact_pair_exists_on_another_turn" {
 		t.Fatalf("duplicate_guard = %v, want same_session_exact_pair_exists_on_another_turn; resp=%+v", trace["duplicate_guard"], resp)
+	}
+	hud, ok := resp["turn_workflow_hud"].(map[string]any)
+	if !ok {
+		t.Fatalf("turn_workflow_hud missing from duplicate response: %+v", resp)
+	}
+	if hud["display_mode"] != "notice" || hud["status"] != "completed" ||
+		hud["severity"] != "notice" || hud["dismissal_policy"] != "card_or_x" {
+		t.Fatalf("duplicate HUD status = %+v", hud)
+	}
+	if hud["title_key"] != "turn_hud.notice.duplicate_suspected" || hud["notice_code"] != "DUPLICATE_PAIR_REPLAY" {
+		t.Fatalf("duplicate HUD presentation = %+v", hud)
+	}
+	if hud["logical_turn"] != float64(8) {
+		t.Fatalf("duplicate HUD logical_turn = %v, want attempted turn 8", hud["logical_turn"])
 	}
 }
 
@@ -1187,10 +1524,11 @@ func TestCompleteTurnPostprocessorPairAlreadyPersistedOnAnotherTurnSkipsDuplicat
 		"assistant_content": "final polished text",
 		"client_meta": map[string]any{
 			"critic": map[string]any{
-				"api_key":  "k",
-				"endpoint": "https://example.test/v1/chat/completions",
-				"model":    "m",
-				"provider": "openai",
+				"api_key":    "k",
+				"endpoint":   "https://example.test/v1/chat/completions",
+				"model":      "m",
+				"provider":   "openai",
+				"timeout_ms": 45000,
 			},
 		},
 	})

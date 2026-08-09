@@ -2,10 +2,10 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,22 +248,26 @@ func TestMariaDBStoreSaveChatLogExecutesInsert(t *testing.T) {
 
 	m := &mariadbStore{db: db}
 	created := time.Date(2026, 5, 24, 10, 0, 0, 0, time.UTC)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, content")).
-		WithArgs("sess-1", 1, "user").
-		WillReturnError(sql.ErrNoRows)
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO chat_logs")).
 		WithArgs("sess-1", 1, "user", "hello", created).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, content")).
+		WithArgs("sess-1", 1, "user").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "content"}).AddRow(1, "hello"))
 
-	err = m.SaveChatLog(context.Background(), &ChatLog{
+	log := &ChatLog{
 		ChatSessionID: "sess-1",
 		TurnIndex:     1,
 		Role:          "user",
 		Content:       "hello",
 		CreatedAt:     created,
-	})
+	}
+	err = m.SaveChatLog(context.Background(), log)
 	if err != nil {
 		t.Fatalf("SaveChatLog failed: %v", err)
+	}
+	if log.ID != 1 {
+		t.Fatalf("inserted log ID = %d, want 1", log.ID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -278,6 +282,9 @@ func TestMariaDBStoreSaveChatLogSkipsExactDuplicate(t *testing.T) {
 	defer db.Close()
 
 	m := &mariadbStore{db: db}
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO chat_logs")).
+		WithArgs("sess-1", 1, "assistant", "hello", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(42, 0))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, content")).
 		WithArgs("sess-1", 1, "assistant").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "content"}).AddRow(42, "hello"))
@@ -302,6 +309,9 @@ func TestMariaDBStoreSaveChatLogRejectsRoleConflict(t *testing.T) {
 	defer db.Close()
 
 	m := &mariadbStore{db: db}
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO chat_logs")).
+		WithArgs("sess-1", 1, "assistant", "new text", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(42, 0))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, content")).
 		WithArgs("sess-1", 1, "assistant").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "content"}).AddRow(42, "old text"))
@@ -309,6 +319,54 @@ func TestMariaDBStoreSaveChatLogRejectsRoleConflict(t *testing.T) {
 	err = m.SaveChatLog(context.Background(), &ChatLog{ChatSessionID: "sess-1", TurnIndex: 1, Role: "assistant", Content: "new text"})
 	if err == nil || !strings.Contains(err.Error(), "chat log role conflict") {
 		t.Fatalf("expected chat log role conflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMariaDBStoreSaveChatLogConcurrentExactDuplicateConvergesOnOneRow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.MatchExpectationsInOrder(false)
+
+	m := &mariadbStore{db: db}
+	for i := 0; i < 2; i++ {
+		mock.ExpectExec(regexp.QuoteMeta("INSERT INTO chat_logs")).
+			WithArgs("sess-concurrent", 7, "assistant", "same final", sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(91, int64(1-i)))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id, content")).
+			WithArgs("sess-concurrent", 7, "assistant").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "content"}).AddRow(91, "same final"))
+	}
+
+	logs := []*ChatLog{
+		{ChatSessionID: "sess-concurrent", TurnIndex: 7, Role: " Assistant ", Content: "same final"},
+		{ChatSessionID: "sess-concurrent", TurnIndex: 7, Role: "assistant", Content: "same final"},
+	}
+	errs := make(chan error, len(logs))
+	var wg sync.WaitGroup
+	for _, log := range logs {
+		wg.Add(1)
+		go func(log *ChatLog) {
+			defer wg.Done()
+			errs <- m.SaveChatLog(context.Background(), log)
+		}(log)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent SaveChatLog failed: %v", err)
+		}
+	}
+	for _, log := range logs {
+		if log.ID != 91 || log.Role != "assistant" {
+			t.Fatalf("concurrent log = %#v, want ID 91 and normalized assistant role", log)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -511,7 +569,7 @@ func TestMariaDBStoreStatsQueriesCanonicalCounts(t *testing.T) {
 	}
 }
 
-func TestMariaDBStoreLockSessionMigrationSourceWritesLockAfterVectorReindex(t *testing.T) {
+func TestMariaDBStoreLockSessionMigrationSourceFailsClosedAfterVectorReindexUntilManifestParity(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -519,33 +577,19 @@ func TestMariaDBStoreLockSessionMigrationSourceWritesLockAfterVectorReindex(t *t
 	defer db.Close()
 
 	m := &mariadbStore{db: db}
-	lockedAt := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migrations")).
+	mock.ExpectQuery("SELECT source_session_id, target_session_id, mode, status, chroma_reindexed_count").
 		WithArgs(int64(42)).
-		WillReturnRows(sqlmock.NewRows([]string{"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count"}).
-			AddRow("source-session", "target-session", SessionMigrationModeCopyThenLockSource, "vector_reindexed", 2))
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migration_locks")).
-		WithArgs("source-session").
-		WillReturnRows(sqlmock.NewRows([]string{"migration_id", "source_session_id", "target_session_id", "locked", "lock_status", "reason", "locked_at"}))
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO session_migration_locks")).
-		WithArgs(int64(42), "source-session", "target-session", "operator confirmed").
-		WillReturnResult(sqlmock.NewResult(7, 1))
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migration_locks")).
-		WithArgs("source-session").
-		WillReturnRows(sqlmock.NewRows([]string{"migration_id", "source_session_id", "target_session_id", "locked", "lock_status", "reason", "locked_at"}).
-			AddRow(int64(42), "source-session", "target-session", true, "migrated_away", "operator confirmed", lockedAt))
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_migrations")).
-		WithArgs(int64(42)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
-
+		WillReturnRows(sqlmock.NewRows([]string{
+			"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count",
+		}).AddRow("source", "target", SessionMigrationModeCopyThenLockSource, "vector_reindexed", 2))
+	mock.ExpectQuery("SELECT.*COUNT\\(\\*\\).*FROM session_migration_artifact_parity").
+		WithArgs(int64(42), SessionMigrationManifestVersion).
+		WillReturnRows(sqlmock.NewRows([]string{"total", "relational_verified", "vector_verified"}).AddRow(49, 49, 49))
+	mock.ExpectRollback()
 	result, err := m.LockSessionMigrationSource(context.Background(), 42, "operator confirmed")
-	if err != nil {
-		t.Fatalf("LockSessionMigrationSource failed: %v", err)
-	}
-	if result.Status != "source_locked" || !result.ReadyForLive || !result.Lock.Locked || result.Lock.TargetSessionID != "target-session" {
-		t.Fatalf("unexpected lock result: %+v", result)
+	if result != nil || err == nil || !strings.Contains(err.Error(), "manifest parity rows 49/50") {
+		t.Fatalf("result=%+v err=%v, want 50-entry manifest parity blocker", result, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -587,15 +631,15 @@ func TestMariaDBStoreLockSessionMigrationSourceBlocksBeforeVectorReindex(t *test
 
 	m := &mariadbStore{db: db}
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migrations")).
+	mock.ExpectQuery("SELECT source_session_id, target_session_id, mode, status, chroma_reindexed_count").
 		WithArgs(int64(42)).
-		WillReturnRows(sqlmock.NewRows([]string{"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count"}).
-			AddRow("source-session", "target-session", SessionMigrationModeCopyThenLockSource, "copied", 0))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count",
+		}).AddRow("source", "target", SessionMigrationModeCopyThenLockSource, "copied", 0))
 	mock.ExpectRollback()
-
 	_, err = m.LockSessionMigrationSource(context.Background(), 42, "too early")
-	if err == nil || !strings.Contains(err.Error(), "not vector_reindexed") {
-		t.Fatalf("expected vector_reindexed block, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), `migration status "copied" is not vector_reindexed`) {
+		t.Fatalf("expected vector phase block, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -611,50 +655,15 @@ func TestMariaDBStoreLockSessionMigrationSourceBlocksCopyKeepSourceMode(t *testi
 
 	m := &mariadbStore{db: db}
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migrations")).
+	mock.ExpectQuery("SELECT source_session_id, target_session_id, mode, status, chroma_reindexed_count").
 		WithArgs(int64(42)).
-		WillReturnRows(sqlmock.NewRows([]string{"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count"}).
-			AddRow("source-session", "target-session", SessionMigrationModeCopyKeepSource, "vector_reindexed", 2))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"source_session_id", "target_session_id", "mode", "status", "chroma_reindexed_count",
+		}).AddRow("source", "target", SessionMigrationModeCopyKeepSource, "vector_reindexed", 2))
 	mock.ExpectRollback()
-
 	_, err = m.LockSessionMigrationSource(context.Background(), 42, "should not lock")
 	if err == nil || !strings.Contains(err.Error(), "does not lock source") {
-		t.Fatalf("expected copy_keep_source lock block, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSessionMigrationDeleteMappedRowsUsesOnlyLedgerTargetIDs(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("FROM session_migration_row_map")).
-		WithArgs(int64(42), "chat_logs").
-		WillReturnRows(sqlmock.NewRows([]string{"target_row_id"}).AddRow(int64(101)).AddRow(int64(102)))
-	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM chat_logs WHERE id IN")).
-		WithArgs(int64(101), int64(102)).
-		WillReturnResult(sqlmock.NewResult(0, 2))
-	mock.ExpectCommit()
-
-	tx, err := db.BeginTx(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	deleted, err := deleteSessionMigrationMappedRows(context.Background(), tx, 42, "chat_logs")
-	if err != nil {
-		t.Fatalf("deleteSessionMigrationMappedRows failed: %v", err)
-	}
-	if deleted != 2 {
-		t.Fatalf("deleted = %d, want 2", deleted)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("expected copy-keep mode block, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -775,6 +784,27 @@ func TestMariaDBStoreListAuditLogsQueriesRows(t *testing.T) {
 	}
 }
 
+func TestMariaDBStoreListAuditLogsZeroLimitReadsAllRows(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m := &mariadbStore{db: db}
+	mock.ExpectQuery(`(?s)FROM audit_logs.*ORDER BY created_at DESC, id DESC\s*$`).
+		WithArgs("sess-all", "sess-all", "", "").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "created_at", "event_type", "chat_session_id", "target_type",
+			"target_id", "summary", "details_json", "source",
+		}))
+	if _, err := m.ListAuditLogs(context.Background(), "sess-all", "", 0); err != nil {
+		t.Fatalf("ListAuditLogs zero limit: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMariaDBStoreSaveSupersessionResolutionWritesAuditAndEvidenceState(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -863,6 +893,114 @@ func TestMariaDBStoreListCharacterEventsQueriesRows(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].CharacterName != "Chloe" || items[0].TurnIndex != 8 {
 		t.Fatalf("unexpected character events: %+v", items)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMariaDBSaveWorldRuleCreatesNewTurnVersion(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	m := &mariadbStore{db: db}
+	now := time.Date(2026, 8, 8, 15, 0, 0, 0, time.UTC)
+	rule := &WorldRule{
+		ChatSessionID: "sess-world",
+		Scope:         "root",
+		Category:      "society",
+		Key:           "strict_status_society",
+		ValueJSON:     `{"statement":"status matters"}`,
+		Genre:         "historical",
+		SourceTurn:    2,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	mock.ExpectQuery("SELECT id FROM world_rules .*source_turn = \\?").
+		WithArgs(rule.ChatSessionID, rule.Scope, rule.Key, nil, rule.SourceTurn, rule.SourceTurn).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectExec("INSERT INTO world_rules").
+		WithArgs(rule.ChatSessionID, rule.Scope, nil, rule.Category, rule.Key, rule.ValueJSON,
+			rule.Genre, rule.SourceTurn, false, false, false, now, now).
+		WillReturnResult(sqlmock.NewResult(44, 1))
+
+	if err := m.SaveWorldRule(context.Background(), rule); err != nil {
+		t.Fatalf("SaveWorldRule: %v", err)
+	}
+	if rule.ID != 44 {
+		t.Fatalf("rule ID = %d, want 44", rule.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMariaDBSaveWorldRuleUpdatesSameTurnWithoutDuplicate(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	m := &mariadbStore{db: db}
+	now := time.Date(2026, 8, 8, 15, 5, 0, 0, time.UTC)
+	rule := &WorldRule{
+		ChatSessionID: "sess-world",
+		Scope:         "root",
+		Category:      "society",
+		Key:           "strict_status_society",
+		ValueJSON:     `{"statement":"status matters"}`,
+		SourceTurn:    2,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	mock.ExpectQuery("SELECT id FROM world_rules .*source_turn = \\?").
+		WithArgs(rule.ChatSessionID, rule.Scope, rule.Key, nil, rule.SourceTurn, rule.SourceTurn).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(33))
+	mock.ExpectExec("UPDATE world_rules .*WHERE id = \\?").
+		WithArgs(nil, rule.Category, rule.ValueJSON, nil, rule.SourceTurn, rule.SourceTurn,
+			false, false, false, now, int64(33)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	if err := m.SaveWorldRule(context.Background(), rule); err != nil {
+		t.Fatalf("SaveWorldRule: %v", err)
+	}
+	if rule.ID != 33 {
+		t.Fatalf("rule ID = %d, want 33", rule.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMariaDBListWorldRulesReadsOnlyLatestTurnVersion(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	m := &mariadbStore{db: db}
+	now := time.Date(2026, 8, 8, 15, 10, 0, 0, time.UTC)
+	mock.ExpectQuery("FROM world_rules AS current_rule .*ORDER BY COALESCE\\(candidate.source_turn, 0\\) DESC, candidate.id DESC").
+		WithArgs("sess-world").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "chat_session_id", "scope", "scope_name", "category", "key", "value_json", "genre", "source_turn",
+			"pinned", "suppressed", "user_corrected", "created_at", "updated_at",
+		}).AddRow(44, "sess-world", "root", nil, "society", "strict_status_society",
+			`{"statement":"status matters"}`, nil, 2, false, false, false, now, now))
+
+	items, err := m.ListWorldRules(context.Background(), "sess-world")
+	if err != nil {
+		t.Fatalf("ListWorldRules: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != 44 || items[0].SourceTurn != 2 {
+		t.Fatalf("unexpected world rules: %+v", items)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -1200,6 +1338,36 @@ func TestMariaDBStoreSearchChapterSummariesReturnsRows(t *testing.T) {
 	}
 	if items[0].ChapterTitle != "Archive Gate" || items[0].CallbackCandidatesJSON != `["gate"]` {
 		t.Fatalf("unexpected item: %+v", items[0])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMariaDBHierarchyZeroLimitDoesNotAddHiddenLimit(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m := &mariadbStore{db: db}
+
+	mock.ExpectQuery(`(?s)FROM chapter_summaries.*ORDER BY chapter_index DESC, id DESC\s*$`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if _, err := m.SearchChapterSummaries(context.Background(), "session", "", 0, 0, 0); err != nil {
+		t.Fatalf("chapter search: %v", err)
+	}
+
+	mock.ExpectQuery(`(?s)FROM arc_summaries.*ORDER BY arc_index DESC, id DESC\s*$`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if _, err := m.SearchArcSummaries(context.Background(), "session", "", 0, 0, 0); err != nil {
+		t.Fatalf("arc search: %v", err)
+	}
+
+	mock.ExpectQuery(`(?s)FROM saga_digests.*ORDER BY to_turn DESC, id DESC\s*$`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if _, err := m.SearchSagaDigests(context.Background(), "session", "", 0, 0, 0); err != nil {
+		t.Fatalf("saga search: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

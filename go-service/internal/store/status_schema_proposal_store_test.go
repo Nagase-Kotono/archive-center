@@ -310,8 +310,15 @@ func TestMariaDBStoreSaveStatusCurrentValuePersistsEvidenceBoundCurrentValue(t *
 	}
 }
 
-func TestMariaDBStoreListStatusCurrentValuesScansCurrentRows(t *testing.T) {
-	db, mock, err := sqlmock.New()
+func TestMariaDBStoreListStatusCurrentValuesKeepsLegacyRowsAndRejectsDeclaredStaleSources(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(requiredSQLMatcher(
+		[]string{
+			"left join memory_source_revisions source_revision",
+			"source_revision.lifecycle_state = 'active'",
+			"nullif(json_unquote(json_extract(current_value.evidence_json, '$.source_revision')), '') is null",
+			"or source_revision.source_revision is not null",
+		}, nil,
+	)))
 	if err != nil {
 		t.Fatalf("sqlmock new: %v", err)
 	}
@@ -328,7 +335,7 @@ func TestMariaDBStoreListStatusCurrentValuesScansCurrentRows(t *testing.T) {
 		"이시우", "resource", "75", `{"turn":2}`, 2,
 		"current", created, created,
 	)
-	mock.ExpectQuery("FROM status_current_values").
+	mock.ExpectQuery("legacy-compatible source fence").
 		WithArgs("sess-schema", "character", "siwoo", "hp", 50).
 		WillReturnRows(rows)
 
@@ -338,6 +345,21 @@ func TestMariaDBStoreListStatusCurrentValuesScansCurrentRows(t *testing.T) {
 	}
 	if len(values) != 1 || values[0].ID != 200 || values[0].StatusKey != "hp" || values[0].EvidenceJSON == "" {
 		t.Fatalf("unexpected current values: %+v", values)
+	}
+	// The same query returns no row when evidence declares a revision and the
+	// active-source LEFT JOIN cannot match it. SQL semantics, not Go filtering,
+	// therefore exclude stale source-backed projections while preserving the
+	// legacy row above, whose evidence has no source_revision.
+	mock.ExpectQuery("declared stale source excluded").
+		WithArgs("sess-schema", "character", "siwoo", "hp", 50).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "chat_session_id", "registry_id", "status_key", "owner_scope", "owner_id",
+			"owner_label", "value_kind", "value_json", "evidence_json", "source_turn",
+			"write_state", "created_at", "updated_at",
+		}))
+	values, err = m.ListStatusCurrentValues(context.Background(), "sess-schema", "character", "siwoo", "hp", 50)
+	if err != nil || len(values) != 0 {
+		t.Fatalf("declared stale source was not excluded: values=%+v err=%v", values, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -416,6 +438,52 @@ func TestMariaDBStoreListStatusChangeEventsScansLedgerRows(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].ID != 300 || events[0].NewValueJSON != "63" || events[0].StoryClockJSON == "" {
 		t.Fatalf("unexpected events: %+v", events)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestMariaDBStoreStatusChangeEventSourceLookupsAreExactAndUncapped(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock new: %v", err)
+	}
+	defer db.Close()
+
+	m := &mariadbStore{db: db}
+	created := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	columns := []string{
+		"id", "chat_session_id", "registry_id", "status_value_id", "status_key", "owner_scope", "owner_id",
+		"event_kind", "previous_value_json", "new_value_json", "evidence_json", "source_turn",
+		"story_clock_json", "event_state", "created_at",
+	}
+	sourceRows := sqlmock.NewRows(columns).AddRow(
+		int64(301), "sess-schema", int64(100), int64(200), "story_clock", "session", "current",
+		"correction", `{}`, `{"precision":"exact"}`, `{"source_revision":"revision-9","current_projection":true}`, 9,
+		`{"precision":"exact"}`, "recorded", created,
+	)
+	mock.ExpectQuery("JSON_UNQUOTE\\(JSON_EXTRACT\\(evidence_json, '\\$\\.source_revision'\\)\\)").
+		WithArgs("sess-schema", "story_clock", 9, "revision-9").
+		WillReturnRows(sourceRows)
+
+	event, err := m.GetStatusChangeEventBySourceRevision(context.Background(), "sess-schema", "story_clock", "revision-9", 9)
+	if err != nil || event.ID != 301 {
+		t.Fatalf("exact source lookup mismatch: event=%+v err=%v", event, err)
+	}
+
+	currentRows := sqlmock.NewRows(columns).AddRow(
+		int64(301), "sess-schema", int64(100), int64(200), "story_clock", "session", "current",
+		"correction", `{}`, `{"precision":"exact"}`, `{"source_revision":"revision-9","current_projection":true}`, 9,
+		`{"precision":"exact"}`, "recorded", created,
+	)
+	mock.ExpectQuery("JOIN memory_source_revisions source_revision").
+		WithArgs("sess-schema", "story_clock").
+		WillReturnRows(currentRows)
+
+	event, err = m.GetLatestCurrentProjectionStatusChangeEvent(context.Background(), "sess-schema", "story_clock")
+	if err != nil || event.ID != 301 || event.SourceTurn != 9 {
+		t.Fatalf("latest current projection lookup mismatch: event=%+v err=%v", event, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

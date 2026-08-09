@@ -34,6 +34,9 @@ func (m *mariadbStore) DeleteMemories(ctx context.Context, chatSessionID string,
 	if err := m.ensureDB(); err != nil {
 		return err
 	}
+	if _, err := m.db.ExecContext(ctx, "UPDATE precise_memory_units SET lifecycle_state = 'invalidated', updated_at = CURRENT_TIMESTAMP(3) WHERE chat_session_id = ? AND source_turn_end >= ? AND lifecycle_state = 'active'", chatSessionID, fromTurn); err != nil {
+		return err
+	}
 	_, err := m.db.ExecContext(ctx, "DELETE FROM memories WHERE chat_session_id = ? AND turn_index >= ?", chatSessionID, fromTurn)
 	return err
 }
@@ -92,6 +95,60 @@ func (m *mariadbStore) DeleteEntities(ctx context.Context, chatSessionID string,
 			_ = tx.Rollback()
 		}
 	}()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE precise_memory_units
+		SET lifecycle_state = 'invalidated',
+		    actor_entity_id = NULL,
+		    subject_entity_id = NULL,
+		    affected_entity_id = NULL,
+		    location_entity_id = NULL,
+		    object_entity_id = NULL,
+		    knowledge_holder_entity_id = NULL,
+		    updated_at = CURRENT_TIMESTAMP(3)
+		WHERE chat_session_id = ? AND source_turn_end >= ?
+	`, chatSessionID, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM speaker_attributions WHERE chat_session_id = ? AND source_turn >= ?", chatSessionID, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM entity_identity_artifact_bindings WHERE chat_session_id = ? AND source_turn >= ?", chatSessionID, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM entity_identity_surfaces WHERE chat_session_id = ? AND source_turn >= ?", chatSessionID, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE entity_identities identity_row
+		SET last_seen_turn = GREATEST(
+			identity_row.first_seen_turn,
+			COALESCE((
+				SELECT MAX(surface.source_turn)
+				FROM entity_identity_surfaces surface
+				WHERE surface.chat_session_id = identity_row.chat_session_id
+				  AND surface.stable_entity_id = identity_row.stable_entity_id
+			), identity_row.first_seen_turn)
+		),
+		updated_at = CURRENT_TIMESTAMP(3)
+		WHERE identity_row.chat_session_id = ?
+		  AND identity_row.source_turn < ?
+		  AND identity_row.last_seen_turn >= ?
+	`, chatSessionID, fromTurn, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM entity_identity_links
+		WHERE chat_session_id = ?
+		  AND (
+			source_entity_id IN (SELECT stable_entity_id FROM entity_identities WHERE chat_session_id = ? AND source_turn >= ?)
+			OR target_entity_id IN (SELECT stable_entity_id FROM entity_identities WHERE chat_session_id = ? AND source_turn >= ?)
+		  )
+	`, chatSessionID, chatSessionID, fromTurn, chatSessionID, fromTurn); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM entity_identities WHERE chat_session_id = ? AND source_turn >= ?", chatSessionID, fromTurn); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE entities
 		SET last_seen_turn = ?,

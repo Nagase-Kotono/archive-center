@@ -125,7 +125,7 @@ lastTurnTrace = {
   critic: { memorySaved: false, kgSaved: false }
 };
 html = renderTurnTraceRows();
-assert(html.includes("Supervisor") && html.includes("fail"), "backend-off supervisor fallback missing");
+assert(html.includes("Publisher LLM") && html.includes("fail"), "backend-off publisher status missing");
 assert(html.includes("Storylines") && html.includes("no storylines"), "backend-off storyline fallback missing");
 assert(html.includes("World Rules") && html.includes("no rules"), "backend-off world-rule fallback missing");
 console.log(JSON.stringify({ storylineText, worldRulesText, ok: true }));
@@ -431,7 +431,9 @@ func TestArchiveCenterJSPrepareTurnInjectionPackMarkers(t *testing.T) {
 		"const injectionPack = orchResult && orchResult._injectionPack",
 		`response_projection: "prepare_turn.production_compact.v1"`,
 		`responseProjection: result.response_projection || ""`,
-		`source: "prepare_turn.production_compact.v1"`,
+		`preparedBundle.tracePreview.compact_orchestration`,
+		`trace.search = compactSearchResult`,
+		`trace.supervisor = compactSupervisorTrace`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
@@ -440,6 +442,11 @@ func TestArchiveCenterJSPrepareTurnInjectionPackMarkers(t *testing.T) {
 	}
 	if strings.Contains(src, "await runSupervisor(") {
 		t.Fatal("Archive Center.js still performs a separate supervisor call after /prepare-turn")
+	}
+	for _, forbidden := range []string{"compactMemoryLineage", "compactMemoryCount", "compactSupervisorProposal", "compactSupervisorStatus"} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js still derives Go-owned compact status/count %q", forbidden)
+		}
 	}
 }
 
@@ -678,8 +685,11 @@ func TestArchiveCenterJSPluginVersionMarkers(t *testing.T) {
 	required := []string{
 		"//@name Archive Center",
 		"//@display-name Archive Center",
-		"//@version 3.5.0",
-		`const VERSION = "3.5.0";`,
+		"//@version 3.9.9",
+		`const VERSION = "3.9.9";`,
+		`"settings.title": ` + "`🗂️ Archive Center ${VERSION} 설정`",
+		`"settings.title": ` + "`🗂️ Archive Center ${VERSION} Settings`",
+		`"settings.title": ` + "`🗂️ Archive Center ${VERSION} 設定`",
 		`const VERSION_STR = typeof VERSION !== "undefined" ? String(VERSION) : "unknown";`,
 		"source_version:    VERSION_STR",
 		`bridgeFetch("/update/check", {`,
@@ -754,45 +764,65 @@ func TestArchiveCenterJSTurnWorkflowHUDSettingMarkers(t *testing.T) {
 		`if (prevTurnWorkflowHUDEnabled && settings.turnWorkflowHUDEnabled === false)`,
 		`function turnWorkflowHUDIsEnabled()`,
 		`if (!turnWorkflowHUDIsEnabled())`,
+		`function consumeTurnWorkflowHUDNotice(view)`,
+		`"turn_hud.stage.publisher_llm": "출판사 LLM 호출"`,
+		`"turn_hud.stage.raw_persist": "입력 저장"`,
+		`"turn_hud.stage.critic_llm": "평론가 호출"`,
+		`"turn_hud.count.knowledge_graph": "관계 지식"`,
+		`"turn_hud.count.relationship_state": "관계 상태"`,
+		`"explorer.tabs.kg_triples.label": "관계 지식"`,
+		`"turn_hud.stage.publisher_llm": "Publisher LLM call"`,
+		`"turn_hud.stage.raw_persist": "Saving input"`,
+		`"turn_hud.stage.critic_llm": "Critic call"`,
+		`"turn_hud.stage.publisher_llm": "Publisher LLM 呼び出し"`,
+		`"turn_hud.stage.raw_persist": "入力を保存"`,
+		`"turn_hud.stage.critic_llm": "批評家を呼び出し"`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing turn workflow HUD setting marker %q", needle)
 		}
 	}
+	for _, forbidden := range []string{
+		"function showTurnWorkflowHUDOOCRecognition(",
+		`kind: "ooc_input_cancelled"`,
+		`"turn_hud.count.relationship_knowledge"`,
+		"`ooc-observation:${sessionId}:",
+		`"turn_hud.stage.publisher_llm": "감독관 LLM 호출"`,
+		`"turn_hud.stage.raw_persist": "사용자·Assistant 원문 저장"`,
+		`"turn_hud.stage.critic_llm": "평론가 LLM 호출"`,
+		`"turn_hud.stage.publisher_llm": "Supervisor LLM call"`,
+		`"turn_hud.stage.raw_persist": "Saving user and Assistant source"`,
+		`"turn_hud.stage.critic_llm": "Critic LLM call"`,
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js must not fabricate an OOC decision or notice: %q", forbidden)
+		}
+	}
 }
 
-func TestArchiveCenterJSInitiativeControlLatestEquivalentMarkers(t *testing.T) {
+func TestArchiveCenterJSRetiredLocalInitiativePolicyIsAbsent(t *testing.T) {
 	src := readArchiveCenterJS(t)
-	required := []string{
+	forbidden := []string{
 		`storyNarrativeStance: "balanced"`,
 		"merged.storyNarrativeStance = sanitizeEnumValue(",
 		"NARRATIVE_STANCE_MODES",
 		`<select id="mo-storyNarrativeStance"`,
-		`<option value="reactive"`,
-		`<option value="balanced"`,
-		`<option value="proactive"`,
-		`const stanceEl = $("mo-storyNarrativeStance");`,
 		`storyNarrativeStance: $("mo-storyNarrativeStance").value`,
-		`$("mo-storyNarrativeStance").value = settings.storyNarrativeStance || "balanced";`,
 		"function buildInitiativeModeSuffix(mode)",
 		"function buildInitiativeModeBounds(mode)",
 		`narrative_stance: settings.storyNarrativeStance || "balanced"`,
-		"supervisorResult:   result.supervisor_result",
-		"const supervisorResult = (preparedBundle && preparedBundle.supervisorResult)",
 		"extractNarrativeStanceSummary(_narrativeStance)",
 		"initiativeSummaryRaw",
 		"initiativeSuffixRaw",
 		"initiativeBoundsRaw",
 		`debugLog("initiative:", _initiativeSummary.mode`,
+		"storyInitiativeMode",
 	}
-	for _, needle := range required {
-		if !strings.Contains(src, needle) {
-			t.Fatalf("Archive Center.js missing H-3 initiative latest-equivalent marker %q", needle)
+	for _, needle := range forbidden {
+		if strings.Contains(src, needle) {
+			t.Fatalf("Archive Center.js still contains retired local initiative policy %q", needle)
 		}
-	}
-	if strings.Contains(src, "storyInitiativeMode") {
-		t.Fatal("Archive Center.js should not reintroduce retired storyInitiativeMode beside storyNarrativeStance")
 	}
 }
 
@@ -960,43 +990,192 @@ func TestArchiveCenterJSPersistenceRequestsDoNotBlindRetry(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	for _, marker := range []string{
 		`bridgeFetchWithRetry("/turns", { method: "POST", body }, 1)`,
-		`bridgeFetchWithRetry("/effective-inputs", { method: "POST", body }, 1)`,
 		`bridgeFetchWithRetry("/turns/complete", { method: "POST", body }, 1)`,
-		`bridgeFetchWithRetry("/complete-turn", { method: "POST", body, timeoutMs: getCompleteTurnTimeoutMs() }, 1)`,
+		`bridgeFetchWithRetry("/complete-turn", { method: "POST", body, timeoutMs: 0 }, 1)`,
 		`/complete-turn/request-status?idempotency_key=`,
 		`idempotency_key: idempotencyKey`,
+		`contract_version: "effective_input_observation.v1"`,
+		`Number(_ctResult.effective_input_saved || 0) > 0`,
 	} {
 		if !strings.Contains(src, marker) {
 			t.Fatalf("Archive Center.js missing persistence idempotency marker %q", marker)
 		}
 	}
+	if strings.Contains(src, `bridgeFetchWithRetry("/effective-inputs"`) {
+		t.Fatal("Archive Center.js retains the duplicate effective-input persistence request")
+	}
 }
 
-func TestArchiveCenterJSStreamingAfterRequestPollerMarkers(t *testing.T) {
+func TestBackendOwnedLongOperationsDoNotUsePluginRequestTimeout(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	cases := []struct {
+		functionName string
+		pathFragment string
+	}{
+		{`notifyBackendSessionDeletedFromRisu`, `req_source=risu_plugin_chat_delete`},
+		{`applyReadySessionMigration`, `/admin/session-migrate`},
+		{`referenceLibraryDeleteWork`, `bridgeFetch(path`},
+		{`referenceLibraryImportFile`, `/documents`},
+		{`referenceLibrarySearchVectors`, `/vector/search`},
+		{`referenceCanonPreviewFile`, `/canon-packs/preview/v1`},
+		{`referenceCanonInstallFile`, `/canon-packs/install/v1`},
+		{`referenceCanonLifecycle`, `/lifecycle/v1`},
+		{`referenceDiscoveryRunFromUI`, `/source-discovery/jobs/v1`},
+		{`referenceDiscoveryAdmitFromUI`, `/admit/v1`},
+		{`applyArchiveCenterUpdate`, `/update/apply`},
+		{`tryPrepareTurn`, `/prepare-turn`},
+		{`drainOneFailedQueueItem`, `bridgeFetchWithRetry("/complete-turn"`},
+		{`queuePendingCompleteTurnPayload`, `result = await bridgeFetchWithRetry(`},
+		{`executeAutoRollback`, `/rollback/`},
+		{`tryCompleteTurn`, `/complete-turn`},
+		{`resetArchiveDatabaseFromDebugUI`, `/admin/database-reset`},
+		{`exportSession`, `/export`},
+		{`runEpisodeBackfillOnlyForSession`, `/admin/rescan`},
+		{`runDerivedArtifactBackfillOnlyForSession`, `/admin/rescan`},
+		{`explorerRepairChatLogs`, `/turns/repair-replay`},
+		{`importHypaMemory`, `/import/hypamemory`},
+		{`explorerRegenerateMemory`, `/explorer/memories/regenerate`},
+		{`explorerRegenerateEpisode`, `/episodes/regenerate`},
+		{`explorerMergeEpisodes`, `/episodes/merge`},
+		{`deleteTimelineSessionFromBackend`, `req_source=timeline_manual_delete`},
+		{`runTimelineSessionCopy`, `/sessions/migrate-preview`},
+		{`runTimelineSessionMigration`, `/sessions/migrate-preview`},
+		{`runTimelineSessionMigrationRollback`, `/sessions/migrate-rollback`},
+		{`runTimelineSessionMigrationCleanup`, `/sessions/migrate-cleanup-source`},
+		{`loadSubjectiveEntityBundlesForPersonaCapsule`, `/subjective-entity-memories/entities`},
+		{`createPersonaCapsuleFromSelectedEntityBundle`, `/subjective-entity-memories/capsule`},
+		{`createPersonaCapsuleFromSelectedEntityMemories`, `/subjective-entity-memories/capsule`},
+	}
+	for _, tc := range cases {
+		block := extractArchiveCenterJSAsyncFunction(t, src, tc.functionName)
+		pathIndex := strings.Index(block, tc.pathFragment)
+		if pathIndex < 0 {
+			t.Fatalf("%s missing long-operation path %s", tc.functionName, tc.pathFragment)
+		}
+		end := pathIndex + 2000
+		if end > len(block) {
+			end = len(block)
+		}
+		if !strings.Contains(block[pathIndex:end], `timeoutMs: 0`) {
+			t.Fatalf("%s still applies Plugin Timeout to %s", tc.functionName, tc.pathFragment)
+		}
+	}
+}
+
+func TestArchiveCenterJSImmediateUpdateUsesOneServerAuthoritativeApplyCall(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	check := extractArchiveCenterJSAsyncFunction(t, src, "checkArchiveCenterUpdate")
+	if strings.Count(check, `bridgeFetch("/update/check"`) != 1 || !strings.Contains(check, `timeoutMs: 0`) {
+		t.Fatal("checkArchiveCenterUpdate must allow the backend to finish verified package preflight")
+	}
+	apply := extractArchiveCenterJSAsyncFunction(t, src, "applyArchiveCenterUpdate")
+	if strings.Count(apply, `bridgeFetch("/update/apply"`) != 1 {
+		t.Fatal("applyArchiveCenterUpdate must issue exactly one POST /update/apply request")
+	}
+	for _, forbidden := range []string{"checkArchiveCenterUpdate", "/update/check", "/update/download", "asset_name", "expected_sha256", "current_version", "platform"} {
+		if strings.Contains(apply, forbidden) {
+			t.Fatalf("applyArchiveCenterUpdate retains client-side update selection %q", forbidden)
+		}
+	}
+	start := strings.Index(src, `const updateDownloadBtn = $("mo-update-download");`)
+	if start < 0 {
+		t.Fatal("immediate update button binding is missing")
+	}
+	endOffset := strings.Index(src[start:], "void refreshArchiveCenterUpdateStatus();")
+	if endOffset < 0 {
+		t.Fatal("update button binding end marker is missing")
+	}
+	binding := src[start : start+endOffset]
+	if strings.Contains(binding, "showConfirmModal") {
+		t.Fatal("Update Now still requires a second confirmation click")
+	}
+	if strings.Count(binding, "applyArchiveCenterUpdate()") != 1 {
+		t.Fatal("Update Now click must invoke applyArchiveCenterUpdate exactly once")
+	}
+}
+
+func TestArchiveCenterJSFinalConfirmationUsesAfterRequestWithoutOutputListener(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"const STREAMING_AFTER_REQUEST_POLL_INTERVAL_MS = 800;",
-		"const STREAMING_AFTER_REQUEST_STABLE_POLLS = 3;",
-		"const STREAMING_AFTER_REQUEST_OBSERVED_STREAM_STABLE_POLLS = 4;",
-		"const STREAMING_AFTER_REQUEST_OBSERVED_STREAM_QUIET_MS = 8 * 1000;",
-		"const _streamingAfterRequestWatchers = new Map();",
-		"function armStreamingAfterRequestWatch(sessionId, type, requestId)",
-		"function pollStreamingAfterRequestWatch(sessionId)",
-		"function markNativeAfterRequestObserved(sessionId, type)",
-		"function stopStreamingAfterRequestWatch(sessionId, detail)",
-		"native afterRequest missing; recovered from RisuAI active chat",
-		"late native afterRequest ignored after poller recovery",
-		"RisuAI active chat is still streaming",
-		"persistence deferred until RisuAI active chat confirmation",
-		"armStreamingAfterRequestWatch(orchSessionId, type, orchRequestId);",
+		"const _pendingFinalConfirmations = new Map();",
+		"const _risuHookLifecycle = {",
+		"async function captureFinalConfirmationRequestContext(sessionId, type, requestId)",
+		"function acceptRisuAfterRequestFinal(sessionId, type, pendingContext, requestContext, assistantContent)",
+		"function observePendingFinalConfirmationAtHostSignal(sessionId, signalSource)",
+		"async function drainPendingFinalConfirmations(signalSource)",
+		`contract_version: "source_acceptance_observation.v3"`,
+		`finality_source: "risu_afterRequest"`,
+		`finality_state: "received_final_response"`,
+		`host_signal_source: "afterRequest"`,
+		`prompt_memory_availability: "same_turn"`,
+		"function persistAfterRequestContent()",
+		`contract_version: "source_acceptance_observation.v2"`,
+		`host_lifecycle_contract_version: "risu_host_lifecycle_observation.v1"`,
+		`finality_source: "risu_next_host_signal_active_chat"`,
+		`finality_state: "committed_assistant_observed"`,
+		`position_observation: "committed_before_next_host_signal"`,
+		`next_signal_user_observed_content_hash: nextSignalUserObservedContentHash`,
+		`request_id_provenance: "archive_center_correlation"`,
+		"persistAcceptedHostFinalWithoutBlockingRequest",
+		`prompt_memory_availability: "one_turn_late"`,
+		`recordRisuHookLifecycle("input", "callback_observed");`,
+		`recordRisuHookLifecycle("beforeRequest", "callback_observed");`,
+		`recordRisuHookLifecycle("afterRequest", "callback_observed");`,
+		`recordRisuHookLifecycle("beforeRequest", "registration_requested_unconfirmed");`,
+		"requested (host acceptance unconfirmed)",
+		"return responseReturnContent;",
+		"_pendingFinalConfirmationDrainRequested = true",
+		"pending.requestContext !== observation.requestContext",
+		"await captureFinalConfirmationRequestContext(orchSessionId, type, orchRequestId);",
+		"ensureActiveChatCompletedTurnsBackfilled(orchSessionId",
+		"async function removeRegisteredRisuHooksOnUnload()",
+		`await R.removeRisuScriptHandler("input", onInputHook);`,
+		`await R.removeRisuReplacer("beforeRequest", onBeforeRequest);`,
+		`await R.removeRisuReplacer("afterRequest", onAfterRequest);`,
+		"await R.onUnload(removeRegisteredRisuHooksOnUnload);",
 		`hostLifecycleObservation: "before_request_observed"`,
 		`host_lifecycle_observation: String(observed.hostLifecycleObservation || "")`,
-		`? "generation_watch_active"`,
 		"Streaming Hook",
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
-			t.Fatalf("Archive Center.js missing streaming afterRequest poller marker %q", needle)
+			t.Fatalf("Archive Center.js missing event-driven final confirmation marker %q", needle)
+		}
+	}
+	for _, forbidden := range []string{
+		"STREAMING_AFTER_REQUEST_START_DELAY_MS",
+		"STREAMING_AFTER_REQUEST_POLL_INTERVAL_MS",
+		"STREAMING_AFTER_REQUEST_STABLE_POLLS",
+		"STREAMING_AFTER_REQUEST_OBSERVED_STREAM_QUIET_MS",
+		"STREAMING_AFTER_REQUEST_TIMEOUT_MS",
+		"STREAMING_AFTER_REQUEST_RECENT_RECOVERY_GRACE_MS",
+		"ROLLBACK_PROMOTED_ASSISTANT_SYNC_GRACE_MS",
+		"assessPromotedAssistantSyncRollbackGuard",
+		"pending_active_chat_confirmation",
+		"_streamingAfterRequestSyntheticCallDepth",
+		"pollStreamingAfterRequestWatch",
+		"armStreamingAfterRequestWatch",
+		"synthetic_after_request",
+		"characterData: true",
+		`kind: "host_candidate"`,
+		"async function observePendingFinalConfirmation(",
+		"onDisplayFinalitySignal",
+		`addRisuScriptHandler("display"`,
+		`drainPendingFinalConfirmations("native_afterRequest")`,
+		`drainPendingFinalConfirmations("risu_display")`,
+		"waiting for RisuAI active assistant tail",
+		"registerFinalConfirmationObserver",
+		"acceptRisuAfterRequestFinality",
+		"persistAcceptedAfterRequestWithoutBlockingDisplay",
+		"acceptRisuOutputFinal",
+		"onRisuOutput",
+		"persistOfficialRisuOutputWithoutBlockingHost",
+		`recordRisuHookLifecycle("output", "callback_observed");`,
+		`addRisuChatListener("output"`,
+		`removeRisuChatListener("output"`,
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains forbidden timer/synthetic finality marker %q", forbidden)
 		}
 	}
 	onBeforeRequestAt := strings.Index(src, "async function onBeforeRequest")
@@ -1004,25 +1183,62 @@ func TestArchiveCenterJSStreamingAfterRequestPollerMarkers(t *testing.T) {
 		t.Fatal("Archive Center.js missing onBeforeRequest")
 	}
 	onBeforeRequest := src[onBeforeRequestAt:]
-	armAt := strings.Index(onBeforeRequest, "armStreamingAfterRequestWatch(orchSessionId, type, orchRequestId);")
+	captureAt := strings.Index(onBeforeRequest, "await captureFinalConfirmationRequestContext(orchSessionId, type, orchRequestId);")
 	rollbackAt := strings.Index(onBeforeRequest, "await checkAndAutoRollback(orchSessionId, rollbackComparable.messages")
-	if armAt < 0 || rollbackAt < 0 || armAt > rollbackAt {
-		t.Fatal("generation watch must start before PocketRisu-style removed tail is evaluated")
+	if captureAt < 0 || rollbackAt < 0 || captureAt > rollbackAt {
+		t.Fatal("RisuAI request coordinates must be captured before removed-tail evaluation")
 	}
 }
 
-func TestArchiveCenterJSAfterRequestKeepsEstablishedOriginCID(t *testing.T) {
+func TestArchiveCenterJSAfterRequestStartsPersistenceWithoutBlockingVisibleOutput(t *testing.T) {
+	src := readArchiveCenterJS(t)
+	afterRequest := extractArchiveCenterJSFunction(t, src, "onAfterRequest")
+	acceptAt := strings.Index(afterRequest, "const finalObservation = acceptRisuAfterRequestFinal(")
+	scheduleAt := strings.Index(afterRequest, "Promise.resolve().then(function persistAfterRequestContent()")
+	returnRelativeAt := -1
+	if scheduleAt >= 0 {
+		returnRelativeAt = strings.Index(afterRequest[scheduleAt:], "return responseReturnContent;")
+	}
+	if acceptAt < 0 || scheduleAt < 0 || returnRelativeAt < 0 {
+		t.Fatal("afterRequest final acceptance, persistence scheduling, or response return is missing")
+	}
+	returnAt := scheduleAt + returnRelativeAt
+	if !(acceptAt < scheduleAt && scheduleAt < returnAt) {
+		t.Fatal("afterRequest must accept the final response, schedule persistence, and return in order")
+	}
+	if strings.Contains(src, "async function onAfterRequest") {
+		t.Fatal("afterRequest remains async and can withhold the replacement response")
+	}
+	if strings.Contains(afterRequest[:returnAt], "await ") {
+		t.Fatal("afterRequest performs awaited work before returning the visible response")
+	}
+	if strings.Contains(afterRequest[:returnAt], "resolveAfterRequestWriteSessionId") {
+		t.Fatal("afterRequest performs session routing before returning the visible response")
+	}
+	if strings.Count(afterRequest, "function persistAfterRequestContent()") != 1 {
+		t.Fatal("afterRequest persistence schedule must have exactly one entry point")
+	}
+	for _, forbidden := range []string{"acceptRisuOutputFinal(", "onRisuOutput", `addRisuChatListener("output"`} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("removed output-listener finality path returned: %q", forbidden)
+		}
+	}
+}
+
+func TestArchiveCenterJSAfterRequestUsesBeforeRequestSessionCoordinates(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	required := []string{
-		"async function resolveAfterRequestWriteSessionId(orchResult)",
-		"!isCidSessionId(orchSessionId) && isCidSessionId(currentSessionId) && currentSessionId !== orchSessionId",
-		`reason: "fresh_active_cid_after_request"`,
-		"return orchSessionId || currentSessionId;",
+		"const capturedWriteSessionId = normalizeSessionId(",
+		"latestOrchResult && latestOrchResult._chatSessionId",
+		"const chatSessionId = capturedWriteSessionId || cachedWriteSessionId || SESSION_FALLBACK;",
 	}
 	for _, marker := range required {
 		if !strings.Contains(src, marker) {
-			t.Fatalf("Archive Center.js missing afterRequest origin-session guard %q", marker)
+			t.Fatalf("Archive Center.js missing captured afterRequest session marker %q", marker)
 		}
+	}
+	if strings.Contains(src, "resolveAfterRequestWriteSessionId") {
+		t.Fatal("obsolete afterRequest session reread path remains")
 	}
 }
 

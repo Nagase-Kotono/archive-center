@@ -10,9 +10,16 @@ import (
 
 // Common errors.
 var (
-	ErrNotFound   = errors.New("record not found")
-	ErrNotEnabled = errors.New("mariadb store is not enabled in R0/R1")
+	ErrNotFound                                  = errors.New("record not found")
+	ErrNotEnabled                                = errors.New("mariadb store is not enabled in R0/R1")
+	ErrStatusProjectionStale                     = errors.New("status projection is newer than the incoming transition")
+	ErrSessionMigrationCleanupManifestUnverified = errors.New(SessionMigrationCleanupManifestUnverifiedReason)
 )
+
+// SessionMigrationCleanupManifestUnverifiedReason blocks destructive source
+// cleanup until every session artifact has a versioned copy/retain/regenerate/
+// delete classification and count/hash/FK/vector parity verification.
+const SessionMigrationCleanupManifestUnverifiedReason = "session_cleanup_manifest_verification_required"
 
 // ShadowStatusReporter is implemented by stores that expose shadow-side health.
 // In R1 this is used by the dual-write wrapper to report shadow failures
@@ -222,12 +229,14 @@ type ProtagonistEntityMemoryFilter struct {
 	OwnerEntityRole     string
 	OwnerVisibility     string
 	SourceChatSessionID string
-	Limit               int
+	// Limit is an explicit caller-requested result limit. Zero or a negative
+	// value means all rows matching the semantic scope.
+	Limit int
 }
 
 // ProtagonistEntityMemoryOwner is a lightweight session-local owner identity.
-// It lets prepare-turn resolve an explicitly mentioned owner before applying a
-// row limit to that owner's memories.
+// It lets prepare-turn resolve a relevant owner before reading that owner's
+// semantically scoped memories.
 type ProtagonistEntityMemoryOwner struct {
 	OwnerEntityKey  string
 	OwnerEntityName string
@@ -350,6 +359,17 @@ type SessionMigrationCompleteResult struct {
 	TargetStarterReplaced bool
 }
 
+// SessionMigrationResumeContext identifies an existing migration before the
+// complete endpoint attempts an idempotent resume. Post-vector resumes must
+// acquire a fresh exact-vector proof before CompleteSessionMigration consumes it.
+type SessionMigrationResumeContext struct {
+	MigrationID     int64
+	Status          string
+	SourceSessionID string
+	TargetSessionID string
+	Mode            string
+}
+
 // SessionMigrationVectorDocument is a copied target row that can be reindexed
 // into ChromaDB using an embedding already stored in MariaDB.
 type SessionMigrationVectorDocument struct {
@@ -368,6 +388,7 @@ type SessionMigrationVectorDocument struct {
 // SessionMigrationStore performs the write phase of session migration.
 // Implementations must use one transaction and write row provenance.
 type SessionMigrationStore interface {
+	GetSessionMigrationResumeContext(ctx context.Context, req SessionMigrationCompleteRequest) (*SessionMigrationResumeContext, error)
 	CompleteSessionMigration(ctx context.Context, req SessionMigrationCompleteRequest) (*SessionMigrationCompleteResult, error)
 }
 
@@ -424,6 +445,13 @@ type SessionMigrationSourceLockStore interface {
 	GetSessionMigrationSourceLock(ctx context.Context, sourceSessionID string) (*SessionMigrationLock, error)
 }
 
+// SessionMigrationSourceLockFenceStore exposes the durable provisional fence
+// that must be committed before current relational/vector validation begins.
+type SessionMigrationSourceLockFenceStore interface {
+	PrepareSessionMigrationSourceLock(ctx context.Context, migrationID int64, reason string) (*SessionMigrationLock, error)
+	ReleaseSessionMigrationSourceLockFence(ctx context.Context, migrationID int64, reason string) error
+}
+
 // SessionMigrationRollbackResult reports a ledger-scoped rollback. It deletes
 // only copied target rows recorded in session_migration_row_map.
 type SessionMigrationRollbackResult struct {
@@ -438,7 +466,8 @@ type SessionMigrationRollbackResult struct {
 }
 
 // SessionMigrationCleanupPreview reports whether an abandoned source session
-// can be safely cleaned after a successful copy, vector reindex, and source lock.
+// can be safely cleaned after a successful copy, vector reindex, source lock,
+// and full artifact-manifest parity verification.
 type SessionMigrationCleanupPreview struct {
 	MigrationID     int64
 	SourceSessionID string
@@ -451,6 +480,8 @@ type SessionMigrationCleanupPreview struct {
 }
 
 // SessionMigrationCleanupResult reports an operator-confirmed source cleanup.
+// The destructive operation remains fail-closed until the artifact manifest is
+// complete; callers must honor ErrSessionMigrationCleanupManifestUnverified.
 type SessionMigrationCleanupResult struct {
 	MigrationID     int64
 	SourceSessionID string
@@ -676,11 +707,40 @@ type ChatLog struct {
 	CreatedAt     time.Time
 }
 
-// LogicalTurnReplacementStore atomically replaces the canonical tail turn and
-// removes every MariaDB-derived artifact whose provenance reaches that turn.
-// Host adapters only report observations; this mutation remains store-owned.
+// LogicalTurnReplacementStore owns canonical-tail mutation. Replacement and
+// rollback both remove every MariaDB-derived artifact whose provenance reaches
+// the affected turn in one transaction. Host adapters only report observations.
 type LogicalTurnReplacementStore interface {
 	ReplaceLogicalTurn(ctx context.Context, replacement LogicalTurnReplacement) error
+	RollbackCanonicalTail(ctx context.Context, rollback LogicalTurnRollback) error
+}
+
+// LogicalTurnReplacementError exposes the canonical transaction stage without
+// forcing HTTP callers to infer retry policy from MariaDB error strings.
+// CommitState is one of not_committed, committed, or unknown.
+type LogicalTurnReplacementError struct {
+	Code        string
+	Stage       string
+	Retryable   bool
+	CommitState string
+	Cause       error
+}
+
+func (e *LogicalTurnReplacementError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Cause == nil {
+		return e.Code
+	}
+	return e.Code + ": " + e.Cause.Error()
+}
+
+func (e *LogicalTurnReplacementError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 type LogicalTurnReplacement struct {
@@ -689,6 +749,24 @@ type LogicalTurnReplacement struct {
 	UserContent      string
 	AssistantContent string
 	CreatedAt        time.Time
+	SourceRevision   *MemorySourceRevision
+}
+
+const (
+	LogicalTurnLifecycleInvalidated = "invalidated"
+	LogicalTurnLifecycleSuperseded  = "superseded"
+	LogicalTurnLifecycleDeleted     = "deleted"
+)
+
+// LogicalTurnRollback removes the canonical tail beginning at TurnIndex.
+// It deliberately carries no branch identifier: RisuAI has not exposed a
+// durable branch contract, so rollback remains scoped to the active session.
+type LogicalTurnRollback struct {
+	ChatSessionID   string
+	TurnIndex       int
+	LifecycleAction string
+	Reason          string
+	CreatedAt       time.Time
 }
 
 // EffectiveInput is the processed user intent per turn.
@@ -1084,6 +1162,42 @@ type StatusLifecycleStore interface {
 	ListStatusEffects(ctx context.Context, chatSessionID, ownerScope, ownerID, effectState string, limit int) ([]StatusEffect, error)
 	SaveStatusEffect(ctx context.Context, effect StatusEffect) (StatusEffect, error)
 	UpdateStatusEffectState(ctx context.Context, id int64, effectState, clearedEvidenceJSON string, clearedTurn int) error
+}
+
+// StatusChangeEventSourceLookupStore provides exact, unbounded-by-window
+// lifecycle lookups for source-fenced projections. Implementations must read
+// source_revision/current_projection from the event evidence envelope rather
+// than approximating the lookup with a recent-row cap.
+type StatusChangeEventSourceLookupStore interface {
+	GetStatusChangeEventBySourceRevision(ctx context.Context, chatSessionID, statusKey, sourceRevision string, sourceTurn int) (StatusChangeEvent, error)
+	GetLatestCurrentProjectionStatusChangeEvent(ctx context.Context, chatSessionID, statusKey string) (StatusChangeEvent, error)
+}
+
+// ReversibleStatusTransition keeps one source-backed reversible current
+// projection and its immutable history event in the same canonical
+// transaction. SourceUnitID distinguishes independent subject/domain/slot
+// mutations emitted by the same accepted source revision.
+type ReversibleStatusTransition struct {
+	SourceContract string
+	SourceRevision string
+	SourceUnitID   string
+	CurrentValue   *StatusCurrentValue
+	Event          StatusChangeEvent
+}
+
+type ReversibleStatusTransitionResult struct {
+	CurrentValue StatusCurrentValue
+	Event        StatusChangeEvent
+	Replayed     bool
+}
+
+// ReversibleStatusTransitionStore is the atomic owner for reversible state
+// projection/history writes and their exact, uncapped rebuild reads.
+type ReversibleStatusTransitionStore interface {
+	ApplyReversibleStatusTransition(ctx context.Context, transition ReversibleStatusTransition) (ReversibleStatusTransitionResult, error)
+	GetReversibleStatusEventBySourceUnit(ctx context.Context, chatSessionID, sourceRevision, sourceUnitID string) (StatusChangeEvent, error)
+	ListReversibleStatusCurrentValues(ctx context.Context, chatSessionID, ownerScope string, statusKeys []string) ([]StatusCurrentValue, error)
+	ListLatestReversibleCurrentProjectionEvents(ctx context.Context, chatSessionID string, statusKeys []string) ([]StatusChangeEvent, error)
 }
 
 type ThemeOffscreenCarryStore interface {

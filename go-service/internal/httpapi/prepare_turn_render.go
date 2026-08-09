@@ -33,7 +33,6 @@ func buildPrepareTurnPayloadApplicationPlan(rawUserInput, referenceText, memoryT
 	appliedCount := 0
 	deferredCount := 0
 	failedCount := 0
-	guidanceBlocked := false
 	for _, item := range guidanceItems {
 		text := strings.TrimSpace(item.Text)
 		status := strings.TrimSpace(item.Status)
@@ -45,24 +44,16 @@ func buildPrepareTurnPayloadApplicationPlan(rawUserInput, referenceText, memoryT
 		switch {
 		case status == "failed":
 			failedCount++
-		case guidanceBlocked:
-			status = "deferred"
-			if reason == "" {
-				reason = "prior_guidance_not_applied"
-			}
-			deferredCount++
 		case text == "":
 			status = "deferred"
 			if reason == "" {
 				reason = "empty_guidance"
 			}
 			deferredCount++
-			guidanceBlocked = true
 		case chars+map[bool]int{true: 2, false: 0}[len(appliedGuidance) > 0] > remaining:
 			status = "deferred"
 			reason = "narrative_support_budget_exhausted"
 			deferredCount++
-			guidanceBlocked = true
 		default:
 			status = "applied"
 			if len(appliedGuidance) > 0 {
@@ -177,40 +168,138 @@ func prepareTurnPayloadLane(key, title, text string, budget int, enabled bool, s
 	}
 }
 
+func buildPrepareTurnRecomposerEnhancementContract(
+	sessionID string,
+	turnIndex int,
+	memoryPlan map[string]any,
+	memoryLineage map[string]any,
+	payloadPlan map[string]any,
+	supervisorCallStatus string,
+) map[string]any {
+	classCounts := map[string]int{}
+	for _, rawClass := range prepareTurnMemoryLineageSlice(memoryPlan["classes"]) {
+		class := mapFromAny(rawClass)
+		key := extractionStringFromAny(class["key"])
+		if key == "" {
+			continue
+		}
+		classCounts[key] = intFromAny(class["selected_count"], 0)
+	}
+	countFor := func(keys ...string) int {
+		total := 0
+		for _, key := range keys {
+			total += classCounts[key]
+		}
+		return total
+	}
+	feature := func(count int, sourceMode string) map[string]any {
+		status := "empty"
+		if count > 0 {
+			status = "available"
+		}
+		return map[string]any{
+			"status":         status,
+			"selected_count": count,
+			"source_mode":    sourceMode,
+		}
+	}
+
+	objectiveCount := countFor(
+		"event_recent",
+		"character_objective",
+		"world_state",
+		"direct_evidence",
+		"unresolved_goal",
+	)
+	subjectiveCount := countFor("subjective_relationship")
+	protectedCount := countFor("protected_secret")
+	guidanceTrace := mapFromAny(payloadPlan["guidance_application_trace"])
+	supervisorCount := intFromAny(guidanceTrace["applied_count"], 0)
+	directEvidenceCount := countFor("direct_evidence")
+
+	supervisorFeature := feature(supervisorCount, "current_turn_supervisor_guidance")
+	supervisorFeature["call_status"] = strings.TrimSpace(supervisorCallStatus)
+	criticFeature := feature(directEvidenceCount, "prior_accepted_or_verified_direct_evidence")
+	criticFeature["same_turn_result"] = false
+
+	totalAvailable := objectiveCount + subjectiveCount + protectedCount + supervisorCount
+	status := "ready"
+	if totalAvailable == 0 {
+		status = "empty"
+	} else if supervisorCallStatus == "failed_open" || supervisorCallStatus == "malformed_failed_open" {
+		status = "partial"
+	}
+
+	return map[string]any{
+		"contract_version":                  "archive_center.recomposer_enhancement.v1",
+		"status":                            status,
+		"owner":                             "go",
+		"read_only":                         true,
+		"optional_enhancement":              true,
+		"standalone_fallback_required":      true,
+		"session_id":                        strings.TrimSpace(sessionID),
+		"turn_index":                        turnIndex,
+		"memory_plan_contract_version":      extractionStringFromAny(memoryPlan["contract_version"]),
+		"memory_lineage_contract_version":   extractionStringFromAny(memoryLineage["contract_version"]),
+		"same_turn_critic_result_available": false,
+		"feature_status": map[string]any{
+			"long_term_memory":        feature(objectiveCount, "go_selected_objective_and_grounded_memory"),
+			"subjective_memory":       feature(subjectiveCount, "perspective_scoped_subjective_memory"),
+			"protected_secret":        feature(protectedCount, "writer_only_secret_guard"),
+			"supervisor_guidance":     supervisorFeature,
+			"critic_curated_evidence": criticFeature,
+		},
+		"lane_semantics": map[string]any{
+			"event_recent":            "objective_event_memory",
+			"character_objective":     "objective_character_state",
+			"subjective_relationship": "perspective_scoped_subjective",
+			"world_state":             "objective_world_state",
+			"protected_secret":        "writer_only",
+			"unresolved_goal":         "open_thread_or_goal",
+			"direct_evidence":         "accepted_or_verified_grounded_evidence",
+			"output_guidance":         "supervisor_current_turn",
+		},
+		"privacy": map[string]any{
+			"subjective_not_objective_truth": true,
+			"protected_secret_writer_only":   true,
+			"no_state_write":                 true,
+		},
+		"handoff": map[string]any{
+			"mode":        "transient_current_turn_only",
+			"text_source": "existing_go_memory_and_payload_plans",
+			"copy_policy": "resolve_existing_plan_text_without_backend_reselection",
+		},
+	}
+}
+
 func prepareTurnTextHash(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
-func formatSupervisorSceneProposalGuidance(result map[string]any) (string, []string) {
+func supervisorSceneProposalGuidanceItems(result map[string]any) []prepareTurnGuidanceItem {
 	proposal := mapFromAny(mapFromAny(result["directive"])["supervisor_scene_proposal"])
-	if len(proposal) == 0 {
-		return "", nil
+	plan := mapFromAny(proposal["publisher_plan"])
+	if extractionStringFromAny(plan["contract_version"]) != "publisher_plan.v1" || extractionStringFromAny(plan["status"]) != "ready" {
+		return nil
 	}
-	lines := []string{"[Supervisor Proposal]", "Proposal only. Do not treat it as new facts, user actions, relationship changes, or event completion."}
-	refs := []string{}
-	for _, lane := range []struct {
-		key   string
-		label string
-	}{
-		{"fidelity_warnings", "Fidelity"},
-		{"portrayal_notes", "Portrayal"},
-	} {
-		for _, raw := range sliceFromAny(proposal[lane.key]) {
-			item := mapFromAny(raw)
-			text := strings.TrimSpace(extractionStringFromAny(item["text"]))
-			itemRefs := stringSliceFromAny(item["source_refs"])
-			if text == "" || len(itemRefs) == 0 {
-				continue
-			}
-			lines = append(lines, "- "+lane.label+": "+text+" (evidence: "+strings.Join(itemRefs, ", ")+")")
-			refs = appendUniqueStringValues(refs, itemRefs...)
+	items := []prepareTurnGuidanceItem{}
+	for _, raw := range outputFidelityLineageSlice(plan["guidance_items"]) {
+		item := mapFromAny(raw)
+		text := strings.TrimSpace(extractionFirstNonEmpty(extractionStringFromAny(item["render_text"]), extractionStringFromAny(item["text"])))
+		itemRefs := stringSliceFromAny(item["source_refs"])
+		slot := strings.ToLower(strings.TrimSpace(extractionStringFromAny(item["slot"])))
+		if slot == "" || text == "" || len(itemRefs) == 0 {
+			continue
 		}
+		items = append(items, prepareTurnGuidanceItem{
+			Key:        "publisher_" + slot,
+			Title:      "Optional Publisher " + strings.ReplaceAll(slot, "_", " "),
+			Text:       "[Optional Publisher " + strings.ReplaceAll(slot, "_", " ") + "]\n" + text,
+			SourceRefs: itemRefs,
+		})
 	}
-	if len(lines) == 2 {
-		return "", nil
-	}
-	return strings.Join(lines, "\n"), refs
+	return items
 }
 
 type prepareTurnInjectionBlock struct {
@@ -227,10 +316,12 @@ type prepareTurnInjectionAssembly struct {
 	SagaText                  string
 	ChapterText               string
 	MemoryText                string
+	MemoryRecallQuery         string
 	ActualMemoryText          string
 	ProtectedMemoryText       string
 	MemoryDeliveryLineage     map[string]any
 	MemoryDeliveryPlan        map[string]any
+	CharacterMemorySupport    map[string]any
 	KGText                    string
 	DirectEvidenceText        string
 	FallbackText              string
@@ -325,6 +416,7 @@ func buildInjectionPack(rawUserInput, inputContextText string, injectionEnabled,
 		"protected_memory_text":                 nilIfEmpty(assembly.ProtectedMemoryText),
 		"memory_delivery_lineage":               nilIfEmptyMap(assembly.MemoryDeliveryLineage),
 		"memory_delivery_plan":                  nilIfEmptyMap(assembly.MemoryDeliveryPlan),
+		"character_memory_support":              nilIfEmptyMap(assembly.CharacterMemorySupport),
 		"language_context":                      nilIfEmptyMap(assembly.LanguageContext),
 		"language_injection_trace":              nilIfEmptyMap(assembly.LanguageInjectionTrace),
 		"perspective_context":                   nilIfEmptyMap(assembly.PerspectiveContext),
@@ -334,6 +426,8 @@ func buildInjectionPack(rawUserInput, inputContextText string, injectionEnabled,
 		"storyline_text":                        nilIfEmpty(assembly.StorylineText),
 		"world_rules_text":                      nilIfEmpty(assembly.WorldRulesText),
 		"character_text":                        nilIfEmpty(assembly.CharacterText),
+		"character_objective_text":              nilIfEmpty(assembly.CharacterObjectiveText),
+		"character_relationship_text":           nilIfEmpty(assembly.CharacterRelationshipText),
 		"pending_thread_text":                   nilIfEmpty(assembly.PendingThreadText),
 		"episode_text":                          nilIfEmpty(assembly.EpisodeText),
 		"persona_recollection_text":             nilIfEmpty(assembly.PersonaText),
