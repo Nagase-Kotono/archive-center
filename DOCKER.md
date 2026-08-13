@@ -84,9 +84,20 @@ RisuAI 플러그인 창의 "업데이트"는 **JS 어댑터**용이라 이 백�
 upstream 3.6부터 이 역할을 `mariadb-schema` 도구가 맡아요. 이 포크는 그 도구를 같은 이미지에
 넣고 compose의 `ac-schema` 서비스로 기동 전에 자동 실행해요.
 
+- **`Exited (0)` 이 정상이에요.** 계속 떠 있는 서비스가 아니라 마이그레이션만 적용하고 끝나는
+  일회성 작업이라, 할 일을 마치면 종료된 채로 남아요. `docker ps` 와 `docker compose ps` 는
+  실행 중인 것만 보여줘서 목록에서 사라진 것처럼 보이는데, `docker compose ps -a` 로 봐야 나와요.
+  `ac-go` 가 떠 있으면 스키마 적용은 이미 성공한 거예요 (아래 의존 관계 참고).
 - `--schema /app/migrations` 로 디렉터리를 주면 `.sql` 을 파일명 순서대로 전부 적용해요.
 - 신규 마이그레이션은 `ADD COLUMN IF NOT EXISTS` 류 rerunnable 구문이라 매 기동마다 돌아도 안전해요.
 - `ac-go` 는 `service_completed_successfully` 로 물려 있어서, 스키마 적용이 실패하면 백엔드가 아예 안 떠요.
+
+정상 여부를 한 번에 보려면 (`status: ok` 와 `exit=0` 두 개만 보면 돼요):
+
+```bash
+docker compose ps -a ac-schema
+docker logs ac-schema 2>&1 | tail -20
+```
 
 수동으로 한 번 더 돌리거나 적용 전 계획만 보고 싶으면 (`--execute` 를 빼면 dry-run 리포트):
 
