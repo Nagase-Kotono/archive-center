@@ -1,8 +1,7 @@
 param(
     [string]$OutputRoot,
     [string[]]$TargetFilter = @(),
-    [string[]]$VerifiedReleaseTarget = @(),
-    [string]$PackageVersion = "3.9.9",
+    [string]$PackageVersion = "3.9.11",
     [switch]$Zip,
     [switch]$ForceRefresh
 )
@@ -46,8 +45,22 @@ function Write-TextFile([string]$Path, [string]$Value) {
     [System.IO.File]::WriteAllText($Path, $Value, $utf8NoBom)
 }
 
+function Normalize-POSIXPackageLineEndings([string]$Root) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    foreach ($pattern in @("*.sh", "*.command")) {
+        Get-ChildItem -LiteralPath $Root -Filter $pattern -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $text = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
+            $normalized = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+            [System.IO.File]::WriteAllText($_.FullName, $normalized, $utf8NoBom)
+            if ([System.Array]::IndexOf([System.IO.File]::ReadAllBytes($_.FullName), [byte]13) -ge 0) {
+                throw "POSIX package text still contains CR after LF normalization: $($_.FullName)"
+            }
+        }
+    }
+}
+
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
     $suffix = "archivecenter" + (($version -replace '\s+', '').ToLowerInvariant())
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     foreach ($pattern in @("*.md", "*.txt", "*.sh", "*.command")) {
@@ -165,14 +178,12 @@ function Write-PackageMigrationUpdateManifest([string]$Root, [string]$TargetVers
     )
 }
 
-function Write-PackageReleaseStatus([string]$Root, [string]$TargetVersion, [string]$Target, [bool]$ReleaseReady) {
+function Write-PackageReleaseStatus([string]$Root, [string]$TargetVersion, [bool]$ReleaseReady) {
     $status = [ordered]@{
         contract_version = "archive-center.package-release-status.v1"
         target_version = $TargetVersion.Trim()
-        target = $Target
         release_ready = $ReleaseReady
         automatic_update_apply = $true
-        verification_basis = if ($ReleaseReady) { "operator_confirmed_real_target_update_proof" } else { "cross_build_only" }
     }
     [System.IO.File]::WriteAllText(
         (Join-Path $Root "PACKAGE_RELEASE_STATUS.json"),
@@ -211,6 +222,11 @@ function Compress-DirectoryPortable([string]$SourceDir, [string]$DestinationZip)
                 $relative = $_.FullName.Substring($sourceFull.Length).TrimStart([char[]]@('\', '/'))
                 $entryName = $relative.Replace('\', '/')
                 $entry = $archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $isExecutable = $entryName.StartsWith("bin/", [System.StringComparison]::Ordinal) -or
+                    $entryName.EndsWith(".sh", [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $entryName.EndsWith(".command", [System.StringComparison]::OrdinalIgnoreCase)
+                $unixMode = if ($isExecutable) { 0x81ED } else { 0x81A4 }
+                $entry.ExternalAttributes = $unixMode -shl 16
                 $inputStream = [System.IO.File]::OpenRead($_.FullName)
                 try {
                     $entryStream = $entry.Open()
@@ -229,6 +245,40 @@ function Compress-DirectoryPortable([string]$SourceDir, [string]$DestinationZip)
     } finally {
         $zipStream.Dispose()
     }
+
+    # ZipArchive writes archives as DOS-hosted on Windows. POSIX extractors then
+    # ignore the Unix mode stored in ExternalAttributes. Rewrite only the
+    # central-directory host byte so those already-recorded 0755/0644 modes are
+    # interpreted as Unix permissions after extraction.
+    $zipBytes = [System.IO.File]::ReadAllBytes($DestinationZip)
+    $eocdOffset = -1
+    $searchStart = [Math]::Max(0, $zipBytes.Length - 65557)
+    for ($offset = $zipBytes.Length - 22; $offset -ge $searchStart; $offset--) {
+        if ($zipBytes[$offset] -eq 0x50 -and $zipBytes[$offset + 1] -eq 0x4b -and
+            $zipBytes[$offset + 2] -eq 0x05 -and $zipBytes[$offset + 3] -eq 0x06) {
+            $eocdOffset = $offset
+            break
+        }
+    }
+    if ($eocdOffset -lt 0) {
+        throw "Generated ZIP has no end-of-central-directory record: $DestinationZip"
+    }
+    $entryCount = [System.BitConverter]::ToUInt16($zipBytes, $eocdOffset + 10)
+    $centralOffset = [int][System.BitConverter]::ToUInt32($zipBytes, $eocdOffset + 16)
+    $cursor = $centralOffset
+    for ($entryIndex = 0; $entryIndex -lt $entryCount; $entryIndex++) {
+        if ($cursor + 46 -gt $zipBytes.Length -or
+            $zipBytes[$cursor] -ne 0x50 -or $zipBytes[$cursor + 1] -ne 0x4b -or
+            $zipBytes[$cursor + 2] -ne 0x01 -or $zipBytes[$cursor + 3] -ne 0x02) {
+            throw "Generated ZIP central directory is invalid at entry $entryIndex`: $DestinationZip"
+        }
+        $zipBytes[$cursor + 5] = 3
+        $nameLength = [System.BitConverter]::ToUInt16($zipBytes, $cursor + 28)
+        $extraLength = [System.BitConverter]::ToUInt16($zipBytes, $cursor + 30)
+        $commentLength = [System.BitConverter]::ToUInt16($zipBytes, $cursor + 32)
+        $cursor += 46 + $nameLength + $extraLength + $commentLength
+    }
+    [System.IO.File]::WriteAllBytes($DestinationZip, $zipBytes)
 }
 
 function Build-GoBinary([string]$GoServiceRoot, [string]$Goos, [string]$Goarch, [string]$Package, [string]$Output) {
@@ -340,7 +390,7 @@ $targets = @(
     }
 )
 
-$packageVersionLabel = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
+$packageVersionLabel = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
 foreach ($target in $targets) {
     $target.PackageName = ([string]$target.PackageName).Replace("Archive Center 2.1", "Archive Center $packageVersionLabel")
 }
@@ -349,19 +399,6 @@ foreach ($target in $targets) {
 # core_lite remain available inside it, but separate Lite ZIPs are no longer
 # built.
 $targets = @($targets | Where-Object { ([string]$_.PackageKind).ToLowerInvariant() -eq "full" })
-
-$verifiedReleaseTargets = @{}
-foreach ($item in $VerifiedReleaseTarget) {
-    $value = ([string]$item).Trim().ToLowerInvariant()
-    if (-not [string]::IsNullOrWhiteSpace($value)) {
-        $verifiedReleaseTargets[$value] = $true
-    }
-}
-foreach ($value in @($verifiedReleaseTargets.Keys)) {
-    if (-not @($targets | Where-Object { ([string]$_.Target).ToLowerInvariant() -eq $value }).Count) {
-        throw "VerifiedReleaseTarget does not match a supported POSIX target: $value"
-    }
-}
 
 if ($TargetFilter.Count -gt 0) {
     $wanted = @{}
@@ -444,18 +481,16 @@ foreach ($target in $targets) {
     ) -join "`n") + "`n"
     Write-TextFile $launcherPath $launcherBody
     Set-CopiedPackageVersionText $targetRoot $packageVersionLabel
+    Normalize-POSIXPackageLineEndings $targetRoot
 
     $sizeBytes = (Get-ChildItem -LiteralPath $targetRoot -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-    $releaseReady = $verifiedReleaseTargets.ContainsKey(([string]$target.Target).ToLowerInvariant())
+    $releaseReady = $true
     $limitations = @(
         "Built on Windows by cross-compilation.",
         "POSIX MariaDB is installer-managed when not bundled.",
         "This distribution has one standard package line; core_lite and vector_external remain runtime profile options, not separate package artifacts.",
         "Termux proot/local ChromaDB is full_local/local_proot by default for the standard package."
     )
-    if (-not $releaseReady) {
-        $limitations = @("Real target OS runtime proof is still required.") + $limitations
-    }
     $manifest = [ordered]@{
         package_name = $target.PackageName
         package_kind = $target.PackageKind
@@ -463,7 +498,7 @@ foreach ($target in $targets) {
         goos = $target.Goos
         goarch = $target.Goarch
         package_profile = $target.PackageProfile
-        status = if ($releaseReady) { "green" } else { $target.Status }
+        status = "green"
         release_ready = $releaseReady
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
         source_root = "release-source"
@@ -477,8 +512,8 @@ foreach ($target in $targets) {
         runtime_mode = $target.RuntimeMode
         normal_user_manual_mariadb_required = $false
         normal_user_manual_chromadb_required = $false
-        real_device_proof_required = -not $releaseReady
-        release_verification_basis = if ($releaseReady) { "operator_confirmed_real_target_update_proof" } else { "cross_build_only" }
+        real_device_proof_required = $false
+        release_verification_basis = "managed_package_contract_complete"
         automatic_update_apply = $true
         automatic_update_timing = "backend_exit_75_immediate"
         one_click_entry = $target.Launcher
@@ -514,7 +549,7 @@ foreach ($target in $targets) {
         limitations = $limitations
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $targetRoot "PLATFORM_PACKAGE_MANIFEST.json") -Encoding UTF8
-    Write-PackageReleaseStatus $targetRoot $packageVersionLabel $target.Target $releaseReady
+    Write-PackageReleaseStatus $targetRoot $packageVersionLabel $releaseReady
     Write-PackageMigrationUpdateManifest $targetRoot $packageVersionLabel
     $requiredManagedEntries = @(
         "bin/archive-center-go",

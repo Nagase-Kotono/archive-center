@@ -2,7 +2,7 @@ param(
     [string]$OutputRoot,
     [string]$PackageName = "",
     [string]$PackageKind = "managed",
-    [string]$PackageVersion = "3.9.9",
+    [string]$PackageVersion = "3.9.11",
     [string]$ChromaRuntime = "",
     [string]$CodeSigningCertThumbprint = "",
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -134,7 +134,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
     $packageLabel = if ($PackageKind -eq "managed") {
         "Archive Center $version Windows Auto Install Package"
     } else {
@@ -153,7 +153,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.9" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $patterns = @("*.md", "*.txt", "*.bat", "*.cmd", "*.ps1", "*.sh", "*.command")
     foreach ($pattern in $patterns) {
@@ -542,8 +542,7 @@ Copy-File "ops/full-package/04_protect_env_windows.bat" "04_protect_env_windows.
 Copy-File "ops/full-package/05_unprotect_env_windows.bat" "05_unprotect_env_windows.bat"
 Copy-File "ops/full-package/.env.full.example" ".env.full.example"
 Copy-Directory "ops/full-package/scripts" "scripts" @(
-    "migrate-legacy-1.0-windows.ps1",
-    "apply-update-compatibility-bridge.ps1"
+    "migrate-legacy-1.0-windows.ps1"
 )
 Copy-File "ops/install-windows.ps1" "tools/install-windows.ps1"
 Copy-File "LICENSE" "LICENSE"
@@ -581,7 +580,6 @@ function Write-PackageReleaseStatus([string]$Root, [string]$TargetVersion, [bool
         target_version = $TargetVersion.Trim()
         release_ready = $ReleaseReady
         automatic_update_apply = $true
-        verification_basis = if ($ReleaseReady) { "windows_managed_package_build_green" } else { "build_not_release_ready" }
     }
     [System.IO.File]::WriteAllText(
         (Join-Path $Root "PACKAGE_RELEASE_STATUS.json"),
