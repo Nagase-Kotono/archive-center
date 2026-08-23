@@ -116,6 +116,7 @@ docker exec ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N \
 
 - 3.0.1 → 3.5.0: `002_canon_pack_storage.sql` 수동 적용 (테이블 52 → 62)
 - 3.5.0 → 3.9.9: `003`~`009` 를 `ac-schema` 자동 적용으로 전환
+- 3.9.9 → 3.9.11: 새 마이그레이션 없음 (`ac-schema` 재실행은 멱등적이라 그대로 통과)
 
 ## 데이터 / 백업
 

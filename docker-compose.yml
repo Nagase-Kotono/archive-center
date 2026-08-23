@@ -91,7 +91,7 @@ services:
     restart: unless-stopped
     network_mode: "container:pocketrisu-ts"   # 리수와 같은 namespace → 프록시 127.0.0.1:28080 도달
     environment:
-      AC_BUILD_VERSION: "3.9.9"
+      AC_BUILD_VERSION: "3.9.11"
       # namespace loopback 에만 바인드 (외부 노출 없음, 리수 프록시만 접근).
       AC_BIND_ADDR: "127.0.0.1:28080"
       # live + mariadb_authority = 실제 영속 저장. 같은 namespace라 DB/Chroma도 127.0.0.1.
