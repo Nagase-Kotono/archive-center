@@ -15,7 +15,7 @@ import (
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
-func TestCompleteTurnCriticProviderFailureRetriesWithUnchangedCurrentTurn(t *testing.T) {
+func TestCompleteTurnCriticProviderFailureUsesOneCallAndWritesNoDerivedArtifacts(t *testing.T) {
 	fake := &turnRecordingStore{}
 	cfg := config.Default()
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
@@ -24,42 +24,14 @@ func TestCompleteTurnCriticProviderFailureRetriesWithUnchangedCurrentTurn(t *tes
 	srv.StoreOpenError = nil
 	srv.RuntimeConfig.LLMRetryCount = 1
 
-	extractionBytes, _ := json.Marshal(map[string]any{
-		"turn_summary":      "Mina and Rowan crossed an intimate threshold while Rowan stayed reassuring.",
-		"importance_score":  7,
-		"evidence_excerpts": []any{"Rowan stayed reassuring."},
-		"kg_triples":        []any{testEntityScalarKG("state_fact", "Rowan", "character", "stayed", "reassuring", "state", "Rowan stayed reassuring.")},
-	})
-	chatResp, _ := json.Marshal(map[string]any{
-		"model":   "critic-model",
-		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
-	})
 	oldClient := proxyHTTPClient
 	callCount := 0
-	secondPrompt := ""
-	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		callCount++
-		var upstreamReq map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
-			t.Fatalf("decode upstream request: %v", err)
-		}
-		if callCount == 1 {
-			return &http.Response{
-				StatusCode: http.StatusInternalServerError,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream rejected"}}`)),
-			}, nil
-		}
-		msgs, _ := upstreamReq["messages"].([]any)
-		if len(msgs) >= 2 {
-			if msg, _ := msgs[1].(map[string]any); msg != nil {
-				secondPrompt = fmt.Sprint(msg["content"])
-			}
-		}
 		return &http.Response{
-			StatusCode: http.StatusOK,
+			StatusCode: http.StatusInternalServerError,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(bytes.NewReader(chatResp)),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream rejected"}}`)),
 		}, nil
 	})}
 	defer func() { proxyHTTPClient = oldClient }()
@@ -91,17 +63,14 @@ func TestCompleteTurnCriticProviderFailureRetriesWithUnchangedCurrentTurn(t *tes
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if callCount != 2 {
-		t.Fatalf("critic call count = %d, want 2", callCount)
+	if callCount != 1 {
+		t.Fatalf("critic call count = %d, want 1", callCount)
 	}
-	if !strings.Contains(strings.ToLower(secondPrompt), "penetration") || strings.Contains(secondPrompt, "redacted for critic retry") {
-		t.Fatalf("second critic prompt changed the completed current turn: %s", secondPrompt)
+	if resp["critic_triggered"] != false || intFromAny(resp["derived_artifacts_saved"], -1) != 0 {
+		t.Fatalf("provider failure produced a Critic result or derived artifacts: %+v", resp)
 	}
-	if resp["critic_triggered"] != true {
-		t.Fatalf("critic_triggered = %v, want true after unchanged retry: %+v", resp["critic_triggered"], resp)
-	}
-	if resp["derived_artifacts_saved"].(float64) < 3 {
-		t.Fatalf("derived_artifacts_saved = %v, want memory/evidence/KG after retry: %+v", resp["derived_artifacts_saved"], resp)
+	if stringFromMap(mapFromAny(resp["critic_failure"]), "code") != "CRITIC_PROVIDER_HTTP_ERROR" {
+		t.Fatalf("critic failure=%#v", resp["critic_failure"])
 	}
 }
 
@@ -117,6 +86,16 @@ func TestCompleteTurnEmbeddingProviderFailureReportsWarning(t *testing.T) {
 	srv.Vector = &turnRecordingVectorStore{}
 
 	oldClient := proxyHTTPClient
+	criticContent := criticWireJSONForTest(map[string]any{
+		"turn_summary":      "Mina and Rowan commit to the blue key.",
+		"importance_score":  7,
+		"evidence_excerpts": []any{"blue key safe"},
+		"kg_triples":        []any{map[string]any{"semantic_class": "event_fact", "subject": "Rowan", "predicate": "protects", "object": "blue key"}},
+		"entities":          map[string]any{"characters": []any{map[string]any{"name": "Rowan"}}, "items": []any{map[string]any{"name": "blue key"}}},
+	})
+	criticResponse, _ := json.Marshal(map[string]any{
+		"model": "critic-model", "choices": []any{map[string]any{"message": map[string]any{"content": criticContent}}},
+	})
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if strings.Contains(r.URL.Path, "/embeddings") {
 			return &http.Response{
@@ -128,10 +107,7 @@ func TestCompleteTurnEmbeddingProviderFailureReportsWarning(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body: io.NopCloser(strings.NewReader(`{
-				"model":"critic-model",
-				"choices":[{"message":{"content":"{\"turn_summary\":\"Mina and Rowan commit to the blue key.\",\"importance_score\":7,\"evidence_excerpts\":[\"blue key safe\"],\"kg_triples\":[{\"semantic_class\":\"event_fact\",\"subject\":\"Rowan\",\"predicate\":\"protects\",\"object\":\"blue key\"}],\"entities\":{\"characters\":[{\"name\":\"Rowan\"}],\"items\":[{\"name\":\"blue key\"}]}}"}}]
-			}`)),
+			Body:       io.NopCloser(bytes.NewReader(criticResponse)),
 		}, nil
 	})}
 	defer func() { proxyHTTPClient = oldClient }()
@@ -284,7 +260,7 @@ func TestCompleteTurnStructuredCanonicalContentDoesNotSkipDerivedIngest(t *testi
 	oldClient := proxyHTTPClient
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		calls++
-		extraction := `{"turn_summary":"The scene continues under the requested constraints.","importance_score":6}`
+		extraction := criticWireJSONForTest(map[string]any{"turn_summary": "The scene continues under the requested constraints.", "importance_score": 6})
 		response := `{"model":"critic-model","choices":[{"message":{"content":` + strconv.Quote(extraction) + `}}]}`
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
 	})}

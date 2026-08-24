@@ -425,7 +425,8 @@ func TestArchiveCenter24ReplayRegressionGate(t *testing.T) {
 			{ID: 202, ChatSessionID: "sess-artifact-vector", Scope: "session", Category: "identity", Key: "suppressed_rule", ValueJSON: `"hidden"`, SourceTurn: 7, Suppressed: true},
 		}
 		vectorShadow := map[string]any{
-			"search_result": "ok",
+			"memory_search_result": "ok",
+			"search_result":        "ok",
 			"search_results": []map[string]any{
 				{"id": "evidence:sess-artifact-vector:101", "tier": "evidence", "source_table": "direct_evidence_records", "source_row_id": "101", "similarity": 0.87, "similarity_source": "cosine_from_query_and_stored_embedding"},
 				{"id": "world_rule:sess-artifact-vector:201", "tier": "world_rule", "source_table": "world_rules", "source_row_id": "201", "similarity": 0.82, "similarity_source": "cosine_from_query_and_stored_embedding"},
@@ -485,7 +486,13 @@ func TestArchiveCenter24ReplayRegressionGate(t *testing.T) {
 			{ID: 3, TurnIndex: 30, SummaryJSON: `{"turn_summary":"Recent unrelated dinner detail."}`, Importance: 1},
 		}
 		vectorShadow := map[string]any{
-			"search_result": "ok",
+			"memory_search_result": "ok",
+			"search_result":        "ok",
+			"memory_search_results": []map[string]any{
+				{"id": "memory:sess-24:2", "source_table": "memories", "source_row_id": "2", "raw_language": "ja", "summary_language": "en", "session_output_language": "en", "alias_count": 2, "similarity": 0.86, "similarity_source": "cosine_from_query_and_stored_embedding"},
+				{"id": "memory:sess-24:99", "source_table": "memories", "source_row_id": "99"},
+				{"id": "memory:sess-24:1", "source_table": "memories", "source_row_id": "1", "raw_language": "ko", "summary_language": "en", "session_output_language": "en", "alias_count": 2, "similarity": 0.81, "similarity_source": "cosine_from_query_and_stored_embedding"},
+			},
 			"search_results": []map[string]any{
 				{"id": "episode:sess-24:77", "source_table": "episode_summaries", "source_row_id": "77"},
 				{"id": "memory:sess-24:2", "source_table": "memories", "source_row_id": "2", "raw_language": "ja", "summary_language": "en", "session_output_language": "en", "alias_count": 2, "similarity": 0.86, "similarity_source": "cosine_from_query_and_stored_embedding"},
@@ -507,7 +514,7 @@ func TestArchiveCenter24ReplayRegressionGate(t *testing.T) {
 			"vector_memory_hydrated_count":                  2,
 			"vector_memory_selected_count":                  2,
 			"vector_memory_injected_count":                  2,
-			"vector_non_memory_hit_count":                   1,
+			"vector_non_memory_hit_count":                   0,
 			"vector_memory_missing_count":                   1,
 			"vector_memory_hit_language_context_count":      2,
 			"vector_memory_hydrated_language_context_count": 2,
@@ -520,8 +527,8 @@ func TestArchiveCenter24ReplayRegressionGate(t *testing.T) {
 	})
 }
 
-func TestRunCompleteTurnCriticAuditsWorldRulesWhenInitialExtractionEmpty(t *testing.T) {
-	firstExtraction, _ := json.Marshal(map[string]any{
+func TestRunCompleteTurnCriticKeepsIndependentExtractionWhenSingleCallMissesWorldRules(t *testing.T) {
+	firstExtraction := criticWireJSONForTest(map[string]any{
 		"turn_summary":      "The island run establishes a companion gacha and dungeon progression loop.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{"companions are drawn by gacha and dungeon rewards buy skills"},
@@ -529,38 +536,15 @@ func TestRunCompleteTurnCriticAuditsWorldRulesWhenInitialExtractionEmpty(t *test
 		"world_rules":       []any{},
 		"world_state":       map[string]any{"version": "world_state.v1", "confidence": 0, "verification": "", "rules": []any{}},
 	})
-	auditExtraction, _ := json.Marshal(map[string]any{
-		"audit": map[string]any{"durable_rule_found": true, "reason": "The turn confirms a recurring progression economy."},
-		"world_rules": []any{
-			map[string]any{
-				"scope":        "session",
-				"scope_name":   "progression_system",
-				"category":     "progression",
-				"key":          "dungeon_rewards_buy_skills",
-				"value":        "Dungeon rewards can be exchanged for skills and progression upgrades.",
-				"confidence":   0.9,
-				"verification": "verified",
-			},
-		},
-		"world_state": map[string]any{
-			"version":      "world_state.v1",
-			"confidence":   0.9,
-			"verification": "verified",
-			"rules": []any{
-				map[string]any{"scope": "session", "scope_name": "progression_system", "category": "progression", "key": "dungeon_rewards_buy_skills", "value": "Dungeon rewards can be exchanged for skills and progression upgrades."},
-			},
-		},
-	})
-	responses := []string{string(firstExtraction), string(auditExtraction)}
 	calls := 0
 	oldClient := proxyHTTPClient
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if calls >= len(responses) {
+		if calls > 0 {
 			t.Fatalf("unexpected extra critic call %d", calls+1)
 		}
 		payload, _ := json.Marshal(map[string]any{
 			"model":   "critic-test",
-			"choices": []any{map[string]any{"message": map[string]any{"content": responses[calls]}}},
+			"choices": []any{map[string]any{"message": map[string]any{"content": firstExtraction}}},
 		})
 		calls++
 		return &http.Response{
@@ -595,42 +579,35 @@ func TestRunCompleteTurnCriticAuditsWorldRulesWhenInitialExtractionEmpty(t *test
 	if err != nil {
 		t.Fatalf("runCompleteTurnCritic error: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("critic calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("critic calls = %d, want 1", calls)
 	}
-	if got := len(worldRuleItemsForSave(extraction)); got == 0 {
-		t.Fatalf("world-rule audit did not merge rules: %#v", extraction)
+	if got := len(worldRuleItemsForSave(extraction)); got != 0 || extractionStringFromAny(extraction["turn_summary"]) == "" {
+		t.Fatalf("single-call miss discarded independent extraction or invented rules: %#v", extraction)
 	}
 	auditTrace := mapFromAny(trace["world_rule_audit"])
-	if auditTrace["status"] != "ok" || intFromAny(auditTrace["merged_world_rule_count"], 0) == 0 {
+	if auditTrace["status"] != "incomplete" || auditTrace["llm_call_attempt"] != false {
 		t.Fatalf("world_rule_audit trace mismatch: %+v", auditTrace)
 	}
 }
 
-func TestRunCompleteTurnCriticForceWorldRuleAuditWhenInitialAuditMissing(t *testing.T) {
-	firstExtraction, _ := json.Marshal(map[string]any{
+func TestRunCompleteTurnCriticForceWorldRuleAuditDoesNotCreateSecondCall(t *testing.T) {
+	firstExtraction := criticWireJSONForTest(map[string]any{
 		"turn_summary":      "The first session setup establishes a stable progression economy.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{"dungeon points can be spent on skills"},
 		"world_rules":       []any{},
 		"world_state":       map[string]any{"version": "world_state.v1", "confidence": 0, "verification": "", "rules": []any{}},
 	})
-	auditExtraction, _ := json.Marshal(map[string]any{
-		"audit": map[string]any{"durable_rule_found": true, "reason": "Forced cold-start audit found a progression economy."},
-		"world_rules": []any{
-			map[string]any{"scope": "session", "scope_name": "progression_system", "category": "economy", "key": "points_buy_skills", "value": "Dungeon points can be spent to purchase skills."},
-		},
-	})
-	responses := []string{string(firstExtraction), string(auditExtraction)}
 	calls := 0
 	oldClient := proxyHTTPClient
 	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if calls >= len(responses) {
+		if calls > 0 {
 			t.Fatalf("unexpected extra critic call %d", calls+1)
 		}
 		payload, _ := json.Marshal(map[string]any{
 			"model":   "critic-test",
-			"choices": []any{map[string]any{"message": map[string]any{"content": responses[calls]}}},
+			"choices": []any{map[string]any{"message": map[string]any{"content": firstExtraction}}},
 		})
 		calls++
 		return &http.Response{
@@ -666,20 +643,20 @@ func TestRunCompleteTurnCriticForceWorldRuleAuditWhenInitialAuditMissing(t *test
 	if err != nil {
 		t.Fatalf("runCompleteTurnCritic error: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("critic calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("critic calls = %d, want 1", calls)
 	}
-	if got := len(worldRuleItemsForSave(extraction)); got != 1 {
-		t.Fatalf("forced world-rule audit saved rules = %d, want 1: %#v", got, extraction)
+	if got := len(worldRuleItemsForSave(extraction)); got != 0 || extractionStringFromAny(extraction["turn_summary"]) == "" {
+		t.Fatalf("forced audit invented rules or discarded the valid result: %#v", extraction)
 	}
 	auditTrace := mapFromAny(trace["world_rule_audit"])
-	if auditTrace["status"] != "ok" {
+	if auditTrace["status"] != "incomplete" || auditTrace["llm_call_attempt"] != false {
 		t.Fatalf("world_rule_audit trace mismatch: %+v", auditTrace)
 	}
 }
 
-func TestRunCompleteTurnCriticKeepsWholeDerivationRetryableWhenWorldRuleAuditFails(t *testing.T) {
-	firstExtraction, _ := json.Marshal(map[string]any{
+func TestRunCompleteTurnCriticMissingWorldRuleDoesNotFailWholeDerivation(t *testing.T) {
+	firstExtraction := criticWireJSONForTest(map[string]any{
 		"turn_summary":      "The turn establishes a recurring progression rule.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{},
@@ -693,7 +670,7 @@ func TestRunCompleteTurnCriticKeepsWholeDerivationRetryableWhenWorldRuleAuditFai
 		if providerCalls == 1 {
 			payload, _ := json.Marshal(map[string]any{
 				"model":   "critic-test",
-				"choices": []any{map[string]any{"message": map[string]any{"content": string(firstExtraction)}}},
+				"choices": []any{map[string]any{"message": map[string]any{"content": firstExtraction}}},
 			})
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -701,16 +678,13 @@ func TestRunCompleteTurnCriticKeepsWholeDerivationRetryableWhenWorldRuleAuditFai
 				Body:       io.NopCloser(strings.NewReader(string(payload))),
 			}, nil
 		}
-		return &http.Response{
-			StatusCode: http.StatusTooManyRequests,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"audit unavailable"}}`)),
-		}, nil
+		t.Fatalf("unexpected second critic call")
+		return nil, nil
 	})}
 	defer func() { proxyHTTPClient = oldClient }()
 
 	srv := NewServer(config.Default())
-	_, trace, err := srv.runCompleteTurnCritic(
+	extraction, trace, err := srv.runCompleteTurnCritic(
 		context.Background(), "sess-world-audit-failure", 5,
 		"The same rule is explained again.", "The recurring rule is confirmed.",
 		nil, nil,
@@ -719,14 +693,11 @@ func TestRunCompleteTurnCriticKeepsWholeDerivationRetryableWhenWorldRuleAuditFai
 			Provider: "openai", TimeoutMs: 60_000, RetryBudget: newLLMRetryBudget(0),
 		},
 	)
-	if err == nil || providerCalls != 2 {
+	if err != nil || providerCalls != 1 || extractionStringFromAny(extraction["turn_summary"]) == "" {
 		t.Fatalf("err=%v provider calls=%d", err, providerCalls)
 	}
-	details := criticPipelineErrorDetails(err)
-	if stringFromMap(details, "code") != "CRITIC_WORLD_RULE_AUDIT_FAILED" ||
-		!boolFromAny(details["retryable"]) ||
-		stringFromMap(mapFromAny(trace["world_rule_audit"]), "status") != "error" {
-		t.Fatalf("details=%#v trace=%#v", details, trace)
+	if auditTrace := mapFromAny(trace["world_rule_audit"]); auditTrace["status"] != "incomplete" || auditTrace["llm_call_attempt"] != false {
+		t.Fatalf("trace=%#v", trace)
 	}
 }
 

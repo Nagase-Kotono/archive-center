@@ -30,8 +30,11 @@ func completeTurnMemorySourceRevision(
 	if strings.TrimSpace(userText) == "" || strings.TrimSpace(assistantText) == "" {
 		return nil, fmt.Errorf("source_revision_raw_pair_missing")
 	}
-	messageID := ""
-	if decision.Observation.MessageIndex >= 0 {
+	messageID := strings.TrimSpace(decision.Observation.MessageChatID)
+	if decision.Observation.MessageChatIDState != "observed" || messageID == "" {
+		messageID = ""
+	}
+	if messageID == "" && decision.Observation.MessageIndex >= 0 {
 		messageID = fmt.Sprintf("%s:index:%d", decision.Observation.HostChatID, decision.Observation.MessageIndex)
 	}
 	content := strings.TrimSpace(strings.Join([]string{userText, assistantText}, "\n"))
@@ -138,7 +141,7 @@ func (s *Server) enqueueCompleteTurnReprocessingJob(
 		ChatSessionID:  strings.TrimSpace(sid),
 		SourceRevision: strings.TrimSpace(decision.Revision),
 	}
-	return s.enqueueSourceRevisionReprocessingJob(ctx, writer, source, reason, now)
+	return s.enqueueSourceRevisionReprocessingJob(ctx, writer, source, reason, now, false)
 }
 
 func (s *Server) enqueueSourceRevisionReprocessingJob(
@@ -147,6 +150,7 @@ func (s *Server) enqueueSourceRevisionReprocessingJob(
 	source *store.MemorySourceRevision,
 	reason string,
 	now time.Time,
+	wakeAfterEnqueue ...bool,
 ) (bool, error) {
 	if source == nil ||
 		strings.TrimSpace(source.ChatSessionID) == "" ||
@@ -179,7 +183,8 @@ func (s *Server) enqueueSourceRevisionReprocessingJob(
 		job.IndexVersion,
 	)
 	inserted, err := writer.EnqueueMemoryReprocessingJob(ctx, job)
-	if err == nil && (job.Status == "pending" || job.Status == "retryable") {
+	shouldWake := len(wakeAfterEnqueue) == 0 || wakeAfterEnqueue[0]
+	if shouldWake && err == nil && (job.Status == "pending" || job.Status == "retryable") {
 		s.wakeMemoryWorkers()
 	}
 	return inserted, err

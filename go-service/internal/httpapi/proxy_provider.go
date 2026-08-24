@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,8 +116,12 @@ func callProxyProviderWithPolicy(ctx context.Context, req dto.ProxyPluginMainReq
 }
 
 func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, endpoint, apiKey, model, provider string, policy proxyRequestPolicy, retryBudget *llmRetryBudget) (map[string]any, int, error) {
-	isGLM := proxyIsGLMLike(model, endpoint, provider)
+	isGLM := provider != "ollama" && proxyIsGLMLike(model, endpoint, provider)
 	target := proxyOpenAIChatEndpoint(proxyOpenAIBaseURL(provider, endpoint), provider, isGLM)
+	reasoningTransport, transportErr := proxyReasoningTransport(provider, endpoint)
+	if transportErr != nil {
+		return nil, http.StatusBadRequest, &proxyLocalRequestError{Stage: "configuration", Cause: transportErr}
+	}
 
 	headers := map[string]string{
 		"Content-Type": "application/json",
@@ -149,30 +154,102 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 		"stream":      false,
 	}
 	reasoningFamily := proxyReasoningFamily(provider, stringPtrValue(req.ReasoningPreset, "auto"), model, endpoint)
-	if reasoningFamily == "glm" {
+	if reasoningTransport == "ollama" {
+		if effort := proxyOllamaReasoningEffort(
+			reasoningFamily,
+			model,
+			stringPtrValue(req.ReasoningEffort, ""),
+			stringPtrValue(req.GlmThinkingType, ""),
+		); effort != "" {
+			outputTokens := maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
+			reasoningBudget := maxInt64(0, firstPositiveInt64(
+				int64Value(req.ReasoningBudgetTokens, 0),
+				int64Value(req.BudgetTokens, 0),
+			))
+			body["reasoning_effort"] = effort
+			body["max_tokens"] = outputTokens
+			if effort != "none" {
+				body["max_tokens"] = outputTokens + reasoningBudget
+			}
+		}
+	} else if reasoningTransport == "llmgateway" {
+		if effort := proxyGatewayReasoningEffort(reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
+			body["reasoning_effort"] = effort
+			body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
+			if reasoningFamily == "gpt" {
+				delete(body, "temperature")
+			}
+		}
+	} else if reasoningTransport == "openrouter" || reasoningTransport == "vercel" {
+		if effort := proxyGatewayReasoningEffort(reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
+			body["reasoning"] = map[string]any{"effort": effort}
+			body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
+			if reasoningFamily == "gpt" {
+				delete(body, "temperature")
+			}
+		}
+	} else if reasoningFamily == "glm" {
 		body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
 		effort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, "")))
 		thinkingType := proxyGLMThinkingTypeFromRequest(stringPtrValue(req.GlmThinkingType, ""), effort)
 		body["thinking"] = map[string]any{
 			"type": thinkingType,
 		}
-		if thinkingType == "enabled" {
-			if normalizedEffort := proxyGLM52ReasoningEffort(model, effort); normalizedEffort != "" {
-				body["reasoning_effort"] = normalizedEffort
+		if thinkingType == "enabled" && proxyGLMSupportsReasoningEffort(model) {
+			switch effort {
+			case "xhigh", "max":
+				body["reasoning_effort"] = "max"
+			case "enable", "enabled", "on", "true", "low", "medium", "high":
+				body["reasoning_effort"] = "high"
 			}
 		}
-	} else if effort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, ""))); effort != "" {
-		if effort != "none" || provider == "ollama" {
-			body["reasoning_effort"] = effort
+	} else if reasoningFamily == "deepseek_v4" && reasoningTransport == "deepseek" {
+		outputTokens := maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
+		body["max_tokens"] = outputTokens
+		effort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, "")))
+		normalizedEffort := "none"
+		switch effort {
+		case "high", "max":
+			normalizedEffort = effort
+		case "low", "medium":
+			normalizedEffort = "high"
+		case "xhigh":
+			normalizedEffort = "max"
 		}
-		if effort != "none" {
+		if normalizedEffort == "none" {
+			body["thinking"] = map[string]any{"type": "disabled"}
+		} else {
+			body["thinking"] = map[string]any{"type": "enabled"}
+			body["reasoning_effort"] = normalizedEffort
+		}
+	} else if reasoningFamily == "gpt" {
+		if effort := proxyOpenAICompatibleReasoningEffort(model, stringPtrValue(req.ReasoningEffort, "")); effort != "" {
+			body["reasoning_effort"] = effort
 			body["max_completion_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
 			delete(body, "max_tokens")
+			if reasoningFamily == "gpt" {
+				delete(body, "temperature")
+			}
+		}
+	}
+	managedReasoning := map[string][]byte{}
+	for _, key := range []string{"reasoning_effort", "reasoning", "thinking"} {
+		if value, ok := body[key]; ok {
+			managedReasoning[key], _ = json.Marshal(value)
 		}
 	}
 	overrideTrace, overrideErr := proxyApplyRequestOverrides(headers, body, req, provider, false)
 	if overrideErr != nil {
 		return nil, http.StatusBadRequest, &proxyLocalRequestError{Stage: "request_build", Cause: overrideErr}
+	}
+	for key, expected := range managedReasoning {
+		actual, _ := json.Marshal(body[key])
+		if !bytes.Equal(actual, expected) {
+			return nil, http.StatusBadRequest, &proxyLocalRequestError{
+				Stage: "request_build",
+				Cause: fmt.Errorf("extra_body_json conflicts with backend-managed %s", key),
+			}
+		}
 	}
 	if policyErr := proxyApplyOpenAIJSONResponsePolicy(body, overrideTrace, provider, policy); policyErr != nil {
 		return map[string]any{"_proxy_request_overrides": overrideTrace}, http.StatusBadRequest, &proxyLocalRequestError{
@@ -192,7 +269,12 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 	if err != nil {
 		return nil, http.StatusBadGateway, err
 	}
+	_, hasReasoningEffort := body["reasoning_effort"]
+	_, hasReasoningObject := body["reasoning"]
+	_, hasThinking := body["thinking"]
+	managedReasoningRequest := hasReasoningEffort || hasReasoningObject || hasThinking
 	if status == http.StatusBadRequest &&
+		!managedReasoningRequest &&
 		proxyHasAdvancedParams(body) &&
 		proxyUnsupportedParameter(raw, data) &&
 		!proxyServiceTierError(raw, data) &&
@@ -213,12 +295,59 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 	if data == nil {
 		return nil, http.StatusBadGateway, fmt.Errorf("OpenAI-like provider returned invalid JSON")
 	}
-	if strings.TrimSpace(chatCompletionText(data)) == "" {
-		return nil, http.StatusBadGateway, &proxyEmptyContentError{Provider: provider}
+	choice := map[string]any{}
+	if choices := sliceFromAny(data["choices"]); len(choices) > 0 {
+		choice = mapFromAny(choices[0])
+	}
+	data[proxyResponseMetadataKey] = buildProxyResponseMetadata(
+		"openai_compatible",
+		strings.TrimSpace(extractionStringFromAny(choice["finish_reason"])),
+		mapFromAny(data["usage"]),
+	)
+	if policy.Purpose != "publisher" && strings.TrimSpace(chatCompletionText(data)) == "" {
+		return data, http.StatusBadGateway, &proxyEmptyContentError{Provider: provider}
 	}
 	proxyAttachLLMGatewayServiceTierTrace(data, overrideTrace)
 	proxyAttachRequestOverrideTrace(data, overrideTrace)
 	return data, http.StatusOK, nil
+}
+
+func proxyReasoningTransport(provider, endpoint string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	knownEndpoint := ""
+	if parsed, err := url.Parse(strings.TrimSpace(endpoint)); err == nil {
+		host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+		switch host {
+		case "api.openai.com":
+			knownEndpoint = "openai"
+		case "openrouter.ai":
+			knownEndpoint = "openrouter"
+		case "api.llmgateway.io":
+			knownEndpoint = "llmgateway"
+		case "ai-gateway.vercel.sh":
+			knownEndpoint = "vercel"
+		case "api.deepseek.com":
+			knownEndpoint = "deepseek"
+		case "localhost", "127.0.0.1", "::1":
+			if parsed.Port() == "11434" {
+				knownEndpoint = "ollama"
+			}
+		}
+	}
+
+	if provider == "custom" {
+		if knownEndpoint == "deepseek" {
+			return "deepseek", nil
+		}
+		return "custom", nil
+	}
+	if provider == "openai" && knownEndpoint == "deepseek" {
+		return "deepseek", nil
+	}
+	if knownEndpoint != "" && knownEndpoint != provider {
+		return "", fmt.Errorf("provider %q conflicts with endpoint host for %q reasoning transport", provider, knownEndpoint)
+	}
+	return provider, nil
 }
 
 func proxyCallClaude(ctx context.Context, req dto.ProxyPluginMainRequest, endpoint, apiKey, model string, policy proxyRequestPolicy) (map[string]any, int, error) {
@@ -240,9 +369,27 @@ func proxyCallClaude(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 	}
 	budget := maxInt64(0, firstPositiveInt64(int64Value(req.ReasoningBudgetTokens, 0), int64Value(req.BudgetTokens, 0)))
 	configuredMax := maxInt64(0, int64Value(req.MaxCompletionTokens, 0))
-	if budget >= 1024 {
-		body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
-		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": maxInt64(1024, budget)}
+	maxTokens := maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
+	switch proxyClaudeThinkingMode(model) {
+	case "manual_budget":
+		if budget >= 1024 {
+			if budget >= maxTokens {
+				return nil, http.StatusBadRequest, &proxyLocalRequestError{
+					Stage: "configuration",
+					Cause: fmt.Errorf("Claude thinking budget_tokens must be smaller than max_tokens"),
+				}
+			}
+			body["max_tokens"] = maxTokens
+			body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+			delete(body, "temperature")
+		}
+	case "adaptive":
+		if effort := proxyClaudeAdaptiveEffort(stringPtrValue(req.ReasoningEffort, "")); effort != "" {
+			body["max_tokens"] = maxTokens
+			body["thinking"] = map[string]any{"type": "adaptive"}
+			body["output_config"] = map[string]any{"effort": effort}
+			delete(body, "temperature")
+		}
 	}
 
 	headers := map[string]string{
@@ -269,12 +416,14 @@ func proxyCallClaude(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 		return nil, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
 	}
 	content := proxyExtractClaudeText(data)
-	if content == "" {
-		return nil, status, &proxyEmptyContentError{Provider: "claude"}
-	}
-	resp := proxyNormalizeChatResponse(content, model, "stop")
+	finishReason := strings.TrimSpace(extractionStringFromAny(data["stop_reason"]))
+	resp := proxyNormalizeChatResponse(content, model, finishReason)
 	proxyAttachClaudeUsage(resp, data, overrideTrace)
+	resp[proxyResponseMetadataKey] = buildProxyResponseMetadata("anthropic_messages", finishReason, mapFromAny(data["usage"]))
 	proxyAttachRequestOverrideTrace(resp, overrideTrace)
+	if content == "" && policy.Purpose != "publisher" {
+		return resp, status, &proxyEmptyContentError{Provider: "claude"}
+	}
 	return resp, http.StatusOK, nil
 }
 
@@ -284,7 +433,8 @@ func proxyCallGemini(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 	configuredMax := maxInt64(0, int64Value(req.MaxCompletionTokens, 0))
 	budget := maxInt64(0, firstPositiveInt64(int64Value(req.ReasoningBudgetTokens, 0), int64Value(req.BudgetTokens, 0)))
 	effort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, "")))
-	isThinking := regexp.MustCompile(`(?i)gemini-(3|2\.5)`).MatchString(model)
+	thinkingMode := proxyGeminiThinkingMode(model)
+	isThinking := thinkingMode != "none"
 	maxOutputTokens := requestedTokens
 	if isThinking {
 		maxOutputTokens = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
@@ -300,16 +450,12 @@ func proxyCallGemini(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 		body["systemInstruction"] = map[string]any{"parts": []map[string]any{{"text": system}}}
 	}
 	genCfg := body["generationConfig"].(map[string]any)
-	if isThinking {
-		thinking := map[string]any{"includeThoughts": false}
-		if proxyGeminiThinkingMode(model) == "level" && isGeminiThinkingLevel(effort) {
-			thinking["thinkingLevel"] = effort
-		} else if budget > 0 {
-			thinking["thinkingBudget"] = budget
+	if thinkingMode == "level" {
+		if level := proxyGeminiThinkingLevel(model, effort); level != "" {
+			genCfg["thinkingConfig"] = map[string]any{"includeThoughts": false, "thinkingLevel": level}
 		}
-		genCfg["thinkingConfig"] = thinking
-	} else if budget > 0 {
-		genCfg["thinkingConfig"] = map[string]any{"thinkingBudget": budget}
+	} else if thinkingMode == "budget" && budget > 0 {
+		genCfg["thinkingConfig"] = map[string]any{"includeThoughts": false, "thinkingBudget": budget}
 	}
 
 	target := ""
@@ -358,12 +504,18 @@ func proxyCallGemini(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 		return nil, status, fmt.Errorf("%s", scrubProxySecret(detail, apiKey))
 	}
 	content := proxyExtractGeminiText(data)
-	if content == "" {
-		return nil, status, &proxyEmptyContentError{Provider: geminiProvider}
+	candidate := map[string]any{}
+	if candidates := sliceFromAny(data["candidates"]); len(candidates) > 0 {
+		candidate = mapFromAny(candidates[0])
 	}
-	resp := proxyNormalizeChatResponse(content, model, "stop")
+	finishReason := strings.TrimSpace(extractionStringFromAny(candidate["finishReason"]))
+	resp := proxyNormalizeChatResponse(content, model, finishReason)
 	proxyAttachGeminiUsage(resp, data, overrideTrace)
+	resp[proxyResponseMetadataKey] = buildProxyResponseMetadata("google_generate_content", finishReason, mapFromAny(data["usageMetadata"]))
 	proxyAttachRequestOverrideTrace(resp, overrideTrace)
+	if content == "" && policy.Purpose != "publisher" {
+		return resp, status, &proxyEmptyContentError{Provider: geminiProvider}
+	}
 	return resp, http.StatusOK, nil
 }
 
@@ -403,24 +555,33 @@ func proxyApplyJSONResponsePolicy(body map[string]any, trace map[string]any, pol
 		trace["json_response_applied"] = true
 		trace["json_response_source"] = "backend_policy"
 		trace["json_response_mime_type"] = requiredMIME
-		return nil
-	}
-	existingText, stringValue := existing.(string)
-	if stringValue && strings.EqualFold(strings.TrimSpace(existingText), requiredMIME) {
+	} else if existingText, stringValue := existing.(string); stringValue && strings.EqualFold(strings.TrimSpace(existingText), requiredMIME) {
 		trace["json_response_applied"] = true
 		trace["json_response_source"] = "extra_body_json"
 		trace["json_response_mime_type"] = existingText
+	} else {
+		existingText, stringValue := existing.(string)
+		trace["json_response_applied"] = false
+		trace["json_response_source"] = "extra_body_json"
+		trace["json_response_conflict"] = true
+		trace["json_response_conflict_reason"] = "generationConfig.responseMimeType must be application/json"
+		trace["json_response_existing_type"] = fmt.Sprintf("%T", existing)
+		if stringValue {
+			trace["json_response_existing_value"] = strings.TrimSpace(existingText)
+		}
+		return fmt.Errorf("json_response_mime_conflict: generationConfig.responseMimeType must be application/json")
+	}
+	if !proxyJSONResponsePurposeIsPublisher(policy) {
 		return nil
 	}
-	trace["json_response_applied"] = false
-	trace["json_response_source"] = "extra_body_json"
-	trace["json_response_conflict"] = true
-	trace["json_response_conflict_reason"] = "generationConfig.responseMimeType must be application/json"
-	trace["json_response_existing_type"] = fmt.Sprintf("%T", existing)
-	if stringValue {
-		trace["json_response_existing_value"] = strings.TrimSpace(existingText)
+	if _, exists := generationConfig["responseJsonSchema"]; !exists {
+		generationConfig["responseJsonSchema"] = proxyPublisherTopLevelJSONSchema()
+		trace["json_response_schema_source"] = "backend_policy"
+	} else {
+		trace["json_response_schema_source"] = "extra_body_json"
 	}
-	return fmt.Errorf("json_response_mime_conflict: generationConfig.responseMimeType must be application/json")
+	trace["json_response_schema_contract"] = publisherWireContractVersion
+	return nil
 }
 
 func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]any, provider string, policy proxyRequestPolicy) error {
@@ -435,24 +596,40 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_purpose"] = purpose
 	}
 
+	providerSupportsNativeJSON := proxyProviderSupportsAutomaticOpenAIJSONResponse(provider)
+	providerSupportsPublisherJSONObject := proxyJSONResponsePurposeIsPublisher(policy)
+
 	const requiredType = "json_object"
 	existing, exists := body["response_format"]
 	if !exists {
-		if !proxyProviderSupportsAutomaticOpenAIJSONResponse(provider) {
+		if providerSupportsPublisherJSONObject && !providerSupportsNativeJSON {
+			body["response_format"] = map[string]any{"type": requiredType}
+			trace["json_response_applied"] = true
+			trace["json_response_source"] = "backend_policy"
+			trace["json_response_format"] = requiredType
+			trace["json_response_schema_contract"] = publisherWireContractVersion + "_prompt_validated"
+			return nil
+		}
+		if !providerSupportsNativeJSON {
 			trace["json_response_applied"] = false
 			trace["json_response_source"] = "backend_policy"
 			trace["json_response_skip_reason"] = "provider_native_contract_not_verified"
 			return nil
 		}
 		appliedType := requiredType
-		if strings.EqualFold(strings.TrimSpace(provider), "vercel") {
+		if proxyJSONResponsePurposeIsPublisher(policy) || strings.EqualFold(strings.TrimSpace(provider), "vercel") {
 			appliedType = "json_schema"
+			schemaName, schema := proxyJSONResponseSchema(policy)
+			jsonSchema := map[string]any{
+				"name":   schemaName,
+				"schema": schema,
+			}
+			if proxyJSONResponsePurposeIsPublisher(policy) {
+				jsonSchema["strict"] = true
+			}
 			body["response_format"] = map[string]any{
-				"type": appliedType,
-				"json_schema": map[string]any{
-					"name":   "archive_center_critic",
-					"schema": proxyCriticTopLevelJSONSchema(),
-				},
+				"type":        appliedType,
+				"json_schema": jsonSchema,
 			}
 		} else {
 			body["response_format"] = map[string]any{"type": appliedType}
@@ -460,6 +637,9 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_applied"] = true
 		trace["json_response_source"] = "backend_policy"
 		trace["json_response_format"] = appliedType
+		if proxyJSONResponsePurposeIsPublisher(policy) {
+			trace["json_response_schema_contract"] = publisherWireContractVersion
+		}
 		return nil
 	}
 
@@ -520,15 +700,19 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 	}
 	existing, exists := body["output_config"]
 	if !exists {
+		_, schema := proxyJSONResponseSchema(policy)
 		body["output_config"] = map[string]any{
 			"format": map[string]any{
 				"type":   "json_schema",
-				"schema": proxyCriticTopLevelJSONSchema(),
+				"schema": schema,
 			},
 		}
 		trace["json_response_applied"] = true
 		trace["json_response_source"] = "backend_policy"
 		trace["json_response_format"] = "json_schema"
+		if proxyJSONResponsePurposeIsPublisher(policy) {
+			trace["json_response_schema_contract"] = publisherWireContractVersion
+		}
 		return nil
 	}
 	outputConfig, ok := existing.(map[string]any)
@@ -539,7 +723,19 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_conflict_reason"] = "output_config must be a JSON object"
 		return fmt.Errorf("json_response_format_conflict: output_config must be a JSON object")
 	}
-	format, ok := outputConfig["format"].(map[string]any)
+	existingFormat, formatExists := outputConfig["format"]
+	if !formatExists {
+		_, schema := proxyJSONResponseSchema(policy)
+		outputConfig["format"] = map[string]any{"type": "json_schema", "schema": schema}
+		trace["json_response_applied"] = true
+		trace["json_response_source"] = "backend_policy"
+		trace["json_response_format"] = "json_schema"
+		if proxyJSONResponsePurposeIsPublisher(policy) {
+			trace["json_response_schema_contract"] = publisherWireContractVersion
+		}
+		return nil
+	}
+	format, ok := existingFormat.(map[string]any)
 	if !ok {
 		trace["json_response_applied"] = false
 		trace["json_response_source"] = "extra_body_json"
@@ -559,49 +755,60 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 	trace["json_response_applied"] = true
 	trace["json_response_source"] = "extra_body_json"
 	trace["json_response_format"] = "json_schema"
+	if proxyJSONResponsePurposeIsPublisher(policy) {
+		trace["json_response_schema_contract"] = publisherWireContractVersion
+	}
 	return nil
+}
+
+func proxyJSONResponsePurposeIsPublisher(policy proxyRequestPolicy) bool {
+	return strings.EqualFold(strings.TrimSpace(policy.Purpose), "publisher")
+}
+
+func proxyJSONResponseSchema(policy proxyRequestPolicy) (string, map[string]any) {
+	if proxyJSONResponsePurposeIsPublisher(policy) {
+		return "archive_center_publisher_output_v3", proxyPublisherTopLevelJSONSchema()
+	}
+	return "archive_center_critic_output_v1", proxyCriticTopLevelJSONSchema()
+}
+
+func proxyPublisherTopLevelJSONSchema() map[string]any {
+	item := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"role": map[string]any{"type": "string", "enum": []string{"book_author", "director"}},
+			"field": map[string]any{"type": "string", "enum": []string{
+				"current_arc", "narrative_goal", "next_beats", "guardrails",
+				"scene_mandate", "required_outcomes", "forbidden_moves", "pressure_level",
+			}},
+			"text":        map[string]any{"type": "string", "minLength": 1},
+			"source_refs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1},
+			"level":       map[string]any{"type": "string", "enum": []string{"quiet", "low", "medium", "high"}},
+		},
+		"required":             []string{"role", "field", "text", "source_refs"},
+		"additionalProperties": false,
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"contract_version": map[string]any{"type": "string", "enum": []string{publisherWireContractVersion}},
+			"items":            map[string]any{"type": "array", "items": item},
+		},
+		"required":             []string{"contract_version", "items"},
+		"additionalProperties": false,
+	}
 }
 
 func proxyCriticTopLevelJSONSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"turn_summary":                   map[string]any{"type": "string"},
-			"importance_score":               map[string]any{"type": "number"},
-			"story_clock":                    map[string]any{},
-			"relationship_memory":            map[string]any{},
-			"entities":                       map[string]any{},
-			"kg_triples":                     map[string]any{"type": "array", "items": map[string]any{}},
-			"archive_hint":                   map[string]any{},
-			"world_rule_audit":               map[string]any{},
-			"world_rules":                    map[string]any{"type": "array", "items": map[string]any{}},
-			"world_state":                    map[string]any{},
-			"subjective_entity_memories":     map[string]any{"type": "array", "items": map[string]any{}},
-			"protected_secrets":              map[string]any{"type": "array", "items": map[string]any{}},
-			"character_identity_accuracy":    map[string]any{"type": "array", "items": map[string]any{}},
-			"persona_capsule_candidates":     map[string]any{"type": "array", "items": map[string]any{}},
-			"narrative_events":               map[string]any{"type": "array", "items": map[string]any{}},
-			"state_claims":                   map[string]any{"type": "array", "items": map[string]any{}},
-			"belief_updates":                 map[string]any{"type": "array", "items": map[string]any{}},
-			"interaction_events":             map[string]any{"type": "array", "items": map[string]any{}},
-			"relationship_observations":      map[string]any{"type": "array", "items": map[string]any{}},
-			"interaction_boundaries":         map[string]any{"type": "array", "items": map[string]any{}},
-			"habit_observations":             map[string]any{"type": "array", "items": map[string]any{}},
-			"character_profile_observations": map[string]any{"type": "array", "items": map[string]any{}},
-			"voice_observations":             map[string]any{"type": "array", "items": map[string]any{}},
-			"user_interaction_profile":       map[string]any{"type": "array", "items": map[string]any{}},
-			"rp_character_profile":           map[string]any{"type": "array", "items": map[string]any{}},
-			"prune_targets":                  map[string]any{"type": "array", "items": map[string]any{}},
-			"evidence_excerpts":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-			"emotional_intensity":            map[string]any{"type": "number"},
-			"narrative_significance":         map[string]any{"type": "number"},
-			"state_deltas":                   map[string]any{},
-			"character_deltas":               map[string]any{"type": "array", "items": map[string]any{}},
-			"physical_conditions":            map[string]any{"type": "array", "items": map[string]any{}},
-			"entity_conditions":              map[string]any{"type": "array", "items": map[string]any{}},
-			"reversible_states":              map[string]any{"type": "array", "items": map[string]any{}},
-			"pending_threads":                map[string]any{"type": "array", "items": map[string]any{}},
+			"turn_summary":           map[string]any{"type": "string"},
+			"importance_score":       map[string]any{"type": "number"},
+			"emotional_intensity":    map[string]any{"type": "number"},
+			"narrative_significance": map[string]any{"type": "number"},
 		},
+		"required":             []string{"turn_summary", "importance_score"},
 		"additionalProperties": true,
 	}
 }
@@ -1099,6 +1306,65 @@ func proxyAttachGeminiUsage(resp, upstream map[string]any, trace map[string]any)
 	}
 }
 
+const proxyResponseMetadataKey = "_archive_center_response_meta"
+
+func buildProxyResponseMetadata(adapter, finishReason string, usage map[string]any) map[string]any {
+	meta := map[string]any{
+		"contract_version":     "archive_center.provider_response.v1",
+		"adapter":              strings.TrimSpace(adapter),
+		"native_finish_reason": strings.TrimSpace(finishReason),
+		"termination_kind":     proxyTerminationKind(finishReason),
+		"usage_reported":       len(usage) > 0,
+	}
+	inputTokens := firstPositiveInt(
+		intFromAny(usage["prompt_tokens"], 0),
+		intFromAny(usage["input_tokens"], 0),
+		intFromAny(usage["promptTokenCount"], 0),
+	)
+	outputTokens := firstPositiveInt(
+		intFromAny(usage["completion_tokens"], 0),
+		intFromAny(usage["output_tokens"], 0),
+		intFromAny(usage["candidatesTokenCount"], 0),
+	)
+	reasoningTokens := firstPositiveInt(
+		intFromAny(mapFromAny(usage["completion_tokens_details"])["reasoning_tokens"], 0),
+		intFromAny(usage["thoughtsTokenCount"], 0),
+	)
+	totalTokens := firstPositiveInt(
+		intFromAny(usage["total_tokens"], 0),
+		intFromAny(usage["totalTokenCount"], 0),
+	)
+	if totalTokens <= 0 && inputTokens+outputTokens > 0 {
+		totalTokens = inputTokens + outputTokens
+	}
+	cachedInputTokens := firstPositiveInt(
+		intFromAny(mapFromAny(usage["prompt_tokens_details"])["cached_tokens"], 0),
+		intFromAny(usage["cache_read_input_tokens"], 0),
+		intFromAny(usage["cachedContentTokenCount"], 0),
+	)
+	meta["input_tokens"] = inputTokens
+	meta["output_tokens"] = outputTokens
+	meta["reasoning_tokens"] = reasoningTokens
+	meta["total_tokens"] = totalTokens
+	meta["cached_input_tokens"] = cachedInputTokens
+	return meta
+}
+
+func proxyTerminationKind(finishReason string) string {
+	switch strings.ToLower(strings.TrimSpace(finishReason)) {
+	case "stop", "end_turn", "stop_sequence":
+		return "complete"
+	case "length", "max_tokens", "model_context_window_exceeded":
+		return "length"
+	case "content_filter", "safety", "recitation", "prohibited_content", "blocked", "blocklist", "spii", "image_safety", "language":
+		return "safety"
+	case "tool_calls", "function_call", "tool_use":
+		return "tool"
+	default:
+		return "unknown"
+	}
+}
+
 func proxyAttachLLMGatewayServiceTierTrace(resp map[string]any, trace map[string]any) {
 	if resp == nil || trace["llm_gateway_service_tier_applied"] != true {
 		return
@@ -1239,10 +1505,21 @@ func proxyIsGLMLike(model, endpoint, provider string) bool {
 }
 
 func proxyReasoningFamily(provider, preset, model, endpoint string) string {
-	preset = strings.ToLower(strings.TrimSpace(preset))
-	switch preset {
-	case "gpt", "gemini", "claude", "glm":
-		return preset
+	modelName := strings.ToLower(strings.TrimSpace(model))
+	if regexp.MustCompile(`(^|/)deepseek[-_]?v4($|[-_:])`).MatchString(modelName) {
+		return "deepseek_v4"
+	}
+	if regexp.MustCompile(`(^|/)gemini[-_]`).MatchString(modelName) {
+		return "gemini"
+	}
+	if regexp.MustCompile(`(^|/)glm[-_]`).MatchString(modelName) {
+		return "glm"
+	}
+	if regexp.MustCompile(`(^|/)claude[-_]`).MatchString(modelName) {
+		return "claude"
+	}
+	if proxyOpenAIReasoningModel(modelName) {
+		return "gpt"
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if proxyIsGLMLike(model, endpoint, provider) {
@@ -1254,7 +1531,30 @@ func proxyReasoningFamily(provider, preset, model, endpoint string) string {
 	if provider == "gemini" || provider == "vertex" {
 		return "gemini"
 	}
-	return "gpt"
+	if provider == "ollama" && proxyOllamaThinkingModel(modelName) {
+		return "ollama_thinking"
+	}
+	preset = strings.ToLower(strings.TrimSpace(preset))
+	switch preset {
+	case "gpt", "gemini", "claude", "glm":
+		return preset
+	default:
+		return "none"
+	}
+}
+
+func proxyGLMSupportsReasoningEffort(model string) bool {
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(model)), "_", "-")
+	match := regexp.MustCompile(`(?:^|/)glm-?(\d+)(?:[.-](\d+))?(?:$|[-_:])`).FindStringSubmatch(normalized)
+	if len(match) == 0 {
+		return false
+	}
+	major, _ := strconv.Atoi(match[1])
+	minor := 0
+	if len(match) > 2 && match[2] != "" {
+		minor, _ = strconv.Atoi(match[2])
+	}
+	return major > 5 || (major == 5 && minor >= 2)
 }
 
 func proxyGeminiThinkingMode(model string) string {
@@ -1262,10 +1562,224 @@ func proxyGeminiThinkingMode(model string) string {
 	if strings.Contains(model, "gemini-2.5") {
 		return "budget"
 	}
-	if regexp.MustCompile(`gemini-(?:3(?:\D|$)|[4-9](?:\D|$)|\d{2,}(?:\D|$))`).MatchString(model) {
+	if regexp.MustCompile(`gemini-3(?:\D|$)`).MatchString(model) {
 		return "level"
 	}
-	return "budget"
+	return "none"
+}
+
+func proxyGeminiThinkingLevel(model, level string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	level = strings.ToLower(strings.TrimSpace(level))
+	allowed := map[string]bool{"low": true, "high": true}
+	switch {
+	case strings.Contains(model, "gemini-3.1-flash-lite-image"):
+		allowed = map[string]bool{"minimal": true, "high": true}
+	case strings.Contains(model, "gemini-3-pro-preview"):
+		// low/high only
+	case strings.Contains(model, "gemini-3.1-pro"), strings.Contains(model, "gemini-3.7-flash"):
+		allowed["medium"] = true
+	case regexp.MustCompile(`gemini-3(?:\.5|\.6)?-(?:flash|flash-lite)`).MatchString(model):
+		allowed["minimal"] = true
+		allowed["medium"] = true
+	}
+	if allowed[level] {
+		return level
+	}
+	return ""
+}
+
+func proxyClaudeThinkingMode(model string) string {
+	model = strings.NewReplacer(".", "-", "_", "-").Replace(strings.ToLower(strings.TrimSpace(model)))
+	match := regexp.MustCompile(`claude(?:-[a-z]+)*-(\d+)(?:-(\d{1,2})(?:-|$))?`).FindStringSubmatch(model)
+	if len(match) == 0 {
+		return "none"
+	}
+	major, _ := strconv.Atoi(match[1])
+	minor := -1
+	if len(match) > 2 && match[2] != "" {
+		minor, _ = strconv.Atoi(match[2])
+	}
+	if major >= 5 || (major == 4 && minor >= 6) {
+		return "adaptive"
+	}
+	if (major == 3 && minor == 7) || (major == 4 && (minor < 0 || minor <= 5)) {
+		return "manual_budget"
+	}
+	return "none"
+}
+
+func proxyClaudeAdaptiveEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low":
+		return "low"
+	case "medium", "high":
+		return strings.ToLower(strings.TrimSpace(effort))
+	case "xhigh", "max":
+		return "max"
+	default:
+		return ""
+	}
+}
+
+func proxyOpenAIReasoningModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return regexp.MustCompile(`(^|/)(?:gpt[-_]?5(?:$|[-_.:])|o[134](?:$|[-_:]))`).MatchString(model)
+}
+
+func proxyOllamaThinkingModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return regexp.MustCompile(`(^|/)(?:gpt[-_]?oss|qwen3|deepseek[-_]?r1|deepseek[-_]?v3\.1)(?:$|[-_:])`).MatchString(model)
+}
+
+func proxyOpenAICompatibleReasoningEffort(model, effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	normalizedModel := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(model)), "_", "-")
+	if regexp.MustCompile(`(^|/)gpt-?5\.6(?:$|[-_:])`).MatchString(normalizedModel) {
+		switch effort {
+		case "none", "low", "medium", "high", "xhigh", "max":
+			return effort
+		default:
+			return ""
+		}
+	}
+	if regexp.MustCompile(`(^|/)gpt-?5\.(?:2|5)(?:$|[-_:])`).MatchString(normalizedModel) {
+		switch effort {
+		case "none", "low", "medium", "high", "xhigh":
+			return effort
+		default:
+			return ""
+		}
+	}
+	if regexp.MustCompile(`(^|/)gpt-?5(?:$|[-_:])`).MatchString(normalizedModel) {
+		switch effort {
+		case "minimal", "low", "medium", "high":
+			return effort
+		default:
+			return ""
+		}
+	}
+	if !regexp.MustCompile(`(^|/)o[134](?:$|[-_:])`).MatchString(normalizedModel) {
+		return ""
+	}
+	switch effort {
+	case "minimal":
+		return "low"
+	case "low", "medium", "high":
+		return effort
+	default:
+		return ""
+	}
+}
+
+func proxyOllamaReasoningEffort(family, model, effort, glmThinkingType string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch family {
+	case "glm":
+		if proxyGLMThinkingTypeFromRequest(glmThinkingType, effort) == "disabled" {
+			return "none"
+		}
+		return "high"
+	case "deepseek_v4":
+		switch effort {
+		case "none":
+			return effort
+		case "minimal":
+			return "low"
+		case "low", "medium", "high":
+			return effort
+		case "xhigh", "max":
+			return "high"
+		default:
+			return "none"
+		}
+	case "gpt":
+		normalized := proxyOpenAICompatibleReasoningEffort(model, effort)
+		switch normalized {
+		case "none", "low", "medium", "high":
+			return normalized
+		case "minimal":
+			return "low"
+		case "xhigh", "max":
+			return "high"
+		default:
+			return ""
+		}
+	case "gemini":
+		if proxyGeminiThinkingMode(model) == "none" {
+			return ""
+		}
+		fallthrough
+	case "claude":
+		if family == "claude" && proxyClaudeThinkingMode(model) == "none" {
+			return ""
+		}
+		fallthrough
+	case "ollama_thinking":
+		switch effort {
+		case "none":
+			return "none"
+		case "minimal":
+			return "low"
+		case "low", "medium", "high":
+			return effort
+		case "xhigh", "max":
+			return "high"
+		default:
+			return ""
+		}
+	default:
+		return ""
+	}
+}
+
+func proxyGatewayReasoningEffort(family, model, effort, glmThinkingType string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch family {
+	case "glm":
+		if proxyGLMThinkingTypeFromRequest(glmThinkingType, effort) == "disabled" {
+			return "none"
+		}
+		return "high"
+	case "deepseek_v4":
+		switch effort {
+		case "none", "high", "max":
+			return effort
+		case "minimal", "low", "medium":
+			return "high"
+		case "xhigh":
+			return "max"
+		default:
+			return ""
+		}
+	case "gpt":
+		return proxyOpenAICompatibleReasoningEffort(model, effort)
+	case "gemini":
+		if proxyGeminiThinkingMode(model) == "none" {
+			return ""
+		}
+		if effort == "none" {
+			return "none"
+		}
+		return proxyGeminiThinkingLevel(model, effort)
+	case "claude":
+		if proxyClaudeThinkingMode(model) == "none" {
+			return ""
+		}
+		if effort == "none" {
+			return "none"
+		}
+		return proxyClaudeAdaptiveEffort(effort)
+	case "ollama_thinking":
+		switch effort {
+		case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+			return effort
+		default:
+			return ""
+		}
+	default:
+		return ""
+	}
 }
 
 func proxyGLMThinkingType(value string) string {
@@ -1288,18 +1802,6 @@ func proxyGLMThinkingTypeFromRequest(value, effort string) string {
 		return "disabled"
 	default:
 		return "enabled"
-	}
-}
-
-func proxyGLM52ReasoningEffort(model, effort string) string {
-	if !regexp.MustCompile(`(?i)\bglm[-_]?5\.2(?:\b|[-_])`).MatchString(strings.TrimSpace(model)) {
-		return ""
-	}
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low", "medium", "high", "xhigh", "max":
-		return strings.ToLower(strings.TrimSpace(effort))
-	default:
-		return ""
 	}
 }
 

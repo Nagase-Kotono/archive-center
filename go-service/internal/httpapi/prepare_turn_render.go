@@ -18,6 +18,27 @@ type prepareTurnGuidanceItem struct {
 	ReasonCode string
 }
 
+const prepareTurnAuxiliaryMessageHeader = "[Archive Center — Auxiliary Context]"
+
+type prepareTurnPayloadBudgetLaneStats struct {
+	CandidateCount  int
+	CandidateChars  int
+	SelectedCount   int
+	SelectedChars   int
+	FinalCount      int
+	EffectiveCap    int
+	ExclusionReason map[string]int
+}
+
+func normalizePublisherGuidanceFormat(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "compact", "explicit":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "standard"
+	}
+}
+
 func buildPrepareTurnPayloadApplicationPlan(rawUserInput, referenceText, memoryText, inputContextText string, injectionEnabled, inputContextEnabled bool, memoryBudget, referenceBudget, narrativeBudget int, guidanceItems []prepareTurnGuidanceItem, supervisorCallStatus string) map[string]any {
 	if narrativeBudget < 0 {
 		narrativeBudget = 0
@@ -94,13 +115,13 @@ func buildPrepareTurnPayloadApplicationPlan(rawUserInput, referenceText, memoryT
 	if !injectionEnabled {
 		auxiliaryText = ""
 	}
+	// RisuAI already carries recent chat in the completed main-model payload.
+	// Keep inputContextText available to the internal Publisher/turn analysis,
+	// but do not duplicate it in the host payload application plan.
 	inputText := ""
-	if inputContextEnabled {
-		inputText = strings.TrimSpace(inputContextText)
-	}
 	usedNarrative := len([]rune(narrativeText))
 	status := "ready"
-	if auxiliaryText == "" && inputText == "" {
+	if auxiliaryText == "" {
 		status = "empty"
 	}
 	return map[string]any{
@@ -140,6 +161,52 @@ func buildPrepareTurnPayloadApplicationPlan(rawUserInput, referenceText, memoryT
 	}
 }
 
+func attachPrepareTurnLorebookReferenceLane(plan map[string]any, text string, budget int, enabled bool, sourceRefs []string) {
+	if plan == nil {
+		return
+	}
+	lorebookLane := prepareTurnPayloadLane(
+		"lorebook_reference",
+		"Lorebook Reference Context",
+		text,
+		budget,
+		enabled && strings.TrimSpace(text) != "",
+		sourceRefs,
+	)
+	lanes := []map[string]any{}
+	inserted := false
+	for _, raw := range outputFidelityLineageSlice(plan["lanes"]) {
+		lane := mapFromAny(raw)
+		if !inserted && extractionStringFromAny(lane["key"]) == "output_guidance" {
+			lanes = append(lanes, lorebookLane)
+			inserted = true
+		}
+		lanes = append(lanes, lane)
+	}
+	if !inserted {
+		lanes = append(lanes, lorebookLane)
+	}
+	parts := []string{}
+	for _, lane := range lanes {
+		if boolFromAny(lane["applied"]) {
+			if laneText := strings.TrimSpace(extractionStringFromAny(lane["text"])); laneText != "" {
+				parts = append(parts, laneText)
+			}
+		}
+	}
+	auxiliary := strings.Join(parts, "\n\n")
+	plan["lane_order"] = []string{"original_work", "long_term_memory", "lorebook_reference", "output_guidance"}
+	plan["lanes"] = lanes
+	plan["auxiliary_text"] = auxiliary
+	plan["auxiliary_chars"] = len([]rune(auxiliary))
+	plan["auxiliary_hash"] = prepareTurnTextHash(auxiliary)
+	if auxiliary == "" {
+		plan["status"] = "empty"
+	} else {
+		plan["status"] = "ready"
+	}
+}
+
 func prepareTurnPayloadLane(key, title, text string, budget int, enabled bool, sourceRefs []string) map[string]any {
 	text = strings.TrimSpace(text)
 	applied := enabled && text != ""
@@ -165,6 +232,255 @@ func prepareTurnPayloadLane(key, title, text string, budget int, enabled bool, s
 		"text":           text,
 		"content_hash":   prepareTurnTextHash(text),
 		"source_refs":    sourceRefs,
+	}
+}
+
+func prepareTurnMemoryPayloadBudgetStats(plan map[string]any, reversibleStateText string) prepareTurnPayloadBudgetLaneStats {
+	stats := prepareTurnPayloadBudgetLaneStats{
+		CandidateCount:  intFromAny(plan["candidate_count"], 0),
+		CandidateChars:  intFromAny(plan["candidate_chars"], 0),
+		SelectedCount:   intFromAny(plan["selected_count"], 0),
+		SelectedChars:   intFromAny(plan["selected_chars"], 0),
+		FinalCount:      intFromAny(plan["final_delivery_count"], 0),
+		EffectiveCap:    intFromAny(plan["delivery_cap_chars"], 0),
+		ExclusionReason: prepareTurnPayloadBudgetReasonCounts(plan["exclusion_reasons"]),
+	}
+	if supplementalChars := len([]rune(strings.TrimSpace(reversibleStateText))); supplementalChars > 0 {
+		separatorChars := 0
+		if stats.SelectedChars > 0 {
+			separatorChars = 2
+		}
+		stats.CandidateCount++
+		stats.CandidateChars += supplementalChars + separatorChars
+		stats.SelectedCount++
+		stats.SelectedChars += supplementalChars + separatorChars
+		stats.FinalCount++
+	}
+	return stats
+}
+
+func prepareTurnOriginalWorkPayloadBudgetStats(candidateRecall, selectedRecall referenceRecallResult, primary primaryCanonBaseResult, injectedCount int, policy referenceInjectionBudgetPolicy, enabled bool) prepareTurnPayloadBudgetLaneStats {
+	maxChars := int(^uint(0) >> 1)
+	candidateScene := formatReferenceRecallInjection(candidateRecall, maxChars)
+	selectedScene := formatReferenceRecallInjection(selectedRecall, maxChars)
+	candidateChars := primary.CandidateChars + len([]rune(candidateScene.Text))
+	if primary.CandidateChars > 0 && candidateScene.Text != "" {
+		candidateChars += 2
+	}
+	selectedChars := primary.SelectedChars + len([]rune(selectedScene.Text))
+	if primary.SelectedChars > 0 && selectedScene.Text != "" {
+		selectedChars += 2
+	}
+	reasons := map[string]int{}
+	if primary.DeferredCount > 0 {
+		reasons["primary_canon_base_budget"] = primary.DeferredCount
+	}
+	if duplicates := maxInt(0, len(candidateRecall.InjectionItems)-len(selectedRecall.InjectionItems)); duplicates > 0 {
+		reasons["primary_canon_base_duplicate"] = duplicates
+	}
+	selectedSceneCount := len(selectedRecall.InjectionItems)
+	if !enabled && selectedSceneCount > 0 {
+		reason := strings.TrimSpace(policy.Source)
+		if reason == "" {
+			reason = "original_work_not_applied"
+		}
+		reasons[reason] += selectedSceneCount
+	} else if deferred := maxInt(0, selectedSceneCount-injectedCount); deferred > 0 {
+		reasons["original_work_char_budget"] = deferred
+	}
+	return prepareTurnPayloadBudgetLaneStats{
+		CandidateCount:  primary.CandidateCount + len(candidateRecall.InjectionItems),
+		CandidateChars:  candidateChars,
+		SelectedCount:   primary.SelectedCount + selectedSceneCount,
+		SelectedChars:   selectedChars,
+		FinalCount:      primary.SelectedCount + injectedCount,
+		EffectiveCap:    prepareTurnPayloadBudgetEnabledCap(enabled, policy.TotalCapChars),
+		ExclusionReason: reasons,
+	}
+}
+
+func prepareTurnLorebookPayloadBudgetStats(result prepareTurnLorebookReferenceResult) prepareTurnPayloadBudgetLaneStats {
+	reasons := map[string]int{}
+	if result.AlreadyPresentCount > 0 {
+		reasons["lorebook_already_present_in_payload"] = result.AlreadyPresentCount
+	}
+	if result.NoContextMatchCount > 0 {
+		reasons["lorebook_no_context_match"] = result.NoContextMatchCount
+	}
+	if belowFrontier := result.FinalDispositionCounts["excluded_below_relevance_frontier"]; belowFrontier > 0 {
+		reasons["lorebook_below_relevance_frontier"] = belowFrontier
+	}
+	if result.CoalescedContentCount > 0 {
+		reasons["lorebook_same_content_coalesced"] = result.CoalescedContentCount
+	}
+	if result.BudgetDeferredCount > 0 {
+		reasons["lorebook_char_budget"] = result.BudgetDeferredCount
+	}
+	if result.SelectedCount > result.DeliveryCount+result.BudgetDeferredCount {
+		reason := strings.TrimSpace(result.ReasonCode)
+		if reason == "" {
+			reason = "lorebook_not_applied"
+		}
+		reasons[reason] += result.SelectedCount - result.DeliveryCount - result.BudgetDeferredCount
+	}
+	return prepareTurnPayloadBudgetLaneStats{
+		CandidateCount:  result.CandidateCount,
+		CandidateChars:  result.CandidateChars,
+		SelectedCount:   result.SelectedCount,
+		SelectedChars:   result.SelectedChars,
+		FinalCount:      result.DeliveryCount,
+		EffectiveCap:    prepareTurnPayloadBudgetLorebookEffectiveCap(result),
+		ExclusionReason: reasons,
+	}
+}
+
+func prepareTurnGuidancePayloadBudgetStats(plan map[string]any) prepareTurnPayloadBudgetLaneStats {
+	trace := mapFromAny(plan["guidance_application_trace"])
+	reasons := map[string]int{}
+	candidateCount := 0
+	candidateChars := 0
+	candidateTextCount := 0
+	for _, raw := range outputFidelityLineageSlice(trace["items"]) {
+		item := mapFromAny(raw)
+		candidateCount++
+		chars := maxInt(0, intFromAny(item["chars"], 0))
+		if chars > 0 {
+			if candidateTextCount > 0 {
+				candidateChars += 2
+			}
+			candidateTextCount++
+			candidateChars += chars
+		}
+		if status := extractionStringFromAny(item["status"]); status != "applied" {
+			reason := extractionStringFromAny(item["reason_code"])
+			if reason == "" {
+				reason = status
+			}
+			if reason != "" {
+				reasons[reason]++
+			}
+		}
+	}
+	appliedCount := intFromAny(trace["applied_count"], 0)
+	usedChars := intFromAny(trace["used_chars"], 0)
+	return prepareTurnPayloadBudgetLaneStats{
+		CandidateCount:  candidateCount,
+		CandidateChars:  candidateChars,
+		SelectedCount:   appliedCount,
+		SelectedChars:   usedChars,
+		FinalCount:      appliedCount,
+		EffectiveCap:    intFromAny(trace["budget_chars"], 0),
+		ExclusionReason: reasons,
+	}
+}
+
+func prepareTurnPayloadBudgetEnabledCap(enabled bool, capChars int) int {
+	if !enabled {
+		return 0
+	}
+	return maxInt(0, capChars)
+}
+
+func prepareTurnPayloadBudgetLorebookEffectiveCap(result prepareTurnLorebookReferenceResult) int {
+	switch result.ReasonCode {
+	case "lorebook_reference_injection_disabled", "lorebook_reference_scope_not_fully_observed", "lorebook_reference_disabled":
+		return 0
+	default:
+		return maxInt(0, result.BudgetChars)
+	}
+}
+
+func prepareTurnPayloadBudgetReasonCounts(value any) map[string]int {
+	result := map[string]int{}
+	switch typed := value.(type) {
+	case map[string]int:
+		for key, count := range typed {
+			if key = strings.TrimSpace(key); key != "" && count > 0 {
+				result[key] = count
+			}
+		}
+	case map[string]any:
+		for key, raw := range typed {
+			if key = strings.TrimSpace(key); key != "" {
+				if count := intFromAny(raw, 0); count > 0 {
+					result[key] = count
+				}
+			}
+		}
+	}
+	return result
+}
+
+func attachPrepareTurnPayloadBudgetLedger(plan map[string]any, configuredCaps map[string]int, stats map[string]prepareTurnPayloadBudgetLaneStats) {
+	if plan == nil {
+		return
+	}
+	lanes := []map[string]any{}
+	configuredCapChars := 0
+	effectiveCapChars := 0
+	laneContentChars := 0
+	candidateChars := 0
+	selectedChars := 0
+	excludedCount := 0
+	for _, raw := range outputFidelityLineageSlice(plan["lanes"]) {
+		lane := mapFromAny(raw)
+		key := extractionStringFromAny(lane["key"])
+		configuredCap := maxInt(0, configuredCaps[key])
+		laneStats := stats[key]
+		effectiveCap := maxInt(0, laneStats.EffectiveCap)
+		finalChars := maxInt(0, intFromAny(lane["used_chars"], 0))
+		reasons := prepareTurnPayloadBudgetReasonCounts(laneStats.ExclusionReason)
+		finalCount := maxInt(0, laneStats.FinalCount)
+		if !boolFromAny(lane["applied"]) || finalChars == 0 {
+			finalCount = 0
+			if laneStats.SelectedCount > 0 && len(reasons) == 0 {
+				reason := "payload_lane_" + extractionStringFromAny(lane["status"])
+				if reason == "payload_lane_" {
+					reason = "payload_lane_not_applied"
+				}
+				reasons[reason] = laneStats.SelectedCount
+			}
+		}
+		laneExcluded := 0
+		for _, count := range reasons {
+			laneExcluded += count
+		}
+		configuredCapChars += configuredCap
+		effectiveCapChars += effectiveCap
+		laneContentChars += finalChars
+		candidateChars += maxInt(0, laneStats.CandidateChars)
+		selectedChars += maxInt(0, laneStats.SelectedChars)
+		excludedCount += laneExcluded
+		lanes = append(lanes, map[string]any{
+			"key": key, "title": extractionStringFromAny(lane["title"]), "status": extractionStringFromAny(lane["status"]),
+			"configured_cap_chars": configuredCap, "effective_cap_chars": effectiveCap,
+			"candidate_count": maxInt(0, laneStats.CandidateCount), "candidate_chars": maxInt(0, laneStats.CandidateChars),
+			"selected_count": maxInt(0, laneStats.SelectedCount), "selected_chars": maxInt(0, laneStats.SelectedChars),
+			"final_delivery_count": finalCount, "final_delivery_chars": finalChars,
+			"excluded_count": laneExcluded, "exclusion_reasons": reasons,
+		})
+	}
+	bodyChars := len([]rune(extractionStringFromAny(plan["auxiliary_text"])))
+	interLaneSeparatorChars := maxInt(0, bodyChars-laneContentChars)
+	headerChars := 0
+	outerSeparatorChars := 0
+	finalDeliveryChars := 0
+	if bodyChars > 0 {
+		headerChars = len([]rune(prepareTurnAuxiliaryMessageHeader))
+		outerSeparatorChars = 2
+		finalDeliveryChars = headerChars + outerSeparatorChars + bodyChars
+	}
+	plan["budget_ledger"] = map[string]any{
+		"contract_version": "payload_budget_ledger.v1", "owner": "go",
+		"scope": "main_model_auxiliary_system_message", "delivery_state": "planned_exact_payload_text",
+		"configured_cap_chars": configuredCapChars, "effective_cap_chars": effectiveCapChars,
+		"candidate_chars": candidateChars, "selected_chars": selectedChars,
+		"lane_content_chars": laneContentChars, "auxiliary_body_chars": bodyChars,
+		"header_chars": headerChars, "outer_separator_chars": outerSeparatorChars,
+		"inter_lane_separator_chars": interLaneSeparatorChars,
+		"assembly_chars":             headerChars + outerSeparatorChars + interLaneSeparatorChars,
+		"final_delivery_chars":       finalDeliveryChars, "excluded_count": excludedCount,
+		"lanes": lanes,
 	}
 }
 
@@ -226,7 +542,7 @@ func buildPrepareTurnRecomposerEnhancementContract(
 	status := "ready"
 	if totalAvailable == 0 {
 		status = "empty"
-	} else if supervisorCallStatus == "failed_open" || supervisorCallStatus == "malformed_failed_open" {
+	} else if supervisorCallStatus == "failed_open" || supervisorCallStatus == "publisher_response_container_invalid" || supervisorCallStatus == "publisher_llm_empty_content" || supervisorCallStatus == "publisher_json_malformed" || supervisorCallStatus == "publisher_json_truncated" || supervisorCallStatus == "publisher_schema_invalid" || supervisorCallStatus == "publisher_plan_no_valid_items" {
 		status = "partial"
 	}
 
@@ -277,29 +593,95 @@ func prepareTurnTextHash(text string) string {
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
-func supervisorSceneProposalGuidanceItems(result map[string]any) []prepareTurnGuidanceItem {
+func supervisorSceneProposalGuidanceItems(result map[string]any, guidanceFormat string) []prepareTurnGuidanceItem {
+	guidanceFormat = normalizePublisherGuidanceFormat(guidanceFormat)
 	proposal := mapFromAny(mapFromAny(result["directive"])["supervisor_scene_proposal"])
 	plan := mapFromAny(proposal["publisher_plan"])
-	if extractionStringFromAny(plan["contract_version"]) != "publisher_plan.v1" || extractionStringFromAny(plan["status"]) != "ready" {
+	status := extractionStringFromAny(plan["status"])
+	if extractionStringFromAny(plan["contract_version"]) != "publisher_plan.v2" || (status != "ready" && status != "partial") {
 		return nil
 	}
-	items := []prepareTurnGuidanceItem{}
-	for _, raw := range outputFidelityLineageSlice(plan["guidance_items"]) {
+	fieldLabels := map[string]string{
+		"current_arc":       "Current arc",
+		"narrative_goal":    "Narrative goal",
+		"next_beats":        "Next beat",
+		"guardrails":        "Guardrail",
+		"scene_mandate":     "Scene mandate",
+		"required_outcomes": "Required outcome",
+		"forbidden_moves":   "Forbidden move",
+		"pressure_level":    "Pressure",
+	}
+	bookAuthorLines := []string{}
+	directorLines := []string{}
+	sourceRefs := []string{}
+	for _, raw := range outputFidelityLineageSlice(plan["accepted_items"]) {
 		item := mapFromAny(raw)
-		text := strings.TrimSpace(extractionFirstNonEmpty(extractionStringFromAny(item["render_text"]), extractionStringFromAny(item["text"])))
+		role := extractionStringFromAny(item["role"])
+		field := extractionStringFromAny(item["field"])
+		label, knownField := fieldLabels[field]
+		text := strings.TrimSpace(extractionStringFromAny(item["text"]))
 		itemRefs := stringSliceFromAny(item["source_refs"])
-		slot := strings.ToLower(strings.TrimSpace(extractionStringFromAny(item["slot"])))
-		if slot == "" || text == "" || len(itemRefs) == 0 {
+		if !knownField || text == "" || len(itemRefs) == 0 || (role != "book_author" && role != "director") {
 			continue
 		}
-		items = append(items, prepareTurnGuidanceItem{
-			Key:        "publisher_" + slot,
-			Title:      "Optional Publisher " + strings.ReplaceAll(slot, "_", " "),
-			Text:       "[Optional Publisher " + strings.ReplaceAll(slot, "_", " ") + "]\n" + text,
-			SourceRefs: itemRefs,
-		})
+		level := extractionStringFromAny(item["level"])
+		line := ""
+		switch guidanceFormat {
+		case "compact":
+			label = field
+			if field == "pressure_level" {
+				label += "(" + level + ")"
+			}
+			line = label + "=" + text
+		case "explicit":
+			label = strings.ToUpper(field)
+			if field == "pressure_level" {
+				label += "(" + level + ")"
+			}
+			line = "- " + label + "=" + text
+		default:
+			if field == "pressure_level" {
+				label += " (" + level + ")"
+			}
+			line = "- " + label + ": " + text
+		}
+		if role == "book_author" {
+			bookAuthorLines = append(bookAuthorLines, line)
+		} else {
+			directorLines = append(directorLines, line)
+		}
+		sourceRefs = appendUniqueStringValues(sourceRefs, itemRefs...)
 	}
-	return items
+	sections := []string{}
+	bookAuthorHeader := "[Book Author]"
+	directorHeader := "[Director]"
+	switch guidanceFormat {
+	case "compact":
+		sections = append(sections, "[PG|scope=current_response|user_input=authority]")
+		bookAuthorHeader = "[BA]"
+		directorHeader = "[D]"
+	case "explicit":
+		sections = append(sections, "[PUBLISHER_PLAN]\nSCOPE=CURRENT_RESPONSE; USER_INPUT=AUTHORITATIVE; AUTHORITY=PROPOSAL_ONLY")
+		bookAuthorHeader = "[BOOK_AUTHOR]"
+		directorHeader = "[DIRECTOR]"
+	default:
+		sections = append(sections, "[Publisher Guidance]", "Use this only to shape the current response. The user input and supplied continuity remain authoritative.")
+	}
+	if len(bookAuthorLines) > 0 {
+		sections = append(sections, bookAuthorHeader+"\n"+strings.Join(bookAuthorLines, "\n"))
+	}
+	if len(directorLines) > 0 {
+		sections = append(sections, directorHeader+"\n"+strings.Join(directorLines, "\n"))
+	}
+	if len(bookAuthorLines) == 0 && len(directorLines) == 0 {
+		return nil
+	}
+	return []prepareTurnGuidanceItem{{
+		Key:        "publisher_plan",
+		Title:      "Publisher Guidance",
+		Text:       strings.Join(sections, "\n\n"),
+		SourceRefs: sourceRefs,
+	}}
 }
 
 type prepareTurnInjectionBlock struct {

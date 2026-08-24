@@ -996,7 +996,7 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 		"pending_threads": []any{map[string]any{"thread_type": "promise", "title": "Alice thanks Bob later", "confidence": 0.85}},
 		"world_rules":     []any{map[string]any{"scope": "session", "category": "relationship", "key": "trust_changes_need_evidence", "value": "Trust shifts should be grounded in visible actions."}},
 	}
-	extractionBytes, _ := json.Marshal(extraction)
+	extractionBytes := []byte(criticWireJSONForTest(extraction))
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "critic-model",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
@@ -1080,8 +1080,15 @@ func TestCompleteTurnDualShadowWithCriticSavesAllArtifacts(t *testing.T) {
 	if len(fake.savedStorylines) != 1 {
 		t.Fatalf("expected one storyline, got %d", len(fake.savedStorylines))
 	}
-	if len(vec.docs) != 2 {
-		t.Fatalf("relationship-scoped memory must stay out of generic vector; expected evidence/world-rule, got %d", len(vec.docs))
+	if len(vec.docs) != 3 {
+		t.Fatalf("public relationship evidence was not retained for general recall; got %#v", vec.docs)
+	}
+	tiers := map[string]bool{}
+	for _, doc := range vec.docs {
+		tiers[doc.Tier] = true
+	}
+	if !tiers["memory"] || !tiers["evidence"] || !tiers["world_rule"] {
+		t.Fatalf("expected public memory, evidence, and world-rule vectors, got %#v", vec.docs)
 	}
 }
 

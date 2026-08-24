@@ -225,8 +225,8 @@ func (s *Server) handleCompleteTurnDecoded(w http.ResponseWriter, r *http.Reques
 		extractionStringFromAny(effectiveInputObservation["capture_stage"]) == "before_request_return" &&
 		extractionStringFromAny(effectiveInputObservation["hash_algorithm"]) == "or1c_utf16_djb2.v1" &&
 		completeTurnBoolFromAny(effectiveInputObservation["payload_content_match"]) {
-		candidate := strings.TrimSpace(extractionStringFromAny(effectiveInputObservation["effective_input"]))
-		if candidate != "" && prepareOR1CHash(candidate) == extractionStringFromAny(effectiveInputObservation["effective_input_hash"]) {
+		candidate := extractionStringFromAny(effectiveInputObservation["effective_input"])
+		if strings.TrimSpace(candidate) != "" && prepareOR1CHash(candidate) == extractionStringFromAny(effectiveInputObservation["effective_input_hash"]) {
 			verifiedEffectiveInput = candidate
 		}
 	}
@@ -1019,6 +1019,14 @@ func (s *Server) handleCompleteTurnDecoded(w http.ResponseWriter, r *http.Reques
 				}
 			}
 		}
+		if reprocessingDurable && s.TurnWorkflows != nil && workflowRequestID != "" {
+			s.TurnWorkflows.bindRecoveryTarget(
+				workflowRequestID,
+				sid,
+				turnIndex,
+				sourceAcceptance.Revision,
+			)
+		}
 		if s.TurnWorkflows != nil && workflowRequestID != "" {
 			switch {
 			case criticResult == nil:
@@ -1082,7 +1090,6 @@ func (s *Server) handleCompleteTurnDecoded(w http.ResponseWriter, r *http.Reques
 			}
 			s.TurnWorkflows.startStage(workflowRequestID, turnWorkflowStageCheckpoints)
 		}
-
 	}
 	if !s.usesShadowWriteStore() {
 		timing.addElapsed("raw_and_audit_store", auditStoreStartedAt)
@@ -1251,6 +1258,9 @@ func (s *Server) handleCompleteTurnDecoded(w http.ResponseWriter, r *http.Reques
 				s.TurnWorkflows.complete(workflowRequestID)
 			}
 		}
+	}
+	if reprocessingDurable {
+		s.wakeMemoryWorkers()
 	}
 	persistencePipeline := map[string]any{
 		"contract_version": "complete_turn.persistence_pipeline.v1",
@@ -1441,10 +1451,6 @@ func (s *Server) handleCompleteTurnDecoded(w http.ResponseWriter, r *http.Reques
 			"persona_capsule_candidates":               personaCapsuleCandidates,
 			"subjective_entity_memories_saved":         subjectiveEntityMemoriesSaved,
 			"subjective_entity_memory_policy":          "support_only_entity_subjective_memory_bank",
-			"critic_preview_pass_version":              completeTurnCriticPreviewPassVersion,
-			"critic_preview_pass_enabled":              true,
-			"critic_preview_pass_scope":                "recent_raw_and_direct_evidence",
-			"critic_preview_compaction_mode":           "hint_only",
 			"canonical_state_promotion_policy_version": "hs1.verified_only.v1",
 			"canonical_state_layers_saved":             canonicalStateLayersSaved,
 			"canonical_state_hard_floor_enabled":       true,

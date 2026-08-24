@@ -47,6 +47,7 @@ type turnRecordingStore struct {
 	savedCanonicalLayers      []*store.CanonicalStateLayer
 	returnKGTriples           []store.KGTriple
 	returnEvidence            []store.DirectEvidence
+	listEvidenceCalls         int
 	returnChatLogs            []store.ChatLog
 	returnResumePack          *store.ResumePack
 	returnStorylines          []store.Storyline
@@ -309,6 +310,7 @@ func (f *turnRecordingStore) ListKGTriples(ctx context.Context, sid string) ([]s
 }
 
 func (f *turnRecordingStore) ListEvidence(ctx context.Context, sid string) ([]store.DirectEvidence, error) {
+	f.listEvidenceCalls++
 	return f.returnEvidence, nil
 }
 
@@ -459,7 +461,31 @@ func (f *turnRecordingStore) ListProtagonistEntityMemories(ctx context.Context, 
 }
 
 func (f *turnRecordingStore) ListProtagonistEntityMemoryOwners(ctx context.Context, filter store.ProtagonistEntityMemoryFilter) ([]store.ProtagonistEntityMemoryOwner, error) {
-	return append([]store.ProtagonistEntityMemoryOwner(nil), f.returnEntityOwners...), nil
+	if len(f.returnEntityOwners) > 0 {
+		return append([]store.ProtagonistEntityMemoryOwner(nil), f.returnEntityOwners...), nil
+	}
+	// Mirror the MariaDB owner-index projection for tests that provide source
+	// memories directly: the production owner list is derived from those rows.
+	seen := map[string]bool{}
+	owners := []store.ProtagonistEntityMemoryOwner{}
+	for _, item := range f.returnEntityMemories {
+		if filter.SourceChatSessionID != "" && item.SourceChatSessionID != filter.SourceChatSessionID {
+			continue
+		}
+		if filter.OwnerEntityRole != "" && item.OwnerEntityRole != filter.OwnerEntityRole {
+			continue
+		}
+		if filter.OwnerVisibility != "" && item.OwnerVisibility != filter.OwnerVisibility {
+			continue
+		}
+		key := strings.TrimSpace(item.OwnerEntityKey)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		owners = append(owners, store.ProtagonistEntityMemoryOwner{OwnerEntityKey: key, OwnerEntityName: item.OwnerEntityName})
+	}
+	return owners, nil
 }
 
 func (f *turnRecordingStore) SaveMemory(ctx context.Context, m *store.Memory) error {
@@ -1174,6 +1200,51 @@ func TestCompleteTurnMariaDBAuthorityWritesAll(t *testing.T) {
 	}
 }
 
+func TestCompleteTurnPreservesWhitespaceInVerifiedEffectiveInput(t *testing.T) {
+	fake := &turnRecordingStore{}
+	cfg := config.Default()
+	cfg.StoreMode = config.StoreModeMariaDBAuthority
+	srv := NewServer(cfg)
+	srv.Store = fake
+	srv.StoreOpenError = nil
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	verifiedEffectiveInput := "  exact input with surrounding whitespace\n"
+	body := fmt.Sprintf(
+		`{"chat_session_id":"sess-effective-whitespace","turn_index":1,"user_input":"input","assistant_content":"reply","client_meta":{"effective_input_observation":{"contract_version":"effective_input_observation.v1","status":"verified","capture_stage":"before_request_return","effective_input":%q,"effective_input_hash":%q,"hash_algorithm":"or1c_utf16_djb2.v1","payload_content_match":true}}}`,
+		verifiedEffectiveInput,
+		prepareOR1CHash(verifiedEffectiveInput),
+	)
+	req := httptest.NewRequest(http.MethodPost, "/complete-turn", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(fake.savedEffectiveInputs) != 1 || fake.savedEffectiveInputs[0].EffectiveInput != verifiedEffectiveInput {
+		t.Fatalf("verified effective input whitespace changed: %#v", fake.savedEffectiveInputs)
+	}
+
+	wrongHashBody := fmt.Sprintf(
+		`{"chat_session_id":"sess-effective-whitespace","turn_index":2,"user_input":"input 2","assistant_content":"reply 2","client_meta":{"effective_input_observation":{"contract_version":"effective_input_observation.v1","status":"verified","capture_stage":"before_request_return","effective_input":%q,"effective_input_hash":"or1c_wrong","hash_algorithm":"or1c_utf16_djb2.v1","payload_content_match":true}}}`,
+		verifiedEffectiveInput,
+	)
+	wrongHashReq := httptest.NewRequest(http.MethodPost, "/complete-turn", strings.NewReader(wrongHashBody))
+	wrongHashReq.Header.Set("Content-Type", "application/json")
+	wrongHashRec := httptest.NewRecorder()
+	mux.ServeHTTP(wrongHashRec, wrongHashReq)
+	if wrongHashRec.Code != http.StatusOK {
+		t.Fatalf("wrong-hash status = %d, want 200: %s", wrongHashRec.Code, wrongHashRec.Body.String())
+	}
+	if len(fake.savedEffectiveInputs) != 1 {
+		t.Fatalf("wrong hash persisted effective input: %#v", fake.savedEffectiveInputs)
+	}
+}
+
 func TestCompleteTurnIdempotentReplaySkipsDuplicateDerivedWrites(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnChatLogs: []store.ChatLog{
@@ -1243,7 +1314,7 @@ func TestCompleteTurnExistingRawWithoutDerivedRetriesCriticWithoutDuplicateLogs(
 		"kg_triples":        []any{testEntityScalarKG("item_fact", "Mina", "character", "found", "a brass key", "string", "Mina found a brass key.")},
 		"entities":          map[string]any{"characters": []any{map[string]any{"name": "Mina"}}, "items": []any{map[string]any{"name": "brass key"}}},
 	}
-	extractionBytes, _ := json.Marshal(extraction)
+	extractionBytes := []byte(criticWireJSONForTest(extraction))
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "critic-model",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},

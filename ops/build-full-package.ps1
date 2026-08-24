@@ -2,7 +2,7 @@ param(
     [string]$OutputRoot,
     [string]$PackageName = "",
     [string]$PackageKind = "managed",
-    [string]$PackageVersion = "3.9.11",
+    [string]$PackageVersion = "4.0.0",
     [string]$ChromaRuntime = "",
     [string]$CodeSigningCertThumbprint = "",
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -134,7 +134,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.0" } else { $PackageVersion.Trim() }
     $packageLabel = if ($PackageKind -eq "managed") {
         "Archive Center $version Windows Auto Install Package"
     } else {
@@ -153,7 +153,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "3.9.11" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.0" } else { $PackageVersion.Trim() }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $patterns = @("*.md", "*.txt", "*.bat", "*.cmd", "*.ps1", "*.sh", "*.command")
     foreach ($pattern in $patterns) {
@@ -171,8 +171,10 @@ function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
     if (Test-Path -LiteralPath $pluginPath -PathType Leaf) {
         $text = [System.IO.File]::ReadAllText($pluginPath, [System.Text.Encoding]::UTF8)
         $next = [regex]::Replace($text, '(?m)^//@display-name Archive Center .+$', "//@display-name Archive Center $version")
-        $next = [regex]::Replace($next, '(?m)^//@version .+$', "//@version $version")
-        $next = [regex]::Replace($next, '(?m)^(\s*const VERSION = )"[^"]+";', ('$1"' + $version + '";'))
+        if ($version -match '^\d+\.\d+\.\d+$') {
+            $next = [regex]::Replace($next, '(?m)^//@version .+$', "//@version $version")
+            $next = [regex]::Replace($next, '(?m)^(\s*const VERSION = )"[^"]+";', ('$1"' + $version + '";'))
+        }
         if ($next -ne $text) {
             [System.IO.File]::WriteAllText($pluginPath, $next, $utf8NoBom)
         }

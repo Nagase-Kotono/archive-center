@@ -467,12 +467,12 @@ func TestConfigUpdateRuntimeSettingsFeedCompleteTurnCritic(t *testing.T) {
 	srv.Store = fake
 	srv.StoreOpenError = nil
 
-	extractionBytes, _ := json.Marshal(map[string]any{
+	extractionBytes := []byte(criticWireJSONForTest(map[string]any{
 		"turn_summary":      "Runtime config critic extracted one durable memory.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"The runtime-configured critic is active."},
 		"kg_triples":        []any{testEntityScalarKG("state_fact", "critic", "event", "is", "active", "state", "The runtime-configured critic is active.")},
-	})
+	}))
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
@@ -637,7 +637,7 @@ func TestSaveCriticExtractionArtifactsAcceptsTupleKGAndScalarEntities(t *testing
 	}
 }
 
-func TestSaveCriticExtractionArtifactsKeepsDistinctEvidenceAndSkipsExactActiveKGDuplicate(t *testing.T) {
+func TestSaveCriticExtractionArtifactsKeepsDistinctEvidenceAndRepeatedEventOnNewTurn(t *testing.T) {
 	fake := &turnRecordingStore{
 		returnEvidence: []store.DirectEvidence{{
 			ChatSessionID:   "sess-dupe-artifacts-fuzzy",
@@ -665,11 +665,11 @@ func TestSaveCriticExtractionArtifactsKeepsDistinctEvidenceAndSkipsExactActiveKG
 		"kg_triples":        []any{map[string]any{"semantic_class": "event_fact", "subject": "Mina", "predicate": "protects", "object": "Rowan", "valid_from": 7}},
 	})
 	result := srv.saveCriticExtractionArtifacts(context.Background(), "sess-dupe-artifacts-fuzzy", 7, extraction, "Mina promises Rowan she will return. Mina protects Rowan.", completeTurnEmbeddingConfig{}, time.Unix(701, 0))
-	if result.Evidence != 1 || result.KGTriples != 0 {
-		t.Fatalf("distinct evidence or exact KG duplicate was handled incorrectly, evidence=%d kg=%d skip=%#v", result.Evidence, result.KGTriples, result.SkipReasons)
+	if result.Evidence != 1 || result.KGTriples != 1 {
+		t.Fatalf("distinct evidence or repeated event was discarded, evidence=%d kg=%d skip=%#v", result.Evidence, result.KGTriples, result.SkipReasons)
 	}
-	if len(fake.savedEvidence) != 1 || len(fake.savedKGTriples) != 0 {
-		t.Fatalf("distinct evidence or exact KG duplicate write count is wrong, evidence=%d kg=%d", len(fake.savedEvidence), len(fake.savedKGTriples))
+	if len(fake.savedEvidence) != 1 || len(fake.savedKGTriples) != 1 {
+		t.Fatalf("distinct evidence or repeated event write count is wrong, evidence=%d kg=%d", len(fake.savedEvidence), len(fake.savedKGTriples))
 	}
 }
 
@@ -709,13 +709,13 @@ func TestExplorerRegenerateMemoryUsesCompleteTurnArtifactPipeline(t *testing.T) 
 	srv.Store = fake
 	srv.StoreOpenError = nil
 
-	extractionBytes, _ := json.Marshal(map[string]any{
+	extractionBytes := []byte(criticWireJSONForTest(map[string]any{
 		"turn_summary":      "Rowan accepts Mina's request and confirms the cellar route.",
 		"importance_score":  7,
 		"evidence_excerpts": []any{"Rowan accepts and confirms the cellar route is the only safe path."},
 		"kg_triples":        []any{testEntityScalarKG("state_fact", "cellar route", "location", "is", "the only safe path", "state", "Rowan accepts and confirms the cellar route is the only safe path.")},
 		"world_rules":       []any{map[string]any{"scope": "location", "scope_name": "cellar", "category": "access", "key": "cellar_route_only_safe_path", "value": "The cellar route is the only safe path."}},
-	})
+	}))
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "critic-test",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
@@ -766,11 +766,11 @@ func TestCompleteTurnCriticLedgerWiringBehindFeatureFlag(t *testing.T) {
 		srv.Store = fake
 		srv.StoreOpenError = nil
 
-		extractionBytes, _ := json.Marshal(map[string]any{
+		extractionBytes := []byte(criticWireJSONForTest(map[string]any{
 			"turn_summary":      "Latest turn produced a small durable memory.",
 			"importance_score":  5,
 			"evidence_excerpts": []any{"Latest turn produced a small durable memory."},
-		})
+		}))
 		chatResp, _ := json.Marshal(map[string]any{
 			"model":   "critic-ledger-test",
 			"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
@@ -849,7 +849,7 @@ func TestCompleteTurnCriticLedgerWiringBehindFeatureFlag(t *testing.T) {
 		t.Fatalf("enabled ledger trace mismatch: %+v", enabledLedgerTrace)
 	}
 	language, _ := enabledLedgerTrace["language"].(map[string]any)
-	if language["assistant_final_language"] != "ko" {
+	if language["assistant_final_language"] != "auto" {
 		t.Fatalf("enabled ledger language mismatch: %+v", language)
 	}
 }
@@ -886,8 +886,16 @@ func TestImportHypamemoryRequiresCriticConfig(t *testing.T) {
 	}
 }
 
+type hypaLifecycleTurnRecordingStore struct {
+	*turnRecordingStore
+}
+
+func (*hypaLifecycleTurnRecordingStore) MemoryDerivationLifecycleEnabled() bool {
+	return true
+}
+
 func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
-	fake := &turnRecordingStore{}
+	fake := &hypaLifecycleTurnRecordingStore{turnRecordingStore: &turnRecordingStore{}}
 	vec := &turnRecordingVectorStore{}
 	cfg := config.Default()
 	cfg.StoreMode = config.StoreModeMariaDBAuthority
@@ -897,7 +905,7 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 	srv.StoreOpenError = nil
 	srv.Vector = vec
 
-	extractionBytes, _ := json.Marshal(map[string]any{
+	extractionBytes := []byte(criticWireJSONForTest(map[string]any{
 		"turn_summary":      "Imported HypaMemory says Chloe trusts Hero after the rooftop promise.",
 		"importance_score":  8,
 		"evidence_excerpts": []any{"Chloe trusts Hero after the rooftop promise."},
@@ -905,7 +913,7 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 			"source_entity": "Chloe", "source_entity_expression": "Chloe", "target_entity": "Hero", "target_entity_expression": "Hero",
 			"domain": "trust", "domain_expression": "trusts", "observation": "Chloe trusts Hero after the rooftop promise", "support_kind": "explicit_observed_state", "evidence_excerpt": "Chloe trusts Hero after the rooftop promise.",
 		}},
-	})
+	}))
 	chatResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(extractionBytes)}}},
@@ -961,11 +969,25 @@ func TestImportHypamemoryWithRuntimeCriticSavesArtifacts(t *testing.T) {
 	if fake.savedMemories[0].TurnIndex != -42 || fake.savedEvidence[0].SourceTurnStart != -42 {
 		t.Fatalf("expected HypaMemory import artifacts to use negative import turn index, memory=%d evidence=%d", fake.savedMemories[0].TurnIndex, fake.savedEvidence[0].SourceTurnStart)
 	}
-	if len(vec.docs) != 1 {
-		t.Fatalf("relationship-scoped imported memory must stay out of generic vector; expected evidence only, got %d", len(vec.docs))
+	if len(vec.docs) != 2 {
+		t.Fatalf("public imported memory and evidence were not retained for general recall, got %d", len(vec.docs))
 	}
 	if !hasAuditEvent(fake.savedAuditLogs, "hypamemory_import") {
 		t.Fatalf("expected hypamemory_import audit log, got %#v", fake.savedAuditLogs)
+	}
+}
+
+func TestMemoryForTurnAlreadyExistsFindsNegativeHypaImportTurn(t *testing.T) {
+	const sid = "sess-hypa-idempotency"
+	fake := &turnRecordingStore{returnMemories: []store.Memory{
+		{ID: 81, ChatSessionID: sid, TurnIndex: -42, SummaryJSON: `{"turn_summary":"Existing HypaMemory import."}`},
+		{ID: 82, ChatSessionID: sid, TurnIndex: -41, SummaryJSON: `{"turn_summary":"Different import."}`},
+	}}
+	srv := &Server{Store: fake}
+
+	id, summary := srv.memoryForTurnAlreadyExists(context.Background(), sid, -42, &artifactSaveResult{})
+	if id != 81 || summary != "Existing HypaMemory import." {
+		t.Fatalf("negative import duplicate lookup = (%d, %q), want (81, Existing HypaMemory import.)", id, summary)
 	}
 }
 
@@ -987,12 +1009,12 @@ func TestImportHypamemoryScoringPassRaisesLowCriticImportance(t *testing.T) {
 		"time_anchor_quality":         "summary_level",
 		"keep_reason":                 "The imported memory changes how future danger should be interpreted.",
 	})
-	extractionBytes, _ := json.Marshal(map[string]any{
+	extractionBytes := []byte(criticWireJSONForTest(map[string]any{
 		"turn_summary":      "Imported HypaMemory says Hero was shot before and Chloe took him to hospital.",
 		"importance_score":  2,
 		"evidence_excerpts": []any{"Hero was shot before and Chloe took him to hospital."},
 		"kg_triples":        []any{map[string]any{"semantic_class": "location_fact", "subject": "Hero", "predicate": "was_taken_to", "object": "hospital"}},
-	})
+	}))
 	scoringResp, _ := json.Marshal(map[string]any{
 		"model":   "runtime-critic",
 		"choices": []any{map[string]any{"message": map[string]any{"content": string(scoringBytes)}}},

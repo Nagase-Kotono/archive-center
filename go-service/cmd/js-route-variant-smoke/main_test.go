@@ -58,7 +58,8 @@ func TestArchiveCenterJSCanonPackAndDiscoveryUIMarkers(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	for _, marker := range []string{
 		`data-reference-panel="canon"`,
-		`data-tab="reference">📚 원작 자료</button>`,
+		`data-tab="reference">${escapeAttr(t('settings.tab.extensions'))}</button>`,
+		`["reference", t('settings.tab.reference')]`,
 		`/canon-registry/v1?q=`,
 		`/canon-packs/preview/v1`,
 		`/canon-packs/install/v1`,
@@ -96,7 +97,6 @@ func TestArchiveCenterJSCanonPackAndDiscoveryUIMarkers(t *testing.T) {
 		`>Ollama Search Agent</option>`,
 		`ollama: { endpoint: "https://ollama.com"`,
 		`generationOptions.style.display = ""`,
-		`Ollama 검색 에이전트 · effort none은 think=false`,
 		`const discoveryExceptions = Array.isArray(discoveryResult.exceptions)`,
 		`' · 검색 URL ' + Number(discoverySearch.result_count || 0)`,
 		`'개 · 수집 실패 ' + discoveryExceptions.length`,
@@ -150,26 +150,35 @@ func TestArchiveCenterJSCanonPackAndDiscoveryUIMarkers(t *testing.T) {
 			t.Fatalf("Archive Center.js still exposes removed Source Discovery field %q", removed)
 		}
 	}
-	referencePanelStart := strings.Index(src, `data-tab-panel="reference"`)
+	referencePanelStart := strings.Index(src, `activePrimaryTab === "extensions"`)
 	if referencePanelStart < 0 {
-		t.Fatal("top-level reference panel missing")
+		t.Fatal("top-level extensions panel missing")
 	}
-	referencePanelEnd := strings.Index(src[referencePanelStart:], `data-tab-panel="archive"`)
-	if referencePanelEnd < 0 || strings.Contains(src[referencePanelStart:referencePanelStart+referencePanelEnd], `settingsSubtabsHtml("reference")`) {
-		t.Fatal("reference workspace must not render the settings subtab bar")
+	referencePanelEnd := strings.Index(src[referencePanelStart:], `activePrimaryTab === "archive"`)
+	if referencePanelEnd < 0 || strings.Contains(src[referencePanelStart:referencePanelStart+referencePanelEnd], `settingsSubtabsHtml(`) || !strings.Contains(src[referencePanelStart:referencePanelStart+referencePanelEnd], `extensionsSubtabsHtml(_settingsActiveTab)`) {
+		t.Fatal("extensions workspace must own its Reference/Persona subtab bar")
 	}
 }
 
 func TestArchiveCenterJSConsumesReferenceLaneOutsideMainInjectionBudget(t *testing.T) {
 	src := readArchiveCenterJS(t)
 	for _, marker := range []string{
-		`reference_injection_budget_basis_chars: settings.maxInjectionChars || DEFAULT_SETTINGS.maxInjectionChars,`,
+		`reference_injection_budget_basis_chars: Number(settings.referenceInjectionMaxChars ?? DEFAULT_SETTINGS.referenceInjectionMaxChars),`,
+		`lorebook_reference_max_chars: Number(settings.lorebookReferenceMaxChars ?? DEFAULT_SETTINGS.lorebookReferenceMaxChars),`,
 		`reference_recall_limit: sanitizeTopKSetting(settings.topK, DEFAULT_SETTINGS.topK),`,
 		`reference_injection_enabled: settings.injectionEnabled !== false,`,
 		`payloadApplicationPlan: result.payload_application_plan`,
+		`publisherCallBudgetLedger: result.publisher_call_budget_ledger || null`,
+		`lorebookReference: result.lorebook_reference || (result.injection_pack && result.injection_pack.lorebook_reference_recall) || null`,
+		`plan.budget_ledger.contract_version === "payload_budget_ledger.v1"`,
+		`payloadBudgetLedger.final_delivery_chars`,
 		`const auxiliaryText = String(plan.auxiliary_text || "")`,
 		`injectAuxiliaryBlock(finalPayload, auxiliaryText)`,
 		`referenceIncluded: !!(laneByKey.original_work && laneByKey.original_work.applied)`,
+		`function renderLorebookSelectionDiagnostics()`,
+		`function renderProviderCallBudgetLedgers()`,
+		`ledger.contract_version !== "provider_call_budget_ledger.v1"`,
+		`provider did not report token usage`,
 	} {
 		if !strings.Contains(src, marker) {
 			t.Fatalf("Archive Center.js missing primary Canon Base host-consumption marker %q", marker)
@@ -177,6 +186,58 @@ func TestArchiveCenterJSConsumesReferenceLaneOutsideMainInjectionBudget(t *testi
 	}
 	if strings.Contains(src, "await runSupervisor(") {
 		t.Fatal("host adapter must not create a second supervisor path")
+	}
+	if strings.Contains(src, `budgetLimit: lanes.reduce(`) || strings.Contains(src, `renderItBlock("Auxiliary Context Budget"`) {
+		t.Fatal("JavaScript must not recompute or retain the memory-only payload budget summary")
+	}
+}
+
+func TestArchiveCenterJSRendersLorebookAndProviderCallObservations(t *testing.T) {
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is required for selection/call-ledger runtime smoke")
+		}
+	}
+	src := readArchiveCenterJS(t)
+	script := extractJSFunctionBlockForTest(t, src, "function renderLorebookSelectionDiagnostics()") + "\n" +
+		extractJSFunctionBlockForTest(t, src, "function renderProviderCallBudgetLedgers()") + `
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+function statusDotClass(value) { return value; }
+function escapeAttr(value) { return String(value == null ? "" : value); }
+const lastTurnTrace = {
+  lorebookReference: {
+    selection_observation_contract:"lorebook_selection_observation.v1",
+    catalog_count:40,candidate_count:3,selected_count:1,delivery_count:1,
+    key_matched_candidate_count:1,context_matched_candidate_count:2,
+    already_present_count:1,no_context_match_count:1,coalesced_content_count:0,
+    always_active_candidate_count:1,always_active_delivery_count:0,
+    final_disposition_counts:{delivered:1,excluded_already_present:1,excluded_no_context_match:1},
+    delivery_chars:120,budget_chars:6000,budget_deferred_count:0,
+    candidate_refs:[
+      {entry_ref:"host_entry:relevant",always_active:false,matched_keys:["한얼"],context_overlap:1,final_disposition:"delivered",delivered:true},
+      {entry_ref:"host_entry:present",always_active:true,matched_keys:[],context_overlap:1,observed_source:"risu_request_message",final_disposition:"excluded_already_present",delivered:false}
+    ]
+  },
+  providerCallBudgetLedgers: {
+    publisher:{contract_version:"provider_call_budget_ledger.v1",owner:"go",status:"succeeded",final_prompt_chars:2000,system_prompt_chars:700,current_turn_chars:100,auxiliary_memory_chars:500,original_work_reference_chars:0,original_work_reference_status:"not_in_call_contract",lorebook_reference_chars:200,lorebook_reference_status:"delivered",json_schema_output_requirement_chars:100,json_schema_output_requirement_accounting:"separate_user_payload_field",assembly_chars:400,provider_usage_status:"reported",input_tokens:500,output_tokens:100,total_tokens:600},
+    critic:{contract_version:"provider_call_budget_ledger.v1",owner:"go",status:"failed",failure_stage:"json_parse",failure_code:"CRITIC_JSON_PARSE_FAILED",final_prompt_chars:4000,system_prompt_chars:1600,current_turn_chars:500,auxiliary_memory_chars:1200,original_work_reference_chars:0,original_work_reference_status:"not_in_call_contract",lorebook_reference_chars:0,lorebook_reference_status:"not_in_call_contract",json_schema_output_requirement_chars:0,json_schema_output_requirement_accounting:"embedded_in_system_prompt_not_separable",assembly_chars:700,provider_usage_status:"unreported"}
+  }
+};
+const lorebookHTML = renderLorebookSelectionDiagnostics();
+assert(lorebookHTML.includes("40 → 3 → 1 → 1"), "candidate-to-selection-to-delivery counts missing");
+assert(lorebookHTML.includes("key=한얼") && lorebookHTML.includes("present=risu_request_message"), "selection evidence missing");
+const callHTML = renderProviderCallBudgetLedgers();
+assert(callHTML.includes("input 500") && callHTML.includes("output 100"), "reported provider tokens missing");
+assert(callHTML.includes("provider did not report token usage"), "unreported usage was not explicit");
+assert(callHTML.includes("CRITIC_JSON_PARSE_FAILED") && callHTML.includes("json_parse"), "critic failure point missing");
+`
+	cmd := exec.Command(nodePath, "-")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("selection/call-ledger runtime smoke failed: %v\n%s", err, out)
 	}
 }
 
@@ -198,55 +259,124 @@ let lastOrchResult = null;
 function resolveLatestTransparencyTrace() { return currentTrace; }
 function composeEffectiveInputFromTransparency() { return "REFERENCE\n\nMAIN"; }
 function isBackendEffectiveInputPreview(value) { return !!(value && value.contract_version === "effective_input_preview.v1"); }
+function computeOrchestrationDirtyHashOr1c(value) { return String(value == null ? "" : value); }
 function formatLanguageContextBlock() { return ""; }
-function t(key) { return key; }
+function t(key) {
+  const labels = {
+    "dash.preview.payloadBudget.title":"Payload Ledger",
+    "dash.preview.payloadBudget.actual":"Delivered",
+    "dash.preview.payloadBudget.planned":"Planned delivery",
+    "dash.preview.payloadBudget.configured":"Configured",
+    "dash.preview.payloadBudget.effective":"Effective",
+    "dash.preview.payloadBudget.assembly":"Assembly",
+    "dash.preview.payloadBudget.candidate":"Candidate",
+    "dash.preview.payloadBudget.selected":"Selected",
+    "dash.preview.payloadBudget.final":"Final",
+    "dash.preview.payloadBudget.excluded":"Excluded",
+    "dash.preview.payloadBudget.lane.long_term_memory":"Memory",
+    "dash.preview.payloadBudget.lane.original_work":"Original DB",
+    "dash.preview.payloadBudget.lane.lorebook_reference":"Lorebook",
+    "dash.preview.payloadBudget.lane.output_guidance":"Publisher guidance"
+  };
+  return labels[key] || key;
+}
 function escapeAttr(value) { return String(value == null ? "" : value); }
 function truncPreview(value) { return String(value == null ? "" : value); }
 function renderItBlockRaw(title, html) { return '<RAW title="' + title + '">' + html + '</RAW>'; }
 function renderItBlock(title, text) { return '<BLOCK title="' + title + '">' + text + '</BLOCK>'; }
 
-currentTrace = {_inputTransparency: {injection: {
-  mainInjectionPreview: "MAIN",
-  referenceInjectionPreview: "REFERENCE",
-  guidanceInjectionPreview: "GUIDANCE",
-  auxiliaryPreview: "REFERENCE\n\nMAIN"
-}}};
+currentTrace = {_inputTransparency: {
+  backendEffectiveInputPreview: {contract_version:"effective_input_preview.v1",final_user_text:""},
+  injection: {payloadApplicationPlan: {
+    lanes: [
+      {key:"original_work",title:"Original Work Context",text:"REFERENCE",applied:true},
+      {key:"long_term_memory",title:"Long-term Memory Context",text:"MAIN",applied:true},
+      {key:"output_guidance",title:"Output Guidance Context",text:"GUIDANCE",applied:true}
+    ],
+    input_context_text:""
+  }}
+}};
 let html = renderEffectiveInputSection();
-assert(html.includes('<BLOCK title="Assembled Auxiliary Context">MAIN</BLOCK>'), "main context pane is not isolated");
-assert(html.includes('<BLOCK title="Original Work Reference Context">REFERENCE</BLOCK>'), "reference context pane is not isolated");
+assert(html.includes('<BLOCK title="Long-term Memory Context">MAIN</BLOCK>'), "main context pane is not isolated");
+assert(html.includes('<BLOCK title="Original Work Context">REFERENCE</BLOCK>'), "reference context pane is not isolated");
 assert(html.includes('<BLOCK title="Output Guidance Context">GUIDANCE</BLOCK>'), "guidance context pane is not isolated");
-assert(!html.includes('<BLOCK title="Assembled Auxiliary Context">REFERENCE\n\nMAIN</BLOCK>'), "combined context leaked into main pane");
+assert(!html.includes('<BLOCK title="Auxiliary Context">REFERENCE\n\nMAIN</BLOCK>'), "combined context leaked into canonical lane panes");
 
+const memoryClassFixtures = [
+  {key: "direct_evidence", title: "Latest Direct Evidence", used_chars: 6, reserved_chars: 100, text: "[Latest Direct Evidence]\nMEMORY_DIRECT"},
+  {key: "protected_secret", title: "Protected Memory Guidance", used_chars: 9, reserved_chars: 100, text: "[Protected Memory Guidance]\nMEMORY_PROTECTED"},
+  {key: "event_recent", title: "Event and Recent Memories", used_chars: 5, reserved_chars: 100, text: "[Event and Recent Memories]\nMEMORY_EVENT"},
+  {key: "character_objective", title: "Character Objective States", used_chars: 9, reserved_chars: 100, text: "[Character Objective States]\nMEMORY_CHARACTER"},
+  {key: "subjective_relationship", title: "Subjective Memories and Relationships", used_chars: 10, reserved_chars: 100, text: "[Subjective Memories and Relationships]\nMEMORY_SUBJECTIVE"},
+  {key: "world_state", title: "Item, Location, and World States", used_chars: 6, reserved_chars: 100, text: "[Item, Location, and World States]\nMEMORY_WORLD"}
+];
+const canonicalMemoryLane = memoryClassFixtures.map(item => item.text).join("\n\n");
 currentTrace = {_inputTransparency: {
   backendEffectiveInputPreview: {contract_version: "effective_input_preview.v1", final_user_text: "ACTUAL USER"},
-  inputContext: {text: "INPUT CONTEXT"},
   injection: {
-    mainInjectionPreview: "PRIORITY\n\nDIRECT\n\nEVENT",
-    referenceInjectionPreview: "REFERENCE",
+    payloadApplicationPlan: {
+      lanes: [
+        {key:"original_work",title:"Original Work Context",text:"REFERENCE",applied:true},
+        {key:"long_term_memory",title:"Long-term Memory Context",text:canonicalMemoryLane,applied:true},
+        {key:"lorebook_reference",title:"Lorebook Reference",text:"LORE",applied:true},
+        {key:"output_guidance",title:"Output Guidance Context",text:"GUIDANCE",applied:true}
+      ],
+      budget_ledger: {
+        contract_version:"payload_budget_ledger.v1",owner:"go",
+        final_delivery_chars:14200,configured_cap_chars:21000,effective_cap_chars:18000,assembly_chars:120,
+        lanes:[
+          {key:"long_term_memory",title:"Long-term Memory Context",configured_cap_chars:9000,candidate_chars:9800,selected_chars:8500,final_delivery_chars:8500,excluded_count:2,exclusion_reasons:{memory_char_budget:2}},
+          {key:"original_work",title:"Original Work Context",configured_cap_chars:3000,candidate_chars:2100,selected_chars:1700,final_delivery_chars:1700,excluded_count:1,exclusion_reasons:{original_work_char_budget:1}},
+          {key:"lorebook_reference",title:"Lorebook Reference",configured_cap_chars:6000,candidate_chars:4300,selected_chars:4300,final_delivery_chars:4000,excluded_count:1,exclusion_reasons:{lorebook_char_budget:1}},
+          {key:"output_guidance",title:"Output Guidance Context",configured_cap_chars:3000,candidate_chars:0,selected_chars:0,final_delivery_chars:0,excluded_count:0,exclusion_reasons:{}}
+        ]
+      },
+      input_context_text:"INPUT CONTEXT"
+    },
+    payloadApplicationObservation: {
+      contract_version:"payload_application_observation.v1",
+      status:"ready",
+      payload_application_status:"applied"
+    },
     protection: {text: "PRIORITY"},
-    memoryDeliveryPlan: {classes: [
-      {key: "direct_evidence", title: "Latest Direct Evidence", used_chars: 6, reserved_chars: 100, text: "[Latest Direct Evidence]\nDIRECT"},
-      {key: "event_recent", title: "Event and Recent Memories", used_chars: 5, reserved_chars: 100, text: "[Event and Recent Memories]\nEVENT"}
-    ]}
+    memoryDeliveryPlan: {used_chars:45,delivery_cap_chars:600,global_cap_chars:600,classes: memoryClassFixtures}
   }
 }};
+const canonicalPayloadPlanBeforeRender = JSON.stringify(currentTrace._inputTransparency.injection.payloadApplicationPlan);
+const canonicalMemoryPlanBeforeRender = JSON.stringify(currentTrace._inputTransparency.injection.memoryDeliveryPlan);
 html = renderEffectiveInputSection();
 assert(html.includes('<BLOCK title="Actual User Input">ACTUAL USER</BLOCK>'), "actual user pane is missing");
 assert(html.includes('<BLOCK title="Priority and Base Rules">PRIORITY</BLOCK>'), "priority pane is missing");
-assert(html.includes('title="Latest Direct Evidence · 사용 6 chars · 기본 배정 100 chars"'), "direct evidence pane is missing");
-assert(html.includes('title="Event and Recent Memories · 사용 5 chars · 기본 배정 100 chars"'), "event memory pane is missing");
-assert(html.includes('<BLOCK title="Input Context">INPUT CONTEXT</BLOCK>'), "input context pane is missing");
+assert(html.includes('<BLOCK title="Payload Ledger">') && html.includes('Delivered 14200 / Configured 21000 chars') && html.includes('Assembly 120 chars'), "backend payload ledger summary is missing");
+assert(html.includes('Memory 8500 / 9000 chars') && html.includes('Candidate 9800 → Selected 8500 → Final 8500') && html.includes('memory_char_budget=2'), "backend lane ledger was not rendered verbatim");
+assert(!html.includes('Auxiliary Context Budget'), "legacy memory-only budget summary survived");
+let previousPaneIndex = -1;
+memoryClassFixtures.forEach(function(deliveryClass) {
+  const paneIndex = html.indexOf('title="' + deliveryClass.title);
+  const marker = deliveryClass.text.split("\n")[1];
+  assert(paneIndex > previousPaneIndex, "memory class pane is missing or out of backend order: " + deliveryClass.key);
+  assert((html.match(new RegExp(marker, "g")) || []).length === 1, "memory class text was omitted or duplicated: " + deliveryClass.key);
+  previousPaneIndex = paneIndex;
+});
+assert(!html.includes('<BLOCK title="Long-term Memory Context">'), "coarse memory lane duplicated the class panes");
+assert(html.includes('<BLOCK title="Lorebook Reference">LORE</BLOCK>'), "on-demand lorebook lane was lost while splitting memory classes");
+assert(html.includes('<BLOCK title="Output Guidance Context">GUIDANCE</BLOCK>'), "output guidance lane was lost while splitting memory classes");
+assert(!html.includes('<BLOCK title="Input Context">'), "non-delivered input context appeared in Effective Input");
 assert(!html.includes('title="Assembled Auxiliary Context"'), "planned classes fell back to one combined pane");
 assert(!html.includes('Backend Effective Input Preview'), "diagnostic preview metadata leaked into final input panes");
 assert(!html.includes('Final Payload Parity'), "payload parity diagnostics leaked into final input panes");
+assert(JSON.stringify(currentTrace._inputTransparency.injection.payloadApplicationPlan) === canonicalPayloadPlanBeforeRender, "edit-check rendering mutated the canonical payload plan");
+assert(JSON.stringify(currentTrace._inputTransparency.injection.memoryDeliveryPlan) === canonicalMemoryPlanBeforeRender, "edit-check rendering mutated the backend memory delivery plan");
 
-currentTrace = {_inputTransparency: {injection: {
-  mainInjectionPreview: "",
-  referenceInjectionPreview: "REFERENCE_ONLY"
-}}};
+currentTrace = {_inputTransparency: {
+  backendEffectiveInputPreview:{contract_version:"effective_input_preview.v1",final_user_text:""},
+  injection:{payloadApplicationPlan:{lanes:[
+    {key:"original_work",title:"Original Work Context",text:"REFERENCE_ONLY",applied:true}
+  ],input_context_text:""}}
+}};
 html = renderEffectiveInputSection();
-assert(!html.includes('title="Assembled Auxiliary Context"'), "empty main pane was rendered");
-assert(html.includes('<BLOCK title="Original Work Reference Context">REFERENCE_ONLY</BLOCK>'), "reference-only pane is missing");
+assert(!html.includes('title="Long-term Memory Context"'), "empty main pane was rendered");
+assert(html.includes('<BLOCK title="Original Work Context">REFERENCE_ONLY</BLOCK>'), "reference-only pane is missing");
 `
 	cmd := exec.Command(nodePath, "-")
 	cmd.Stdin = strings.NewReader(script)
@@ -287,7 +417,6 @@ func TestArchiveCenterJSGoPayloadPlanPreservesLanePreviewsForTransparency(t *tes
 		extractJSFunctionBlockForTest(t, src, "function findLastCachePointInsertionIndex("),
 		extractJSFunctionBlockForTest(t, src, "function resolveAuxiliaryInjectionPlacement("),
 		extractJSFunctionBlockForTest(t, src, "function injectAuxiliaryBlock("),
-		extractJSFunctionBlockForTest(t, src, "function injectInputContextBeforeUser("),
 		extractJSFunctionBlockForTest(t, src, "function observeGoPayloadApplication("),
 		extractJSFunctionBlockForTest(t, src, "function applyGoPayloadApplicationPlan("),
 	}, "\n")
@@ -348,7 +477,8 @@ const returnedMessages = extractMessages(applied.payload).messages;
 const auxiliaryMatches = returnedMessages.filter((message) => getPayloadMessageRoleAndText(message).text === exactAuxiliary);
 const inputMatches = returnedMessages.filter((message) => getPayloadMessageRoleAndText(message).text === exactInputContext);
 assert(auxiliaryMatches.length === 1, "Go-owned auxiliary text was not applied exactly once");
-assert(inputMatches.length === 1, "Go-owned input context was not applied exactly once");
+assert(inputMatches.length === 0, "host recent chat was reinjected as an Archive Center system block");
+assert(applied.injectionResult.inputContext.applied === false, "removed input-context lane was reported as applied");
 assert(returnedMessages[returnedMessages.length - 1].content === "continue", "latest user message was not preserved");
 assert(applied.injectionResult.payloadApplicationObservation.payload_application_status === "applied", "returned payload was not observed");
 assert(runtimeUpdates.length === 1 && runtimeUpdates[0].status === "ok", "successful production runtime state was not recorded once");
@@ -517,12 +647,18 @@ func TestArchiveCenterJSProjectConfigGUIRuntimeMarkers(t *testing.T) {
 		`safeSettingsForLog(getSettings())`,
 		`formatBridgeFailureForDisplay("/proxy/plugin-main"`,
 		`narrativeGuideStrength: "weak"`,
-		`const NARRATIVE_GUIDE_STRENGTH_OPTIONS = Object.freeze(["none", "weak", "medium", "strong"])`,
+		`const NARRATIVE_GUIDE_STRENGTH_OPTIONS = Object.freeze(["none", "weak", "medium", "strong", "extreme", "maximum"])`,
+		`publisherGuidanceFormat: "standard"`,
+		`const PUBLISHER_GUIDANCE_FORMAT_OPTIONS = Object.freeze(["compact", "standard", "explicit"])`,
 		`<select id="mo-narrativeGuideStrength"`,
+		`<select id="mo-publisherGuidanceFormat"`,
 		`<option value="none"`,
+		`<option value="extreme"`,
+		`<option value="maximum"`,
 		`guide_strength: settings.narrativeGuideStrength || "weak"`,
-		`Weak proposes response focus`,
-		`Strong adds an arc anchor and preferred frontier`,
+		`publisher_guidance_format: settings.publisherGuidanceFormat || DEFAULT_SETTINGS.publisherGuidanceFormat`,
+		`Higher strength makes current-response priorities and execution order more explicit`,
+		`a quiet scene may remain quiet`,
 		`coreObjectiveMemoryMaxItems: 5`,
 		`core_objective_memory_max_items: sanitizeTopKSetting(`,
 	}
@@ -585,7 +721,7 @@ func TestArchiveCenterJSClaudePromptCacheMarkers(t *testing.T) {
 		`testBody.claude_prompt_cache_mode = testClaudePromptCacheMode`,
 		`extraBodyJson: sanitizeProviderOverrideJsonSetting(`,
 		`if (extraBody) payload.extra_body_json = extraBody;`,
-		`const BUILD_NOTES = "Archive Center 3.9.11"`,
+		`const BUILD_NOTES = "Archive Center 4.0.0"`,
 		`비용: 5분 캐시 쓰기 1.25배, 1시간 쓰기 2배, 캐시 읽기 0.1배`,
 	}
 	for _, needle := range required {
@@ -641,11 +777,15 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 	required := []string{
 		`"settings.section.common.desc": "The previous completed turn is included as continuity context by default. The optional input-improvement LLM is independent from narrative guidance."`,
 		`"settings.label.pluginMainApplyMode": "Input Improvement LLM (Optional)"`,
+		`"settings.applyMode.reviewed_apply": "Rewrite after review"`,
+		`"settings.hint.pluginMainApplyMode": "Rewrite applies the approved improvement to the final user message sent to the main model. The original chat stored in RisuAI is not changed."`,
 		`merged.dbEnabled = true;`,
 		`merged.supervisorEnabled = true;`,
+		`merged.pluginMainRewriteOptIn = merged.pluginMainApplyMode === "reviewed_apply";`,
+		`delete merged.pluginMainRewriteLegacyOptIn;`,
 		`settings.pluginMainApplyMode`,
 		`inputImprovementApplied`,
-		`rewriteAllowed: applyModeName === 'reviewed_apply' && !!settings.pluginMainRewriteLegacyOptIn && payloadRewritten`,
+		`rewriteAllowed: applyModeName === 'reviewed_apply' && !!settings.pluginMainRewriteOptIn && payloadRewritten`,
 		`<select id="mo-pluginMainApplyMode">`,
 	}
 	for _, needle := range required {
@@ -662,11 +802,16 @@ func TestSeq01ContextInjectionToggleRemovedAndSyncedToInputImprovement(t *testin
 		`const syncInputImprovementDependentControls =`,
 		`if (_narrativeGuideOff) return Promise.resolve(null);`,
 		`reasoningSummary: "guide_off"`,
+		`Legacy rewrite (explicit opt-in required)`,
+		`if (!merged.pluginMainRewriteLegacyOptIn && merged.pluginMainApplyMode === "reviewed_apply")`,
 	}
 	for _, needle := range forbidden {
 		if strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js still exposes legacy SEQ-01 manual toggle %q", needle)
 		}
+	}
+	if strings.Count(src, `pluginMainRewriteLegacyOptIn`) != 1 {
+		t.Fatal("deprecated rewrite key must remain only as the persisted-setting cleanup target")
 	}
 }
 
@@ -741,8 +886,8 @@ func TestSeq01SettingsSaveResetAndBridgeConfigMarkers(t *testing.T) {
 		`warnLog("Settings save failed:", err.message);`,
 		`return false;`,
 		`function attachSettingsEvents()`,
-		`$("mo-save-btn").addEventListener("click", async () => {`,
-		`$("mo-reset-btn").addEventListener("click", async () => {`,
+		`$("mo-save-btn")?.addEventListener("click", async () => {`,
+		`$("mo-reset-btn")?.addEventListener("click", async () => {`,
 		`!confirm(t("settings.confirm.resetDefaults"))`,
 		`settings = { ...DEFAULT_SETTINGS };`,
 		`await saveSettings();`,
@@ -797,18 +942,29 @@ func TestSeq02SessionAwareExplorerSyncMarkers(t *testing.T) {
 	required := []string{
 		`activeChatSessionId: null`,
 		`_explorer.activeChatSessionId = resolvedSid`,
+		`function syncSessionScopedInspectionSelection(sessionId)`,
+		`syncSessionScopedInspectionSelection(requestedSessionId)`,
+		`await explorerChangeSession(inspectionSessionId, false)`,
 		`explorer.sync.currentChat`,
 		`explorer.sync.differentSession`,
 		`explorer.sync.gotoLiveBtn`,
 		`explorer.sync.matchTooltip`,
 		`explorer.sync.mismatchTooltip`,
 		`const liveSid = _explorer.activeChatSessionId`,
-		`await explorerChangeSession(_explorer.activeChatSessionId)`,
-		`const el = $("mo-session-id-display")`,
+		`sessionId: _explorer.activeChatSessionId`,
 	}
 	for _, needle := range required {
 		if !strings.Contains(src, needle) {
 			t.Fatalf("Archive Center.js missing SEQ-02 session-aware explorer sync marker %q", needle)
+		}
+	}
+	for _, forbidden := range []string{
+		`function renderExplorerSessionsList()`,
+		`mo-ex-clear-filter`,
+		`await explorerChangeSession(null)`,
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("Archive Center.js retains independent Explorer session selection marker %q", forbidden)
 		}
 	}
 }
@@ -909,7 +1065,7 @@ func TestRuntimeConfigBindsOncePerBackendInstanceBeforeFullPrepare(t *testing.T)
 
 func TestResetDefaultsRequiresConfirmationBeforeMutation(t *testing.T) {
 	src := readArchiveCenterJS(t)
-	start := strings.Index(src, `$("mo-reset-btn").addEventListener("click", async () => {`)
+	start := strings.Index(src, `$("mo-reset-btn")?.addEventListener("click", async () => {`)
 	if start < 0 {
 		t.Fatal("reset handler missing")
 	}
@@ -1147,7 +1303,8 @@ func TestArchiveCenterJSI18nFrameworkMarkers(t *testing.T) {
 		`uiLanguage: $("mo-uiLanguage").value`,
 		`await persistentSet(SETTINGS_KEY, json)`,
 		`settings = sanitizeSettings(parsed)`,
-		`${t('settings.title')}`,
+		`<h2>Archive Center</h2>`,
+		`<span class="mo-hdr-ver">${VERSION}</span>`,
 		`${t('dash.section.turnTrace')}`,
 		"const settingsSubtabsHtml = (activeTab) => {",
 		`t('explorer.chatLogs.loading')`,
@@ -1197,9 +1354,13 @@ func TestArchiveCenterJSI18nRuntimeSwitchAndPersistenceMarkers(t *testing.T) {
 }
 
 func TestArchiveCenterJSI18nRuntimeSwitchAndPersistenceBehavior(t *testing.T) {
-	nodePath, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is required for JS runtime behavior smoke")
+	nodePath := strings.TrimSpace(os.Getenv("ARCHIVE_CENTER_NODE_BINARY"))
+	if nodePath == "" {
+		var err error
+		nodePath, err = exec.LookPath("node")
+		if err != nil {
+			t.Skip("ARCHIVE_CENTER_NODE_BINARY or node on PATH is required for JS runtime behavior smoke")
+		}
 	}
 	src := readArchiveCenterJS(t)
 	i18nStart := strings.Index(src, "const _i18n = {")
@@ -1244,10 +1405,12 @@ async function closeSettingsPanel() { closeCount++; }
 async function renderSettingsPanel() { renderCount++; }
 
 (async () => {
-  assert(t("settings.title", "ko").includes("설정"), "ko settings title missing");
-  assert(t("settings.title", "en").includes("Settings"), "en settings title missing");
-  assert(t("settings.title", "en").includes(VERSION), "settings title is not synchronized with VERSION");
-  assert(t("settings.title", "ja").includes("設定"), "ja settings title missing");
+  assert(t("settings.title", "ko") === "Archive Center " + VERSION, "ko product title is not synchronized with VERSION");
+  assert(t("settings.title", "en") === "Archive Center " + VERSION, "en product title is not synchronized with VERSION");
+  assert(t("settings.title", "ja") === "Archive Center " + VERSION, "ja product title is not synchronized with VERSION");
+  assert(t("settings.tab.settings", "ko").includes("설정"), "ko Settings navigation label missing");
+  assert(t("settings.tab.settings", "en").includes("Settings"), "en Settings navigation label missing");
+  assert(t("settings.tab.settings", "ja").includes("設定"), "ja Settings navigation label missing");
   assert(t("missing.seq05.key", "ja") === "missing.seq05.key", "missing key fallback regressed");
   await applyUiLanguageChange("ja");
   assert(settings.uiLanguage === "ja", "language not persisted to settings");
@@ -1485,11 +1648,84 @@ func extractJSFunctionBlockForTest(t *testing.T, src, signature string) string {
 	if start < 0 {
 		t.Fatalf("Archive Center.js missing JS function signature %q", signature)
 	}
-	brace := strings.Index(src[start:], "{")
-	if brace < 0 {
+	parameterStart := strings.Index(src[start:], "(")
+	if parameterStart < 0 {
+		t.Fatalf("Archive Center.js function %q has no parameter list", signature)
+	}
+	parameterStart += start
+	parameterDepth := 0
+	parameterEnd := -1
+	var parameterQuote byte
+	parameterEscaped := false
+	parameterLineComment := false
+	parameterBlockComment := false
+	for i := parameterStart; i < len(src); i++ {
+		c := src[i]
+		var next byte
+		if i+1 < len(src) {
+			next = src[i+1]
+		}
+		if parameterLineComment {
+			if c == '\n' || c == '\r' {
+				parameterLineComment = false
+			}
+			continue
+		}
+		if parameterBlockComment {
+			if c == '*' && next == '/' {
+				parameterBlockComment = false
+				i++
+			}
+			continue
+		}
+		if parameterQuote != 0 {
+			if parameterEscaped {
+				parameterEscaped = false
+				continue
+			}
+			if c == '\\' {
+				parameterEscaped = true
+				continue
+			}
+			if c == parameterQuote {
+				parameterQuote = 0
+			}
+			continue
+		}
+		if c == '/' && next == '/' {
+			parameterLineComment = true
+			i++
+			continue
+		}
+		if c == '/' && next == '*' {
+			parameterBlockComment = true
+			i++
+			continue
+		}
+		if c == '\'' || c == '"' || c == '`' {
+			parameterQuote = c
+			continue
+		}
+		if c == '(' {
+			parameterDepth++
+			continue
+		}
+		if c == ')' {
+			parameterDepth--
+			if parameterDepth == 0 {
+				parameterEnd = i
+				break
+			}
+		}
+	}
+	if parameterEnd < 0 {
+		t.Fatalf("Archive Center.js function %q has no closing parameter parenthesis", signature)
+	}
+	braceOffset := strings.Index(src[parameterEnd+1:], "{")
+	if braceOffset < 0 {
 		t.Fatalf("Archive Center.js function %q has no opening brace", signature)
 	}
-	brace += start
+	brace := parameterEnd + 1 + braceOffset
 
 	depth := 0
 	var quote byte
@@ -1556,4 +1792,19 @@ func extractJSFunctionBlockForTest(t *testing.T, src, signature string) string {
 	}
 	t.Fatalf("Archive Center.js function %q did not close", signature)
 	return ""
+}
+
+func TestExtractJSFunctionBlockForTestSkipsDefaultObjectParameters(t *testing.T) {
+	src := `async function sample(value, options = {}) {
+  const body = { ok: true };
+  return body;
+}
+function next() { return "outside"; }`
+	block := extractJSFunctionBlockForTest(t, src, "async function sample(")
+	if !strings.Contains(block, "return body;") || !strings.Contains(block, "options = {}") {
+		t.Fatalf("function extractor omitted the production body after a default object parameter:\n%s", block)
+	}
+	if strings.Contains(block, `return "outside"`) {
+		t.Fatalf("function extractor crossed into the next function:\n%s", block)
+	}
 }
