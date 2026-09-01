@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -47,6 +49,18 @@ func (e *proxyEmptyContentError) Error() string {
 	return provider + " returned no text content"
 }
 
+type proxyFinalOutputExhaustedError struct {
+	Provider string
+}
+
+func (e *proxyFinalOutputExhaustedError) Error() string {
+	provider := strings.TrimSpace(e.Provider)
+	if provider == "" {
+		provider = "provider"
+	}
+	return provider + " exhausted its output token budget before returning final text"
+}
+
 type proxyLocalRequestError struct {
 	Stage string
 	Cause error
@@ -68,10 +82,10 @@ func callProxyProvider(ctx context.Context, req dto.ProxyPluginMainRequest) (map
 }
 
 func callProxyProviderWithPolicy(ctx context.Context, req dto.ProxyPluginMainRequest, policy proxyRequestPolicy, retryBudget *llmRetryBudget) (map[string]any, int, error) {
-	endpoint := strings.TrimSpace(stringPtrValue(req.Endpoint, ""))
 	apiKey := strings.TrimSpace(stringPtrValue(req.APIKey, ""))
 	model := strings.TrimSpace(stringPtrValue(req.Model, ""))
 	provider := strings.ToLower(strings.TrimSpace(stringPtrValue(req.Provider, "")))
+	endpoint := proxyProviderBaseURL(provider, stringPtrValue(req.Endpoint, ""))
 	if provider == "" || endpoint == "" || model == "" || (apiKey == "" && provider != "ollama") {
 		return nil, http.StatusBadRequest, &proxyLocalRequestError{
 			Stage: "configuration",
@@ -105,7 +119,7 @@ func callProxyProviderWithPolicy(ctx context.Context, req dto.ProxyPluginMainReq
 		return proxyCallGemini(ctx, req, endpoint, apiKey, model, false, policy)
 	case "vertex":
 		return proxyCallGemini(ctx, req, endpoint, apiKey, model, true, policy)
-	case "openai", "openrouter", "llmgateway", "vercel", "copilot", "ollama", "custom":
+	case "openai", "openrouter", "llmgateway", "vercel", "neuralwatt", "copilot", "ollama", "custom":
 		return proxyCallOpenAILike(ctx, req, endpoint, apiKey, model, provider, policy, retryBudget)
 	default:
 		return nil, http.StatusBadRequest, &proxyLocalRequestError{
@@ -116,8 +130,11 @@ func callProxyProviderWithPolicy(ctx context.Context, req dto.ProxyPluginMainReq
 }
 
 func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, endpoint, apiKey, model, provider string, policy proxyRequestPolicy, retryBudget *llmRetryBudget) (map[string]any, int, error) {
+	if proxyEndpointUsesResponses(endpoint) {
+		return proxyCallOpenAIResponses(ctx, req, endpoint, apiKey, model, provider, policy)
+	}
 	isGLM := provider != "ollama" && proxyIsGLMLike(model, endpoint, provider)
-	target := proxyOpenAIChatEndpoint(proxyOpenAIBaseURL(provider, endpoint), provider, isGLM)
+	target := proxyOpenAIChatEndpoint(proxyProviderBaseURL(provider, endpoint), provider, isGLM)
 	reasoningTransport, transportErr := proxyReasoningTransport(provider, endpoint)
 	if transportErr != nil {
 		return nil, http.StatusBadRequest, &proxyLocalRequestError{Stage: "configuration", Cause: transportErr}
@@ -172,8 +189,8 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 				body["max_tokens"] = outputTokens + reasoningBudget
 			}
 		}
-	} else if reasoningTransport == "llmgateway" {
-		if effort := proxyGatewayReasoningEffort(reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
+	} else if reasoningTransport == "llmgateway" || reasoningTransport == "neuralwatt" || (reasoningTransport == "custom" && reasoningFamily == "deepseek_v4") {
+		if effort := proxyGatewayReasoningEffort(reasoningTransport, reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
 			body["reasoning_effort"] = effort
 			body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
 			if reasoningFamily == "gpt" {
@@ -181,7 +198,7 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 			}
 		}
 	} else if reasoningTransport == "openrouter" || reasoningTransport == "vercel" {
-		if effort := proxyGatewayReasoningEffort(reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
+		if effort := proxyGatewayReasoningEffort(reasoningTransport, reasoningFamily, model, stringPtrValue(req.ReasoningEffort, ""), stringPtrValue(req.GlmThinkingType, "")); effort != "" {
 			body["reasoning"] = map[string]any{"effort": effort}
 			body["max_tokens"] = maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens))
 			if reasoningFamily == "gpt" {
@@ -209,9 +226,9 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 		effort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, "")))
 		normalizedEffort := "none"
 		switch effort {
-		case "high", "max":
+		case "low", "high", "max":
 			normalizedEffort = effort
-		case "low", "medium":
+		case "medium":
 			normalizedEffort = "high"
 		case "xhigh":
 			normalizedEffort = "max"
@@ -257,6 +274,16 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 			Cause: policyErr,
 		}
 	}
+	neuralWattFlex := provider == "neuralwatt" && strings.EqualFold(strings.TrimSpace(extractionStringFromAny(body["service_tier"])), "flex")
+	if neuralWattFlex {
+		body["stream"] = true
+		streamOptions := mapFromAny(body["stream_options"])
+		streamOptions["include_usage"] = true
+		body["stream_options"] = streamOptions
+		headers["Accept"] = "text/event-stream"
+		overrideTrace["neuralwatt_streaming_applied"] = true
+		overrideTrace["neuralwatt_usage_stream_requested"] = true
+	}
 	if provider == "copilot" {
 		token, status, err := proxyGetCopilotToken(ctx, apiKey)
 		if err != nil {
@@ -265,7 +292,15 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 		headers["Authorization"] = "Bearer " + token
 	}
 
-	status, data, raw, err := proxyDoJSON(ctx, target, headers, body)
+	var status int
+	var data map[string]any
+	var raw string
+	var err error
+	if neuralWattFlex {
+		status, data, raw, err = proxyDoNeuralWattFlex(ctx, target, headers, body)
+	} else {
+		status, data, raw, err = proxyDoJSON(ctx, target, headers, body)
+	}
 	if err != nil {
 		return nil, http.StatusBadGateway, err
 	}
@@ -274,6 +309,7 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 	_, hasThinking := body["thinking"]
 	managedReasoningRequest := hasReasoningEffort || hasReasoningObject || hasThinking
 	if status == http.StatusBadRequest &&
+		!neuralWattFlex &&
 		!managedReasoningRequest &&
 		proxyHasAdvancedParams(body) &&
 		proxyUnsupportedParameter(raw, data) &&
@@ -290,7 +326,7 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 		}
 	}
 	if status < 200 || status >= 300 {
-		return nil, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
+		return data, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
 	}
 	if data == nil {
 		return nil, http.StatusBadGateway, fmt.Errorf("OpenAI-like provider returned invalid JSON")
@@ -299,17 +335,211 @@ func proxyCallOpenAILike(ctx context.Context, req dto.ProxyPluginMainRequest, en
 	if choices := sliceFromAny(data["choices"]); len(choices) > 0 {
 		choice = mapFromAny(choices[0])
 	}
-	data[proxyResponseMetadataKey] = buildProxyResponseMetadata(
+	responseMeta := buildProxyResponseMetadata(
 		"openai_compatible",
 		strings.TrimSpace(extractionStringFromAny(choice["finish_reason"])),
 		mapFromAny(data["usage"]),
 	)
+	responseMeta["reasoning_observed"] = proxyChatReasoningObserved(data)
+	data[proxyResponseMetadataKey] = responseMeta
 	if policy.Purpose != "publisher" && strings.TrimSpace(chatCompletionText(data)) == "" {
+		if stringFromMap(responseMeta, "termination_kind") == "length" {
+			return data, http.StatusOK, &proxyFinalOutputExhaustedError{Provider: provider}
+		}
 		return data, http.StatusBadGateway, &proxyEmptyContentError{Provider: provider}
 	}
 	proxyAttachLLMGatewayServiceTierTrace(data, overrideTrace)
 	proxyAttachRequestOverrideTrace(data, overrideTrace)
 	return data, http.StatusOK, nil
+}
+
+func proxyEndpointUsesResponses(endpoint string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed == nil {
+		return false
+	}
+	path := strings.ToLower(strings.TrimRight(strings.TrimSpace(parsed.Path), "/"))
+	return strings.HasSuffix(path, "/responses")
+}
+
+func proxyCallOpenAIResponses(ctx context.Context, req dto.ProxyPluginMainRequest, endpoint, apiKey, model, provider string, policy proxyRequestPolicy) (map[string]any, int, error) {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed == nil {
+		return nil, http.StatusBadRequest, &proxyLocalRequestError{Stage: "configuration", Cause: fmt.Errorf("invalid Responses endpoint")}
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	target := parsed.String()
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "application/json",
+	}
+	if apiKey != "" && provider != "copilot" {
+		headers["Authorization"] = "Bearer " + apiKey
+	}
+	if provider == "openrouter" {
+		headers["HTTP-Referer"] = "https://risuai.xyz"
+		headers["X-Title"] = "Archive Center"
+	} else if provider == "copilot" {
+		headers["Editor-Version"] = "vscode/" + copilotCodeVersion
+		headers["Editor-version"] = "vscode/" + copilotCodeVersion
+		headers["Editor-Plugin-Version"] = "copilot-chat/" + copilotChatVersion
+		headers["Editor-plugin-version"] = "copilot-chat/" + copilotChatVersion
+		headers["Copilot-Integration-Id"] = "vscode-chat"
+		headers["User-Agent"] = "GitHubCopilotChat/" + copilotChatVersion
+		headers["X-Github-Api-Version"] = "2025-10-01"
+		headers["X-Initiator"] = "user"
+	}
+
+	requestedTokens := maxInt64(1, int64Value(req.MaxTokens, 1024))
+	configuredMax := maxInt64(0, int64Value(req.MaxCompletionTokens, 0))
+	body := map[string]any{
+		"model":             model,
+		"input":             req.Messages,
+		"max_output_tokens": maxInt64(requestedTokens, firstPositiveInt64(configuredMax, requestedTokens)),
+		"stream":            false,
+	}
+	if req.Temperature != nil {
+		body["temperature"] = *req.Temperature
+	}
+	reasoningEffort := strings.ToLower(strings.TrimSpace(stringPtrValue(req.ReasoningEffort, "")))
+	switch reasoningEffort {
+	case "none", "minimal", "low", "medium", "high", "xhigh":
+		body["reasoning"] = map[string]any{"effort": reasoningEffort}
+	}
+	managedReasoning, _ := json.Marshal(body["reasoning"])
+	overrideTrace, overrideErr := proxyApplyRequestOverrides(headers, body, req, provider, false)
+	if overrideErr != nil {
+		return nil, http.StatusBadRequest, &proxyLocalRequestError{Stage: "request_build", Cause: overrideErr}
+	}
+	if len(managedReasoning) > 0 {
+		actual, _ := json.Marshal(body["reasoning"])
+		if !bytes.Equal(actual, managedReasoning) {
+			return nil, http.StatusBadRequest, &proxyLocalRequestError{
+				Stage: "request_build",
+				Cause: fmt.Errorf("extra_body_json conflicts with backend-managed reasoning"),
+			}
+		}
+	}
+	if policy.JSONResponse {
+		overrideTrace["json_response_requested"] = true
+		overrideTrace["json_response_purpose"] = strings.TrimSpace(policy.Purpose)
+		overrideTrace["json_response_applied"] = false
+		overrideTrace["json_response_skip_reason"] = "responses_endpoint_uses_prompt_contract"
+	}
+	if provider == "copilot" {
+		token, status, tokenErr := proxyGetCopilotToken(ctx, apiKey)
+		if tokenErr != nil {
+			return nil, status, tokenErr
+		}
+		headers["Authorization"] = "Bearer " + token
+	}
+
+	status, data, raw, callErr := proxyDoJSON(ctx, target, headers, body)
+	if callErr != nil {
+		return nil, http.StatusBadGateway, callErr
+	}
+	if status < 200 || status >= 300 {
+		return data, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
+	}
+	if data == nil {
+		return nil, http.StatusBadGateway, fmt.Errorf("Responses provider returned invalid JSON")
+	}
+
+	content := proxyExtractResponsesText(data)
+	finishReason := proxyResponsesFinishReason(data)
+	responseModel := extractionFirstNonEmpty(extractionStringFromAny(data["model"]), model)
+	resp := proxyNormalizeChatResponse(content, responseModel, finishReason)
+	usage := mapFromAny(data["usage"])
+	if len(usage) > 0 {
+		resp["usage"] = usage
+	}
+	responseMeta := buildProxyResponseMetadata("openai_responses", finishReason, usage)
+	responseMeta["response_status"] = strings.TrimSpace(extractionStringFromAny(data["status"]))
+	responseMeta["reasoning_observed"] = proxyResponsesReasoningObserved(data)
+	resp[proxyResponseMetadataKey] = responseMeta
+	proxyAttachRequestOverrideTrace(resp, overrideTrace)
+	if policy.Purpose != "publisher" && strings.TrimSpace(content) == "" {
+		if stringFromMap(responseMeta, "termination_kind") == "length" {
+			return resp, http.StatusOK, &proxyFinalOutputExhaustedError{Provider: provider}
+		}
+		return resp, http.StatusBadGateway, &proxyEmptyContentError{Provider: provider}
+	}
+	return resp, http.StatusOK, nil
+}
+
+func proxyExtractResponsesText(data map[string]any) string {
+	var builder strings.Builder
+	for _, rawItem := range sliceFromAny(data["output"]) {
+		item := mapFromAny(rawItem)
+		if !strings.EqualFold(strings.TrimSpace(extractionStringFromAny(item["type"])), "message") {
+			continue
+		}
+		for _, rawPart := range sliceFromAny(item["content"]) {
+			part := mapFromAny(rawPart)
+			partType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(part["type"])))
+			if partType != "output_text" && partType != "text" {
+				continue
+			}
+			builder.WriteString(extractionStringFromAny(part["text"]))
+		}
+	}
+	if builder.Len() > 0 {
+		return builder.String()
+	}
+	return extractionStringFromAny(data["output_text"])
+}
+
+func proxyResponsesFinishReason(data map[string]any) string {
+	if reason := strings.TrimSpace(extractionStringFromAny(mapFromAny(data["incomplete_details"])["reason"])); reason != "" {
+		return reason
+	}
+	return strings.TrimSpace(extractionStringFromAny(data["status"]))
+}
+
+func proxyChatReasoningObserved(data map[string]any) bool {
+	usage := mapFromAny(data["usage"])
+	if intFromAny(mapFromAny(usage["completion_tokens_details"])["reasoning_tokens"], 0) > 0 ||
+		intFromAny(mapFromAny(usage["output_tokens_details"])["reasoning_tokens"], 0) > 0 {
+		return true
+	}
+	choices := sliceFromAny(data["choices"])
+	if len(choices) == 0 {
+		return false
+	}
+	choice := mapFromAny(choices[0])
+	message := mapFromAny(choice["message"])
+	for _, value := range []any{choice["reasoning"], choice["reasoning_content"], message["reasoning"], message["reasoning_content"]} {
+		if strings.TrimSpace(extractionStringFromAny(value)) != "" || len(sliceFromAny(value)) > 0 || len(mapFromAny(value)) > 0 {
+			return true
+		}
+	}
+	for _, rawPart := range sliceFromAny(message["content"]) {
+		partType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(mapFromAny(rawPart)["type"])))
+		if strings.Contains(partType, "reasoning") || strings.Contains(partType, "thinking") {
+			return true
+		}
+	}
+	return false
+}
+
+func proxyResponsesReasoningObserved(data map[string]any) bool {
+	if intFromAny(mapFromAny(mapFromAny(data["usage"])["output_tokens_details"])["reasoning_tokens"], 0) > 0 {
+		return true
+	}
+	for _, rawItem := range sliceFromAny(data["output"]) {
+		item := mapFromAny(rawItem)
+		itemType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(item["type"])))
+		if itemType == "reasoning" {
+			return true
+		}
+		for _, rawPart := range sliceFromAny(item["content"]) {
+			partType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(mapFromAny(rawPart)["type"])))
+			if strings.Contains(partType, "reasoning") || partType == "summary_text" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func proxyReasoningTransport(provider, endpoint string) (string, error) {
@@ -324,6 +554,8 @@ func proxyReasoningTransport(provider, endpoint string) (string, error) {
 			knownEndpoint = "openrouter"
 		case "api.llmgateway.io":
 			knownEndpoint = "llmgateway"
+		case "api.neuralwatt.com":
+			knownEndpoint = "neuralwatt"
 		case "ai-gateway.vercel.sh":
 			knownEndpoint = "vercel"
 		case "api.deepseek.com":
@@ -413,15 +645,19 @@ func proxyCallClaude(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 		return nil, http.StatusBadGateway, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
+		return data, status, fmt.Errorf("%s", scrubProxySecret(proxyErrorDetail(status, data, raw), apiKey))
 	}
 	content := proxyExtractClaudeText(data)
 	finishReason := strings.TrimSpace(extractionStringFromAny(data["stop_reason"]))
 	resp := proxyNormalizeChatResponse(content, model, finishReason)
 	proxyAttachClaudeUsage(resp, data, overrideTrace)
-	resp[proxyResponseMetadataKey] = buildProxyResponseMetadata("anthropic_messages", finishReason, mapFromAny(data["usage"]))
+	responseMeta := buildProxyResponseMetadata("anthropic_messages", finishReason, mapFromAny(data["usage"]))
+	resp[proxyResponseMetadataKey] = responseMeta
 	proxyAttachRequestOverrideTrace(resp, overrideTrace)
 	if content == "" && policy.Purpose != "publisher" {
+		if stringFromMap(responseMeta, "termination_kind") == "length" {
+			return resp, status, &proxyFinalOutputExhaustedError{Provider: "claude"}
+		}
 		return resp, status, &proxyEmptyContentError{Provider: "claude"}
 	}
 	return resp, http.StatusOK, nil
@@ -501,7 +737,7 @@ func proxyCallGemini(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 		if vertex {
 			detail = proxyVertexEndpointErrorDetail(status, target, data, raw)
 		}
-		return nil, status, fmt.Errorf("%s", scrubProxySecret(detail, apiKey))
+		return data, status, fmt.Errorf("%s", scrubProxySecret(detail, apiKey))
 	}
 	content := proxyExtractGeminiText(data)
 	candidate := map[string]any{}
@@ -511,9 +747,13 @@ func proxyCallGemini(ctx context.Context, req dto.ProxyPluginMainRequest, endpoi
 	finishReason := strings.TrimSpace(extractionStringFromAny(candidate["finishReason"]))
 	resp := proxyNormalizeChatResponse(content, model, finishReason)
 	proxyAttachGeminiUsage(resp, data, overrideTrace)
-	resp[proxyResponseMetadataKey] = buildProxyResponseMetadata("google_generate_content", finishReason, mapFromAny(data["usageMetadata"]))
+	responseMeta := buildProxyResponseMetadata("google_generate_content", finishReason, mapFromAny(data["usageMetadata"]))
+	resp[proxyResponseMetadataKey] = responseMeta
 	proxyAttachRequestOverrideTrace(resp, overrideTrace)
 	if content == "" && policy.Purpose != "publisher" {
+		if stringFromMap(responseMeta, "termination_kind") == "length" {
+			return resp, status, &proxyFinalOutputExhaustedError{Provider: geminiProvider}
+		}
 		return resp, status, &proxyEmptyContentError{Provider: geminiProvider}
 	}
 	return resp, http.StatusOK, nil
@@ -578,6 +818,13 @@ func proxyApplyJSONResponsePolicy(body map[string]any, trace map[string]any, pol
 		generationConfig["responseJsonSchema"] = proxyPublisherTopLevelJSONSchema()
 		trace["json_response_schema_source"] = "backend_policy"
 	} else {
+		if !proxyPublisherSchemaMatches(generationConfig["responseJsonSchema"]) {
+			trace["json_response_applied"] = false
+			trace["json_response_schema_source"] = "extra_body_json"
+			trace["json_response_conflict"] = true
+			trace["json_response_conflict_reason"] = "generationConfig.responseJsonSchema must match publisher_output.v3"
+			return fmt.Errorf("json_response_schema_conflict: generationConfig.responseJsonSchema must match publisher_output.v3")
+		}
 		trace["json_response_schema_source"] = "extra_body_json"
 	}
 	trace["json_response_schema_contract"] = publisherWireContractVersion
@@ -598,16 +845,18 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 
 	providerSupportsNativeJSON := proxyProviderSupportsAutomaticOpenAIJSONResponse(provider)
 	providerSupportsPublisherJSONObject := proxyJSONResponsePurposeIsPublisher(policy)
+	providerUsesStrictPublisherSchema := providerSupportsPublisherJSONObject && proxyProviderUsesStrictPublisherSchemaByDefault(provider)
 
 	const requiredType = "json_object"
 	existing, exists := body["response_format"]
 	if !exists {
-		if providerSupportsPublisherJSONObject && !providerSupportsNativeJSON {
+		if providerSupportsPublisherJSONObject && !providerUsesStrictPublisherSchema {
 			body["response_format"] = map[string]any{"type": requiredType}
 			trace["json_response_applied"] = true
 			trace["json_response_source"] = "backend_policy"
 			trace["json_response_format"] = requiredType
 			trace["json_response_schema_contract"] = publisherWireContractVersion + "_prompt_validated"
+			trace["json_response_schema_source"] = "system_prompt"
 			return nil
 		}
 		if !providerSupportsNativeJSON {
@@ -617,7 +866,7 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 			return nil
 		}
 		appliedType := requiredType
-		if proxyJSONResponsePurposeIsPublisher(policy) || strings.EqualFold(strings.TrimSpace(provider), "vercel") {
+		if providerUsesStrictPublisherSchema || strings.EqualFold(strings.TrimSpace(provider), "vercel") {
 			appliedType = "json_schema"
 			schemaName, schema := proxyJSONResponseSchema(policy)
 			jsonSchema := map[string]any{
@@ -639,6 +888,7 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_format"] = appliedType
 		if proxyJSONResponsePurposeIsPublisher(policy) {
 			trace["json_response_schema_contract"] = publisherWireContractVersion
+			trace["json_response_schema_source"] = "backend_policy"
 		}
 		return nil
 	}
@@ -656,6 +906,29 @@ func proxyApplyOpenAIJSONResponsePolicy(body map[string]any, trace map[string]an
 	formatType = strings.ToLower(strings.TrimSpace(formatType))
 	vercelLegacyJSON := strings.EqualFold(strings.TrimSpace(provider), "vercel") && formatType == "json"
 	if isString && (formatType == requiredType || formatType == "json_schema" || vercelLegacyJSON) {
+		if providerUsesStrictPublisherSchema && formatType == requiredType {
+			trace["json_response_applied"] = false
+			trace["json_response_source"] = "extra_body_json"
+			trace["json_response_conflict"] = true
+			trace["json_response_conflict_reason"] = "publisher response_format.type=json_object would replace the required publisher_output.v3 schema"
+			return fmt.Errorf("json_response_schema_conflict: publisher response_format.type=json_object would replace the required publisher_output.v3 schema")
+		}
+		if proxyJSONResponsePurposeIsPublisher(policy) && formatType == "json_schema" {
+			jsonSchema := mapFromAny(format["json_schema"])
+			if len(jsonSchema) == 0 || !proxyPublisherSchemaMatches(jsonSchema["schema"]) {
+				trace["json_response_applied"] = false
+				trace["json_response_source"] = "extra_body_json"
+				trace["json_response_conflict"] = true
+				trace["json_response_conflict_reason"] = "response_format.json_schema.schema must match publisher_output.v3"
+				return fmt.Errorf("json_response_schema_conflict: response_format.json_schema.schema must match publisher_output.v3")
+			}
+			trace["json_response_schema_contract"] = publisherWireContractVersion
+			trace["json_response_schema_source"] = "extra_body_json"
+		}
+		if proxyJSONResponsePurposeIsPublisher(policy) && formatType == requiredType && !providerUsesStrictPublisherSchema {
+			trace["json_response_schema_contract"] = publisherWireContractVersion + "_prompt_validated"
+			trace["json_response_schema_source"] = "system_prompt"
+		}
 		trace["json_response_applied"] = true
 		trace["json_response_source"] = "extra_body_json"
 		trace["json_response_format"] = formatType
@@ -687,6 +960,15 @@ func proxyProviderSupportsAutomaticOpenAIJSONResponse(provider string) bool {
 	}
 }
 
+// Aggregating gateways expose JSON-schema capability per model/provider
+// mapping, not for every model behind the gateway. Publisher defaults therefore
+// use the portable json_object contract on those routes. A caller may still
+// supply the exact publisher_output.v3 json_schema explicitly when that exact
+// mapping is known to support it.
+func proxyProviderUsesStrictPublisherSchemaByDefault(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "openai")
+}
+
 func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]any, policy proxyRequestPolicy) error {
 	if !policy.JSONResponse {
 		return nil
@@ -712,6 +994,7 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_format"] = "json_schema"
 		if proxyJSONResponsePurposeIsPublisher(policy) {
 			trace["json_response_schema_contract"] = publisherWireContractVersion
+			trace["json_response_schema_source"] = "backend_policy"
 		}
 		return nil
 	}
@@ -732,6 +1015,7 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_format"] = "json_schema"
 		if proxyJSONResponsePurposeIsPublisher(policy) {
 			trace["json_response_schema_contract"] = publisherWireContractVersion
+			trace["json_response_schema_source"] = "backend_policy"
 		}
 		return nil
 	}
@@ -744,7 +1028,7 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 		return fmt.Errorf("json_response_format_conflict: output_config.format must be a JSON object")
 	}
 	formatType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(format["type"])))
-	_, schemaOK := format["schema"].(map[string]any)
+	schema, schemaOK := format["schema"].(map[string]any)
 	if formatType != "json_schema" || !schemaOK {
 		trace["json_response_applied"] = false
 		trace["json_response_source"] = "extra_body_json"
@@ -752,11 +1036,20 @@ func proxyApplyClaudeJSONResponsePolicy(body map[string]any, trace map[string]an
 		trace["json_response_conflict_reason"] = "output_config.format requires type json_schema and object schema"
 		return fmt.Errorf("json_response_format_conflict: output_config.format requires type json_schema and object schema")
 	}
+	if proxyJSONResponsePurposeIsPublisher(policy) && !proxyPublisherSchemaMatches(schema) {
+		trace["json_response_applied"] = false
+		trace["json_response_source"] = "extra_body_json"
+		trace["json_response_schema_source"] = "extra_body_json"
+		trace["json_response_conflict"] = true
+		trace["json_response_conflict_reason"] = "output_config.format.schema must match publisher_output.v3"
+		return fmt.Errorf("json_response_schema_conflict: output_config.format.schema must match publisher_output.v3")
+	}
 	trace["json_response_applied"] = true
 	trace["json_response_source"] = "extra_body_json"
 	trace["json_response_format"] = "json_schema"
 	if proxyJSONResponsePurposeIsPublisher(policy) {
 		trace["json_response_schema_contract"] = publisherWireContractVersion
+		trace["json_response_schema_source"] = "extra_body_json"
 	}
 	return nil
 }
@@ -773,30 +1066,52 @@ func proxyJSONResponseSchema(policy proxyRequestPolicy) (string, map[string]any)
 }
 
 func proxyPublisherTopLevelJSONSchema() map[string]any {
-	item := map[string]any{
+	commonProperties := func(fieldValues []string) map[string]any {
+		return map[string]any{
+			"role":  map[string]any{"type": "string", "enum": []string{"book_author", "director"}},
+			"field": map[string]any{"type": "string", "enum": fieldValues},
+			"text":  map[string]any{"type": "string", "minLength": 1},
+			"source_refs": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+			},
+		}
+	}
+	standardItem := map[string]any{
 		"type": "object",
-		"properties": map[string]any{
-			"role": map[string]any{"type": "string", "enum": []string{"book_author", "director"}},
-			"field": map[string]any{"type": "string", "enum": []string{
-				"current_arc", "narrative_goal", "next_beats", "guardrails",
-				"scene_mandate", "required_outcomes", "forbidden_moves", "pressure_level",
-			}},
-			"text":        map[string]any{"type": "string", "minLength": 1},
-			"source_refs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1},
-			"level":       map[string]any{"type": "string", "enum": []string{"quiet", "low", "medium", "high"}},
-		},
+		"properties": commonProperties([]string{
+			"current_arc", "narrative_goal", "next_beats", "guardrails",
+			"scene_mandate", "required_outcomes", "forbidden_moves",
+		}),
 		"required":             []string{"role", "field", "text", "source_refs"},
+		"additionalProperties": false,
+	}
+	pressureProperties := commonProperties([]string{"pressure_level"})
+	pressureProperties["role"] = map[string]any{"type": "string", "enum": []string{"director"}}
+	pressureProperties["level"] = map[string]any{"type": "string", "enum": []string{"quiet", "low", "medium", "high"}}
+	pressureItem := map[string]any{
+		"type":                 "object",
+		"properties":           pressureProperties,
+		"required":             []string{"role", "field", "text", "source_refs", "level"},
 		"additionalProperties": false,
 	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"contract_version": map[string]any{"type": "string", "enum": []string{publisherWireContractVersion}},
-			"items":            map[string]any{"type": "array", "items": item},
+			"items": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"anyOf": []any{standardItem, pressureItem}},
+			},
 		},
 		"required":             []string{"contract_version", "items"},
 		"additionalProperties": false,
 	}
+}
+
+func proxyPublisherSchemaMatches(candidate any) bool {
+	actual, actualErr := json.Marshal(candidate)
+	expected, expectedErr := json.Marshal(proxyPublisherTopLevelJSONSchema())
+	return actualErr == nil && expectedErr == nil && bytes.Equal(actual, expected)
 }
 
 func proxyCriticTopLevelJSONSchema() map[string]any {
@@ -952,7 +1267,182 @@ func proxyDoJSON(ctx context.Context, target string, headers map[string]string, 
 	if err := json.Unmarshal(rawBytes, &data); err != nil {
 		data = nil
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data = proxyAttachHTTPFailureMetadata(data, resp.StatusCode, resp.Header, time.Now().UTC())
+	}
 	return resp.StatusCode, data, raw, nil
+}
+
+func proxyDoNeuralWattFlex(ctx context.Context, target string, headers map[string]string, body map[string]any) (int, map[string]any, string, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return http.StatusBadRequest, nil, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+	if err != nil {
+		return http.StatusBadRequest, nil, "", err
+	}
+	for key, value := range headers {
+		if strings.TrimSpace(value) != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	resp, err := proxyHTTPClient.Do(req)
+	if err != nil {
+		return http.StatusBadGateway, nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rawBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if readErr != nil {
+			return http.StatusBadGateway, nil, "", readErr
+		}
+		raw := string(rawBytes)
+		var data map[string]any
+		if json.Unmarshal(rawBytes, &data) != nil {
+			data = nil
+		}
+		data = proxyAttachHTTPFailureMetadata(data, resp.StatusCode, resp.Header, time.Now().UTC())
+		return resp.StatusCode, data, raw, nil
+	}
+
+	var id, object, model, serviceTier, finishReason string
+	var created any
+	var content, reasoning strings.Builder
+	var usage map[string]any
+	var energy, cost any
+	done := false
+	seenChunk := false
+	eventData := make([]string, 0, 1)
+	applyEvent := func() error {
+		if len(eventData) == 0 {
+			return nil
+		}
+		rawEvent := strings.Join(eventData, "\n")
+		eventData = eventData[:0]
+		if strings.TrimSpace(rawEvent) == "[DONE]" {
+			done = true
+			return nil
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(rawEvent), &chunk); err != nil {
+			return fmt.Errorf("NeuralWatt Flex stream returned invalid JSON chunk: %w", err)
+		}
+		seenChunk = true
+		if value := strings.TrimSpace(extractionStringFromAny(chunk["id"])); value != "" {
+			id = value
+		}
+		if value := strings.TrimSpace(extractionStringFromAny(chunk["object"])); value != "" {
+			object = value
+		}
+		if value := strings.TrimSpace(extractionStringFromAny(chunk["model"])); value != "" {
+			model = value
+		}
+		if value := strings.TrimSpace(extractionStringFromAny(chunk["service_tier"])); value != "" {
+			serviceTier = value
+		}
+		if value, ok := chunk["created"]; ok {
+			created = value
+		}
+		if value := mapFromAny(chunk["usage"]); len(value) > 0 {
+			usage = value
+		}
+		for _, rawChoice := range sliceFromAny(chunk["choices"]) {
+			choice := mapFromAny(rawChoice)
+			delta := mapFromAny(choice["delta"])
+			content.WriteString(extractionStringFromAny(delta["content"]))
+			reasoningText := extractionStringFromAny(delta["reasoning_content"])
+			if reasoningText == "" {
+				reasoningText = extractionStringFromAny(delta["reasoning"])
+			}
+			reasoning.WriteString(reasoningText)
+			if value := strings.TrimSpace(extractionStringFromAny(choice["finish_reason"])); value != "" {
+				finishReason = value
+			}
+			break
+		}
+		return nil
+	}
+	applyComment := func(raw string) {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(raw, ":"))
+		for _, target := range []struct {
+			prefix string
+			dst    *any
+		}{{"energy", &energy}, {"cost", &cost}} {
+			if !strings.HasPrefix(strings.ToLower(trimmed), target.prefix+" ") {
+				continue
+			}
+			payload := strings.TrimSpace(trimmed[len(target.prefix):])
+			var value any
+			if json.Unmarshal([]byte(payload), &value) == nil {
+				*target.dst = value
+			}
+		}
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64<<10), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := applyEvent(); err != nil {
+				return http.StatusBadGateway, nil, "", err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			applyComment(line)
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			eventData = append(eventData, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return http.StatusBadGateway, nil, "", err
+	}
+	if err := applyEvent(); err != nil {
+		return http.StatusBadGateway, nil, "", err
+	}
+	if !seenChunk {
+		return http.StatusBadGateway, nil, "", errors.New("NeuralWatt Flex stream returned no completion chunks")
+	}
+	if !done && finishReason == "" {
+		return http.StatusBadGateway, nil, "", errors.New("NeuralWatt Flex stream ended before final completion marker")
+	}
+	if serviceTier == "" {
+		serviceTier = strings.TrimSpace(resp.Header.Get("X-NW-Service-Tier"))
+	}
+	if object == "" || strings.HasSuffix(object, ".chunk") {
+		object = "chat.completion"
+	}
+	message := map[string]any{"role": "assistant", "content": content.String()}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+		message["reasoning"] = reasoning.String()
+	}
+	data := map[string]any{
+		"id":           id,
+		"object":       object,
+		"created":      created,
+		"model":        model,
+		"service_tier": serviceTier,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       message,
+			"finish_reason": finishReason,
+		}},
+	}
+	if len(usage) > 0 {
+		data["usage"] = usage
+	}
+	if energy != nil {
+		data["energy"] = energy
+	}
+	if cost != nil {
+		data["cost"] = cost
+	}
+	return http.StatusOK, data, "", nil
 }
 
 func proxyApplyRequestOverrides(headers map[string]string, body map[string]any, req dto.ProxyPluginMainRequest, provider string, vertex bool) (map[string]any, error) {
@@ -1156,7 +1646,7 @@ func proxyApplyLLMGatewayServiceTier(body map[string]any, req dto.ProxyPluginMai
 	if !proxyProviderSupportsServiceTier(provider) {
 		trace["llm_gateway_service_tier_applied"] = false
 		trace["llm_gateway_service_tier_skip_reason"] = "provider_not_openai_compatible_service_tier"
-		return fmt.Errorf("llm_gateway_service_tier requires provider openai, llmgateway, vercel, or custom")
+		return fmt.Errorf("llm_gateway_service_tier requires provider openai, llmgateway, vercel, neuralwatt, or custom")
 	}
 	if existing, exists := body["service_tier"]; exists {
 		existingText, isString := existing.(string)
@@ -1177,7 +1667,7 @@ func proxyApplyLLMGatewayServiceTier(body map[string]any, req dto.ProxyPluginMai
 
 func proxyProviderSupportsServiceTier(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "openai", "llmgateway", "vercel", "custom":
+	case "openai", "llmgateway", "vercel", "neuralwatt", "custom":
 		return true
 	default:
 		return false
@@ -1308,6 +1798,66 @@ func proxyAttachGeminiUsage(resp, upstream map[string]any, trace map[string]any)
 
 const proxyResponseMetadataKey = "_archive_center_response_meta"
 
+func proxyAttachHTTPFailureMetadata(data map[string]any, status int, headers http.Header, now time.Time) map[string]any {
+	if data == nil {
+		data = map[string]any{}
+	}
+	meta := mapFromAny(data[proxyResponseMetadataKey])
+	if len(meta) == 0 {
+		meta = map[string]any{
+			"contract_version": "archive_center.provider_response.v1",
+			"adapter":          "http_error",
+			"usage_reported":   false,
+		}
+	}
+	meta["http_status"] = status
+	if retryAfterSeconds := proxyRetryAfterSeconds(headers, data, now); retryAfterSeconds > 0 {
+		meta["retry_after_seconds"] = retryAfterSeconds
+	}
+	data[proxyResponseMetadataKey] = meta
+	return data
+}
+
+func proxyRetryAfterSeconds(headers http.Header, data map[string]any, now time.Time) int {
+	seconds := proxyRetryAfterSecondsFromValue(data["retry_after"])
+	if nested := mapFromAny(data["error"]); len(nested) > 0 {
+		seconds = maxInt(seconds, proxyRetryAfterSecondsFromValue(nested["retry_after"]))
+	}
+	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+		if parsed := proxyRetryAfterSecondsFromValue(raw); parsed > 0 {
+			seconds = maxInt(seconds, parsed)
+		} else if retryAt, err := http.ParseTime(raw); err == nil {
+			delay := retryAt.Sub(now)
+			if delay > 0 {
+				seconds = maxInt(seconds, int((delay+time.Second-1)/time.Second))
+			}
+		}
+	}
+	return seconds
+}
+
+func proxyRetryAfterSecondsFromValue(value any) int {
+	var seconds float64
+	switch typed := value.(type) {
+	case float64:
+		seconds = typed
+	case float32:
+		seconds = float64(typed)
+	case int:
+		seconds = float64(typed)
+	case int64:
+		seconds = float64(typed)
+	case json.Number:
+		seconds, _ = typed.Float64()
+	case string:
+		seconds, _ = strconv.ParseFloat(strings.TrimSpace(typed), 64)
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return int(math.Ceil(seconds))
+}
+
 func buildProxyResponseMetadata(adapter, finishReason string, usage map[string]any) map[string]any {
 	meta := map[string]any{
 		"contract_version":     "archive_center.provider_response.v1",
@@ -1328,6 +1878,7 @@ func buildProxyResponseMetadata(adapter, finishReason string, usage map[string]a
 	)
 	reasoningTokens := firstPositiveInt(
 		intFromAny(mapFromAny(usage["completion_tokens_details"])["reasoning_tokens"], 0),
+		intFromAny(mapFromAny(usage["output_tokens_details"])["reasoning_tokens"], 0),
 		intFromAny(usage["thoughtsTokenCount"], 0),
 	)
 	totalTokens := firstPositiveInt(
@@ -1339,6 +1890,7 @@ func buildProxyResponseMetadata(adapter, finishReason string, usage map[string]a
 	}
 	cachedInputTokens := firstPositiveInt(
 		intFromAny(mapFromAny(usage["prompt_tokens_details"])["cached_tokens"], 0),
+		intFromAny(mapFromAny(usage["input_tokens_details"])["cached_tokens"], 0),
 		intFromAny(usage["cache_read_input_tokens"], 0),
 		intFromAny(usage["cachedContentTokenCount"], 0),
 	)
@@ -1352,9 +1904,9 @@ func buildProxyResponseMetadata(adapter, finishReason string, usage map[string]a
 
 func proxyTerminationKind(finishReason string) string {
 	switch strings.ToLower(strings.TrimSpace(finishReason)) {
-	case "stop", "end_turn", "stop_sequence":
+	case "stop", "end_turn", "stop_sequence", "completed":
 		return "complete"
-	case "length", "max_tokens", "model_context_window_exceeded":
+	case "length", "max_tokens", "max_output_tokens", "model_context_window_exceeded":
 		return "length"
 	case "content_filter", "safety", "recitation", "prohibited_content", "blocked", "blocklist", "spii", "image_safety", "language":
 		return "safety"
@@ -1383,22 +1935,34 @@ func proxyAttachRequestOverrideTrace(resp map[string]any, trace map[string]any) 
 	resp["_proxy_request_overrides"] = trace
 }
 
-func proxyOpenAIBaseURL(provider, endpoint string) string {
+func proxyProviderBaseURL(provider, endpoint string) string {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if endpoint != "" {
 		return endpoint
 	}
-	switch provider {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai":
+		return "https://api.openai.com/v1"
 	case "openrouter":
-		return "https://openrouter.ai/api"
+		return "https://openrouter.ai/api/v1"
 	case "llmgateway":
 		return "https://api.llmgateway.io/v1"
 	case "vercel":
 		return "https://ai-gateway.vercel.sh/v1"
+	case "neuralwatt":
+		return "https://api.neuralwatt.com/v1"
 	case "copilot":
 		return "https://api.githubcopilot.com"
+	case "ollama":
+		return "http://127.0.0.1:11434"
+	case "claude":
+		return "https://api.anthropic.com"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com/v1beta"
+	case "vertex":
+		return "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/publishers/google/models"
 	default:
-		return "https://api.openai.com"
+		return ""
 	}
 }
 
@@ -1733,7 +2297,7 @@ func proxyOllamaReasoningEffort(family, model, effort, glmThinkingType string) s
 	}
 }
 
-func proxyGatewayReasoningEffort(family, model, effort, glmThinkingType string) string {
+func proxyGatewayReasoningEffort(transport, family, model, effort, glmThinkingType string) string {
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	switch family {
 	case "glm":
@@ -1745,7 +2309,12 @@ func proxyGatewayReasoningEffort(family, model, effort, glmThinkingType string) 
 		switch effort {
 		case "none", "high", "max":
 			return effort
-		case "minimal", "low", "medium":
+		case "low":
+			if transport == "neuralwatt" && strings.Contains(strings.ToLower(strings.TrimSpace(model)), "flash") {
+				return "high"
+			}
+			return "low"
+		case "minimal", "medium":
 			return "high"
 		case "xhigh":
 			return "max"
@@ -1828,6 +2397,10 @@ func proxyExtractClaudeText(data map[string]any) string {
 	parts := make([]string, 0, len(blocks))
 	for _, block := range blocks {
 		item := mapFromAny(block)
+		blockType := strings.ToLower(strings.TrimSpace(extractionStringFromAny(item["type"])))
+		if strings.Contains(blockType, "thinking") || strings.Contains(blockType, "reasoning") {
+			continue
+		}
 		text := strings.TrimSpace(extractionStringFromAny(item["text"]))
 		if text != "" {
 			parts = append(parts, text)

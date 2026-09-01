@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -89,6 +90,102 @@ func TestPrepareTurnCanonicalCharacterRosterDoesNotConsumeStateBudget(t *testing
 	}
 }
 
+func TestPrepareTurnCanonicalCharacterCandidateRemainsWholeUntilFinalBudget(t *testing.T) {
+	const tail = "canonical-character-tail-끝"
+	longState := strings.Repeat("정밀한 상태 기록 ", 40) + tail
+	canonicalJSON := mustCompactJSON(map[string]any{
+		"characters": []any{map[string]any{
+			"name": "Mira", "location": "forge", "state": longState,
+		}},
+	})
+	perspective := prepareTurnPerspectiveWithNarrativeState(map[string]any{}, nil, []store.ActiveState{{
+		StateType: "scene", Content: `{"location":"forge","present_entities":["Mira"]}`,
+	}})
+	assembly := buildPrepareTurnInjectionAssembly(
+		nil, nil, nil, nil, nil, nil, nil, nil,
+		[]store.CanonicalStateLayer{{ID: 1, LayerType: "entity_state", Content: canonicalJSON, TurnIndex: 9, SourceTurn: 9, Confidence: 0.9}},
+		nil, nil, nil, nil,
+		5, 30000, "Mira checks her precise state at the forge.", "default", nil, nil, nil, perspective,
+	)
+
+	var payload string
+	for _, line := range strings.Split(assembly.CanonCharacterText, "\n") {
+		if strings.HasPrefix(line, "- entity_state: ") {
+			payload = strings.TrimPrefix(line, "- entity_state: ")
+			break
+		}
+	}
+	if payload == "" || !strings.Contains(payload, tail) {
+		t.Fatalf("canonical character candidate lost its tail: %q", assembly.CanonCharacterText)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("canonical character candidate is not complete JSON: %v payload=%q", err, payload)
+	}
+	finalText := extractionStringFromAny(assembly.MemoryDeliveryPlan["final_text"])
+	if !strings.Contains(finalText, tail) {
+		t.Fatalf("adequate final budget did not deliver the whole canonical candidate: %q", finalText)
+	}
+
+	bounded := prepareTurnInjectionAssembly{CanonCharacterText: assembly.CanonCharacterText}
+	boundedPlan := buildPrepareTurnMemoryDeliveryPlan(&bounded, 160, map[string]any{})
+	boundedText := extractionStringFromAny(boundedPlan["final_text"])
+	if strings.Contains(boundedText, "entity_state") || strings.Contains(boundedText, tail) {
+		t.Fatalf("small final budget partially injected an oversized canonical item: %q", boundedText)
+	}
+}
+
+func TestPrepareTurnMemoryCandidateRenderersPreserveLongTails(t *testing.T) {
+	const tail = "memory-candidate-tail-끝"
+	longText := strings.Repeat("완전한 기억 문장 ", 70) + tail
+	longJSON := mustCompactJSON([]any{longText})
+
+	cases := map[string]string{
+		"episode_dense_anchor": episodeDenseAnchorPreview(store.EpisodeSummary{
+			KeyEvents: longJSON, RelationshipChangesJSON: longJSON, OpenLoopsJSON: longJSON,
+		}, "different summary", 0),
+		"chapter": prepareTurnChapterRecallText(store.ChapterSummary{
+			FromTurn: 1, ToTurn: 10, ChapterTitle: longText, ResumeText: longText,
+			OpenLoopsJSON: longJSON, RelationshipChangesJSON: longJSON, WorldChangesJSON: longJSON, CallbackCandidatesJSON: longJSON,
+		}),
+		"arc": prepareTurnArcRecallText(store.ArcSummary{
+			FromTurn: 1, ToTurn: 20, ArcName: longText, ArcStatus: longText, ArcResumeText: longText,
+			KeyTurningPointsJSON: longJSON, UnresolvedDebtsJSON: longJSON, CallbackCandidatesJSON: longJSON,
+		}),
+		"saga": prepareTurnSagaRecallText(store.SagaDigest{
+			FromTurn: 1, ToTurn: 30, EraLabel: longText, ResumePackText: longText,
+			PersistentFactsJSON: longJSON, NeverDropCandidatesJSON: longJSON,
+		}),
+		"persona":           personaRecollectionPromptLineText(store.PersonaMemoryEntry{MemoryText: longText}, 32),
+		"character_private": characterPrivateRecollectionPromptLineText(store.ProtagonistEntityMemory{MemoryText: longText}, 32),
+	}
+	for name, text := range cases {
+		if !strings.Contains(text, tail) {
+			t.Errorf("%s candidate lost its tail: %q", name, text)
+		}
+	}
+}
+
+func TestPrepareTurnContinuityCorrectionPreservesLongCurrentValue(t *testing.T) {
+	const tail = "continuity-current-tail-끝"
+	current := strings.Repeat("현재 연속성 상태 ", 40) + tail
+	value := store.StatusCurrentValue{
+		StatusKey:  narrativeStateStatusKey,
+		WriteState: "current",
+		SourceTurn: 12,
+		ValueJSON: mustCompactJSON(map[string]any{
+			"subject": "Mira", "subject_type": "entity", "state_slot": "physical_state",
+			"value": current, "previous_value": "old state", "claim_scope": "objective", "transition": "change",
+		}),
+	}
+	text, trace := buildNarrativeContinuityCorrection(
+		[]store.StatusCurrentValue{value}, "Mira checks her condition.", nil, nil, prepareTurnMemoryLaneSelection{}, 5,
+	)
+	if intFromAny(trace["selected_count"], 0) != 1 || !strings.Contains(text, tail) {
+		t.Fatalf("continuity correction lost the current-value tail: trace=%#v text=%q", trace, text)
+	}
+}
+
 func TestPrepareTurnMemoryNameOnlyAnchorDoesNotFillEventLane(t *testing.T) {
 	item := store.Memory{
 		TurnIndex:   3,
@@ -132,6 +229,47 @@ func TestPrepareTurnPendingThreadNeedsDescriptionOverlapNotOwnerNameOnly(t *test
 	)
 	if strings.TrimSpace(assembly.PendingThreadText) != "" {
 		t.Fatalf("owner-name-only pending thread survived: %q", assembly.PendingThreadText)
+	}
+}
+
+func TestPrepareTurnPinnedOpenPromiseSurvivesWithoutCurrentQueryOverlap(t *testing.T) {
+	assembly := buildPrepareTurnInjectionAssembly(
+		nil, nil, nil, nil, nil, nil, nil,
+		[]store.PendingThread{
+			{
+				ThreadKey:   "daily-cube-rendezvous",
+				Status:      "open",
+				Description: "The companion uses the gifted teleport cube to rendezvous every morning.",
+				Pinned:      true,
+			},
+			{
+				ThreadKey:   "paused-promise",
+				Status:      "paused",
+				Description: "A paused unrelated promise must not bypass relevance.",
+				Pinned:      true,
+			},
+			{
+				ThreadKey:   "suppressed-promise",
+				Status:      "open",
+				Description: "A suppressed unrelated promise must not be delivered.",
+				Pinned:      true,
+				Suppressed:  true,
+			},
+		},
+		nil, nil, nil, nil, nil,
+		5, 9000, "Mira calibrates the brass wheel at the forge.", "default", nil, nil, nil,
+	)
+	if !strings.Contains(assembly.PendingThreadText, "teleport cube") {
+		t.Fatalf("pinned open promise was dropped without query overlap: %q", assembly.PendingThreadText)
+	}
+	if strings.Contains(assembly.PendingThreadText, "paused unrelated") || strings.Contains(assembly.PendingThreadText, "suppressed unrelated") {
+		t.Fatalf("inactive pinned promise bypassed eligibility: %q", assembly.PendingThreadText)
+	}
+	if got := intFromAny(assembly.Counts["pending_thread_pinned_active_selected"], 0); got != 1 {
+		t.Fatalf("pinned active selected count = %d, want 1", got)
+	}
+	if got := intFromAny(assembly.Counts["pending_thread_suppressed_dropped"], 0); got != 1 {
+		t.Fatalf("suppressed dropped count = %d, want 1", got)
 	}
 }
 
@@ -250,6 +388,30 @@ func TestPrepareTurnRecollectionDoesNotLetTechnicalSceneReactivateUnrelatedHisto
 		if strings.Contains(assembly.CanonEventText, unwanted) {
 			t.Fatalf("stale canonical event %q bypassed the event-memory query: %q", unwanted, assembly.CanonEventText)
 		}
+	}
+}
+
+func TestPrepareTurnWorldRuleRemainsWholeUntilFinalMemoryBudgetSelection(t *testing.T) {
+	const tailMarker = "WORLD_RULE_COMPLETE_TAIL_MARKER"
+	longRule := strings.Repeat("이 규칙은 장면 전체에서 지속되어야 하며 중간 문장을 잃어서는 안 된다. ", 8) + tailMarker
+	assembly := buildPrepareTurnInjectionAssembly(
+		nil, nil, nil, nil, nil,
+		[]store.WorldRule{{
+			ID:        1,
+			Scope:     "root",
+			Key:       "긴 세계 규칙",
+			ValueJSON: `{"rule":` + fmt.Sprintf("%q", longRule) + `}`,
+			Pinned:    true,
+		}},
+		nil, nil, nil, nil, nil, nil, nil,
+		5, 9000, "긴 세계 규칙을 확인한다.", "default", nil, nil, nil,
+	)
+	if !strings.Contains(assembly.WorldRulesText, tailMarker) {
+		t.Fatalf("world rule was truncated before final budget selection: %q", assembly.WorldRulesText)
+	}
+	finalText := extractionStringFromAny(assembly.MemoryDeliveryPlan["final_text"])
+	if !strings.Contains(finalText, tailMarker) {
+		t.Fatalf("whole world rule was not delivered by the final memory budget plan: %q", finalText)
 	}
 }
 
@@ -435,6 +597,43 @@ func TestPrepareTurnStaleSceneCannotActivateRelationshipOrVolatileWorldLanes(t *
 	}
 	if boolFromAny(assembly.Counts["current_scene_state_is_current"]) {
 		t.Fatalf("stale scene was marked current: %#v", assembly.Counts)
+	}
+}
+
+func TestPrepareTurnKGUsesTemporalSupportSemanticsAndBranchReferenceTurn(t *testing.T) {
+	rawInput := "Alice and Bob revisit their promise at the harbor."
+	chatLogs := []store.ChatLog{{TurnIndex: 8, Role: "assistant", Content: "Alice and Bob arrive at the harbor."}}
+	triples := []store.KGTriple{
+		{Subject: "Alice", Predicate: "promised_to", Object: "Bob", SourceTurn: 2, ValidFrom: 2},
+		{Subject: "Alice", Predicate: "lent_coin_to", Object: "Bob", SourceTurn: 3, ValidFrom: 3, ValidTo: 5},
+		{Subject: "Alice", Predicate: "will_meet", Object: "Bob", SourceTurn: 10, ValidFrom: 10},
+	}
+	assembly := buildPrepareTurnInjectionAssembly(
+		nil, triples, nil, chatLogs, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		5, 9000, rawInput, "default", nil, nil, nil,
+	)
+	if !strings.Contains(assembly.KGText, "[Knowledge Graph Support History;") ||
+		!strings.Contains(assembly.KGText, "not current-state authority") {
+		t.Fatalf("KG support authority was not explicit: %q", assembly.KGText)
+	}
+	for _, want := range []string{
+		"source_turn=2", "valid=2..end_unrecorded",
+		"Alice --promised_to--> Bob",
+	} {
+		if !strings.Contains(assembly.KGText, want) {
+			t.Fatalf("KG temporal support missing %q: %q", want, assembly.KGText)
+		}
+	}
+	for _, unwanted := range []string{"lent_coin_to", "will_meet", "currently_valid", "authority=current_state"} {
+		if strings.Contains(assembly.KGText, unwanted) {
+			t.Fatalf("KG support retained out-of-range or current-state text %q: %q", unwanted, assembly.KGText)
+		}
+	}
+	if got := intFromAny(assembly.Counts["kg_closed_or_not_yet_valid_dropped"], 0); got != 2 {
+		t.Fatalf("kg_closed_or_not_yet_valid_dropped=%d, want 2: %#v", got, assembly.Counts)
+	}
+	if len(triples) != 3 || triples[0].ValidTo != 0 {
+		t.Fatalf("read-only KG assembly mutated stored history: %#v", triples)
 	}
 }
 

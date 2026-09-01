@@ -2,7 +2,7 @@ param(
     [string]$OutputRoot,
     [string]$PackageName = "",
     [string]$PackageKind = "managed",
-    [string]$PackageVersion = "4.0.0",
+    [string]$PackageVersion = "4.0.9",
     [string]$ChromaRuntime = "",
     [string]$CodeSigningCertThumbprint = "",
     [string]$TimestampServer = "http://timestamp.digicert.com",
@@ -134,7 +134,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return
     }
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.9" } else { $PackageVersion.Trim() }
     $packageLabel = if ($PackageKind -eq "managed") {
         "Archive Center $version Windows Auto Install Package"
     } else {
@@ -153,7 +153,7 @@ function Set-CopiedPackageKindText([string]$Path, [string]$PackageKind, [string]
 }
 
 function Set-CopiedPackageVersionText([string]$Root, [string]$PackageVersion) {
-    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.0" } else { $PackageVersion.Trim() }
+    $version = if ([string]::IsNullOrWhiteSpace($PackageVersion)) { "4.0.9" } else { $PackageVersion.Trim() }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     $patterns = @("*.md", "*.txt", "*.bat", "*.cmd", "*.ps1", "*.sh", "*.command")
     foreach ($pattern in $patterns) {
@@ -503,11 +503,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $targetFull "bin") | Out-Nu
 $goServiceRoot = Join-Path $repoRoot "go-service"
 $goVersionText = (& go version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $goVersionText -notmatch '\bgo(\d+)\.(\d+)\.(\d+)\b') {
-    throw "Archive Center release packaging requires Go 1.26.5 or newer. Detected: $goVersionText"
+    throw "Archive Center release packaging requires Go 1.26.6 or newer. Detected: $goVersionText"
 }
 $detectedGoVersion = [Version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3])
-if ($detectedGoVersion -lt [Version]"1.26.5") {
-    throw "Archive Center release packaging requires Go 1.26.5 or newer. Detected: $goVersionText"
+if ($detectedGoVersion -lt [Version]"1.26.6") {
+    throw "Archive Center release packaging requires Go 1.26.6 or newer. Detected: $goVersionText"
 }
 Push-Location $goServiceRoot
 try {

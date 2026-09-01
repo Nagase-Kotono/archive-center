@@ -126,6 +126,22 @@ type ActiveSourceRevisionLister interface {
 	) ([]MemorySourceRevision, error)
 }
 
+// SourceRevisionHistoryLister is the read-only recovery view of source
+// revisions for one explicitly selected session.  Normal turn processing and
+// rollback continue to use ActiveSourceRevisionLister; session normalization
+// may additionally inspect inactive revisions so a deleted user side can be
+// restored without another LLM call. Explicit branch-lineage repair may use
+// the same bounded session history to recover an exact fork coordinate; it
+// must not reactivate or rewrite any revision.
+type SourceRevisionHistoryLister interface {
+	ListSourceRevisions(
+		context.Context,
+		string,
+		int,
+		int,
+	) ([]MemorySourceRevision, error)
+}
+
 type MemoryDerivationDependency struct {
 	ID                 int64
 	ContractVersion    string
@@ -171,6 +187,13 @@ type MemoryReprocessingJobStore interface {
 	FailMemoryReprocessingJob(ctx context.Context, jobID int64, leaseOwner string, now, retryAfter time.Time, permanent bool, failure string) error
 }
 
+// MemoryReprocessingWakeScheduleStore exposes only the next durable wake time
+// for the existing reprocessing queue. The worker uses it to restore its
+// one-shot timer after a backend restart without polling or claiming work early.
+type MemoryReprocessingWakeScheduleStore interface {
+	NextMemoryReprocessingWakeAt(context.Context) (time.Time, error)
+}
+
 // MemoryReprocessingJobReopener is an optional administrative capability. It
 // reopens the exact idempotent job and resets only its active source revision's
 // committed admission snapshot. Raw source content and projected secondary
@@ -211,4 +234,40 @@ type MemoryVectorOutboxStore interface {
 	ClaimMemoryVectorOperations(ctx context.Context, leaseOwner string, now time.Time, leaseDuration time.Duration) ([]*MemoryVectorOutboxItem, error)
 	CompleteMemoryVectorOperation(ctx context.Context, outboxID int64, leaseOwner string, now time.Time) error
 	FailMemoryVectorOperation(ctx context.Context, outboxID int64, leaseOwner string, now, retryAfter time.Time, permanent bool, failure string) error
+}
+
+// MemoryVectorOutboxLaneStore lets the bounded authority worker reserve fair
+// service for deletes without changing the canonical outbox contract used by
+// other stores and tests.
+type MemoryVectorOutboxLaneStore interface {
+	ClaimMemoryVectorOperationsByOperation(ctx context.Context, leaseOwner string, now time.Time, leaseDuration time.Duration, operation string) ([]*MemoryVectorOutboxItem, error)
+}
+
+// MemoryVectorMaterialization is the verified public memory vector that must
+// converge into MariaDB before its outbox operation can be completed.
+type MemoryVectorMaterialization struct {
+	ChatSessionID  string
+	SourceRevision string
+	DocumentID     string
+	SourceRowID    int64
+	EmbeddingJSON  string
+	EmbeddingModel string
+}
+
+type MemoryVectorMaterializedCompletionStore interface {
+	CompleteMemoryVectorMaterializedOperation(
+		ctx context.Context,
+		outboxID int64,
+		leaseOwner string,
+		now time.Time,
+		materialization MemoryVectorMaterialization,
+	) error
+}
+
+type MemoryVectorOutboxMaintenanceStore interface {
+	CoalesceInactiveMemoryVectorDeleteOperations(
+		ctx context.Context,
+		chatSessionID string,
+		now time.Time,
+	) (staleRejected int64, err error)
 }

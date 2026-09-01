@@ -174,13 +174,11 @@ func TestNarrativeGuideModesControlledReplayDiverges(t *testing.T) {
 		}
 		userMessage, _ := messages[1].(map[string]any)
 		body := extractionStringFromAny(userMessage["content"])
-		mode := "off"
-		for _, candidate := range []string{"romantic", "action", "mature_soft"} {
-			if strings.Contains(body, `"guide_mode": "`+candidate+`"`) {
-				mode = candidate
-				break
-			}
+		var publisherInput map[string]any
+		if err := json.Unmarshal([]byte(body), &publisherInput); err != nil {
+			t.Fatalf("decode compact Publisher input: %v; body=%s", err, body)
 		}
+		mode := extractionFirstNonEmpty(extractionStringFromAny(publisherInput["guide_mode"]), "off")
 		callByMode[mode]++
 		capturedPromptByMode[mode] = body
 		responseText := map[string]string{
@@ -739,6 +737,40 @@ func TestConfigUpdateSupervisorTraceDoesNotInferMainConfig(t *testing.T) {
 	missing, ok := supervisorTrace["missing_fields"].([]any)
 	if !ok || len(missing) != 4 {
 		t.Fatalf("supervisor missing_fields = %#v, want provider/api_key/endpoint/model", supervisorTrace["missing_fields"])
+	}
+}
+
+func TestRuntimeLLMConfigUsesProviderDefaultEndpointWhenUnset(t *testing.T) {
+	srv := setupTestServer()
+	srv.RuntimeConfig.Synced = true
+	srv.RuntimeConfig.MainProvider = "openai"
+	srv.RuntimeConfig.MainAPIKey = "sk-main"
+	srv.RuntimeConfig.MainEndpoint = ""
+	srv.RuntimeConfig.MainModel = "gpt-test"
+	srv.RuntimeConfig.MainTimeoutSec = 120
+	srv.RuntimeConfig.CriticProvider = "neuralwatt"
+	srv.RuntimeConfig.CriticAPIKey = "nw-critic"
+	srv.RuntimeConfig.CriticEndpoint = ""
+	srv.RuntimeConfig.CriticModel = "critic-test"
+	srv.RuntimeConfig.CriticTimeoutSec = 120
+
+	mainCfg := srv.chapterLLMConfig()
+	if mainCfg.Endpoint != "https://api.openai.com/v1" || !mainCfg.hasConfig() {
+		t.Fatalf("main config = %+v, want configured OpenAI default endpoint", mainCfg)
+	}
+	completeCfg := srv.completeTurnExtractionConfig(map[string]any{})
+	if completeCfg.Critic.Endpoint != "https://api.neuralwatt.com/v1" || !completeCfg.Critic.hasConfig() {
+		t.Fatalf("critic config = %+v, want configured NeuralWatt default endpoint", completeCfg.Critic)
+	}
+
+	trace := srv.runtimeConfigTrace()
+	mainTrace := trace["main"].(map[string]any)
+	if mainTrace["configured"] != true || mainTrace["endpoint_host"] != "api.openai.com" || mainTrace["endpoint_source"] != "provider_default.openai" {
+		t.Fatalf("main trace = %+v", mainTrace)
+	}
+	criticTrace := trace["critic"].(map[string]any)
+	if criticTrace["configured"] != true || criticTrace["endpoint_host"] != "api.neuralwatt.com" || criticTrace["endpoint_source"] != "provider_default.neuralwatt" {
+		t.Fatalf("critic trace = %+v", criticTrace)
 	}
 }
 

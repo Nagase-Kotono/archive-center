@@ -134,6 +134,10 @@ func classifyCriticProviderError(err error, status int) *criticPipelineError {
 	case errors.Is(err, context.Canceled):
 		return newCriticPipelineError("CRITIC_PROVIDER_CANCELED", "provider_call", false, status, err)
 	}
+	var exhaustedErr *proxyFinalOutputExhaustedError
+	if errors.As(err, &exhaustedErr) {
+		return newCriticPipelineError("CRITIC_OUTPUT_TOKEN_EXHAUSTED", "provider_response", true, status, err)
+	}
 	var emptyContentErr *proxyEmptyContentError
 	if errors.As(err, &emptyContentErr) {
 		return newCriticPipelineError("CRITIC_EMPTY_RESPONSE", "provider_response", true, status, err)
@@ -361,6 +365,12 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 	}
 	criticUserInput := boundCompleteTurnCriticInput(sanitizedUserInput, 0)
 	criticAssistantContent := boundCompleteTurnCriticInput(sanitizedAssistantContent, 0)
+	criticInputMode := "paired"
+	criticUserInputState := "observed"
+	if strings.TrimSpace(criticUserInput) == "" && strings.TrimSpace(criticAssistantContent) != "" {
+		criticInputMode = "assistant_only"
+		criticUserInputState = "missing"
+	}
 	if strings.TrimSpace(criticUserInput+"\n"+criticAssistantContent) == "" {
 		err := newCriticPipelineError("CRITIC_INPUT_EMPTY", "input", false, 0, errors.New("critic_input_empty_after_sanitize"))
 		trace := criticFailureTrace(promptSource, cfg, 0, err, "")
@@ -522,6 +532,8 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 	languageContextJSON, _ := json.Marshal(normalizeCompleteTurnLanguageContext(languageContext))
 	inputBudgetTrace := map[string]any{
 		"contract_version":             completeTurnCriticInputBudgetObservationContract,
+		"input_mode":                   criticInputMode,
+		"user_input_state":             criticUserInputState,
 		"user_input_chars":             len([]rune(criticUserInput)),
 		"assistant_content_chars":      len([]rune(criticAssistantContent)),
 		"current_turn_chars":           len([]rune(criticUserInput)) + len([]rune(criticAssistantContent)),
@@ -563,12 +575,14 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 	}
 	maxTokens := cfg.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 1600
+		maxTokens = completeTurnExtractionConfigFromMeta(nil).Critic.MaxTokens
 	}
 	maxCompletionTokens := cfg.MaxCompletionTokens
 	if maxCompletionTokens <= 0 {
 		maxCompletionTokens = maxTokens
 	}
+	callLedger["requested_max_tokens"] = maxTokens
+	callLedger["requested_max_completion_tokens"] = maxCompletionTokens
 	temp := cfg.Temperature
 	req := dto.ProxyPluginMainRequest{
 		APIKey:              &cfg.APIKey,
@@ -727,6 +741,8 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 		trace["request_overrides"] = requestOverrides
 	}
 	trace["critic_archive_ledger"] = criticArchiveLedgerTrace
+	trace["input_mode"] = criticInputMode
+	trace["user_input_state"] = criticUserInputState
 	trace["context_selection"] = contextSelectionTrace
 	trace["active_world_rule_contract"] = activeWorldRuleTrace
 	trace["input_snapshot"] = snapshotTrace
@@ -735,6 +751,8 @@ func (s *Server) runCompleteTurnCriticWithInputPolicy(ctx context.Context, sid s
 		trace["memory_write_contract"] = completeTurnMemoryWriteContract(languageContext)
 	}
 	normalized := normalizeCriticExtraction(parsed)
+	normalized["input_mode"] = criticInputMode
+	normalized["user_input_state"] = criticUserInputState
 	worldRuleCount := len(worldRuleItemsForSave(normalized))
 	if worldRuleCount > 0 {
 		trace["world_rule_audit"] = map[string]any{
@@ -1480,9 +1498,18 @@ func buildCompleteTurnCriticPromptWithLanguageContext(sid string, turnIndex int,
 		ledgerInput = archiveLedger[0]
 	}
 	ledger, _ := json.Marshal(ledgerInput)
+	inputMode := "paired"
+	userInputState := "observed"
+	if strings.TrimSpace(userInput) == "" && strings.TrimSpace(assistantContent) != "" {
+		inputMode = "assistant_only"
+		userInputState = "missing"
+	}
 	return strings.Join([]string{
 		fmt.Sprintf("chat_session_id: %s", sid),
 		fmt.Sprintf("turn_index: %d", turnIndex),
+		fmt.Sprintf("input_mode: %s", inputMode),
+		fmt.Sprintf("user_input_state: %s", userInputState),
+		"When input_mode is assistant_only, extract only claims grounded in the assistant output. Do not invent missing user actions or dialogue. Keep every independently valid extracted item even when another field has no grounded item.",
 		"",
 		"<Latest_Turn>",
 		"[User]",
@@ -2171,7 +2198,7 @@ func criticPerspectiveClaims(extraction map[string]any) []criticPerspectiveClaim
 	}
 	for _, raw := range sliceFromAny(extraction["belief_updates"]) {
 		add("belief", mapFromAny(raw),
-			[]string{"perspective_owner", "knower", "believer", "listener_names", "knowledge_holders"},
+			[]string{"perspective_owner", "owner", "owner_entity_name", "knower", "believer", "listener_names", "knowledge_holders"},
 			[]string{"value", "state_value", "belief", "claim"},
 		)
 	}
@@ -2476,7 +2503,7 @@ func normalizeCriticExtraction(raw map[string]any) map[string]any {
 		delete(out, "story_clock")
 	}
 	out["kg_triples"] = sliceFromAny(raw["kg_triples"])
-	out["character_deltas"] = sliceFromAny(raw["character_deltas"])
+	out["character_deltas"] = normalizeCriticCharacterDeltas(raw["character_deltas"])
 	out["pending_threads"] = normalizeCriticPendingThreads(raw["pending_threads"])
 	out["entities"] = mapFromAny(raw["entities"])
 	out["speaker_attributions"] = normalizeSpeakerAttributionCandidates(raw["speaker_attributions"])
@@ -2507,6 +2534,51 @@ func normalizeCriticExtraction(raw map[string]any) map[string]any {
 	out["character_identity_accuracy"] = characterIdentityAccuracy
 	out["subjective_entity_memories"] = subjectiveMemories
 	out["persona_capsule_candidates"] = normalizePersonaCapsuleCandidates(raw["persona_capsule_candidates"])
+	return out
+}
+
+func normalizeCriticCharacterDeltas(value any) []any {
+	items := sliceFromAny(value)
+	out := make([]any, 0, len(items))
+	for _, raw := range items {
+		item := mapFromAny(raw)
+		if len(item) == 0 {
+			out = append(out, raw)
+			continue
+		}
+		normalized := make(map[string]any, len(item)+2)
+		for key, field := range item {
+			normalized[key] = field
+		}
+		if name := strings.TrimSpace(extractionFirstNonEmpty(
+			stringFromMap(item, "name"),
+			stringFromMap(item, "character_name"),
+			stringFromMap(item, "character"),
+		)); name != "" {
+			normalized["name"] = name
+		}
+
+		if status, structured := item["status"].(map[string]any); !structured || len(status) == 0 {
+			change := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "change"),
+				stringFromMap(item, "value"),
+				stringFromMap(item, "status"),
+			))
+			if change != "" {
+				slot := strings.TrimSpace(extractionFirstNonEmpty(
+					stringFromMap(item, "delta_type"),
+					stringFromMap(item, "change_type"),
+					stringFromMap(item, "dimension"),
+					stringFromMap(item, "aspect"),
+				))
+				if slot == "" {
+					slot = "observed_change"
+				}
+				normalized["status"] = map[string]any{slot: change}
+			}
+		}
+		out = append(out, normalized)
+	}
 	return out
 }
 
@@ -2602,6 +2674,14 @@ func normalizeCriticBeliefUpdates(raw any) []any {
 		}
 		if strings.TrimSpace(stringFromMap(item, "evidence_excerpt")) == "" {
 			item["evidence_excerpt"] = extractionFirstNonEmpty(stringFromMap(item, "evidence"), stringFromMap(item, "source_excerpt"))
+		}
+		if strings.TrimSpace(stringFromMap(item, "perspective_owner")) == "" {
+			owner := strings.TrimSpace(extractionFirstNonEmpty(
+				stringFromMap(item, "owner"), stringFromMap(item, "owner_entity_name"),
+			))
+			if owner != "" {
+				item["perspective_owner"] = owner
+			}
 		}
 		listeners := append([]string{}, stringsFromAny(item["listener_names"])...)
 		for _, listener := range []string{

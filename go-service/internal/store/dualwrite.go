@@ -504,6 +504,36 @@ func (d *dualWriteStore) ResolveReviewedCanonicalEntityID(ctx context.Context, c
 	return "", ErrNotEnabled
 }
 
+func (d *dualWriteStore) ListActiveEntityIdentities(ctx context.Context, chatSessionID string) ([]EntityIdentity, error) {
+	if primary, ok := d.primary.(EntityIdentityCatalogReader); ok {
+		return primary.ListActiveEntityIdentities(ctx, chatSessionID)
+	}
+	if shadow, ok := d.shadow.(EntityIdentityCatalogReader); ok {
+		return shadow.ListActiveEntityIdentities(ctx, chatSessionID)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListActiveEntityIdentitySurfaces(ctx context.Context, chatSessionID string) ([]EntityIdentitySurface, error) {
+	if primary, ok := d.primary.(EntityIdentityCatalogReader); ok {
+		return primary.ListActiveEntityIdentitySurfaces(ctx, chatSessionID)
+	}
+	if shadow, ok := d.shadow.(EntityIdentityCatalogReader); ok {
+		return shadow.ListActiveEntityIdentitySurfaces(ctx, chatSessionID)
+	}
+	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) ListReviewedEntityIdentityLinks(ctx context.Context, chatSessionID string) ([]EntityIdentityLink, error) {
+	if primary, ok := d.primary.(EntityIdentityCatalogReader); ok {
+		return primary.ListReviewedEntityIdentityLinks(ctx, chatSessionID)
+	}
+	if shadow, ok := d.shadow.(EntityIdentityCatalogReader); ok {
+		return shadow.ListReviewedEntityIdentityLinks(ctx, chatSessionID)
+	}
+	return nil, ErrNotEnabled
+}
+
 func (d *dualWriteStore) ResolveUniqueActiveEntityIDBySurface(ctx context.Context, chatSessionID, normalizedSurface string) (string, error) {
 	if primary, ok := d.primary.(UniqueActiveEntitySurfaceResolver); ok {
 		return primary.ResolveUniqueActiveEntityIDBySurface(ctx, chatSessionID, normalizedSurface)
@@ -741,6 +771,21 @@ func (d *dualWriteStore) ListActiveSourceRevisions(
 	return nil, ErrNotEnabled
 }
 
+func (d *dualWriteStore) ListSourceRevisions(
+	ctx context.Context,
+	sid string,
+	fromTurn int,
+	toTurn int,
+) ([]MemorySourceRevision, error) {
+	if reader, ok := d.primary.(SourceRevisionHistoryLister); ok {
+		return reader.ListSourceRevisions(ctx, sid, fromTurn, toTurn)
+	}
+	if reader, ok := d.shadow.(SourceRevisionHistoryLister); ok {
+		return reader.ListSourceRevisions(ctx, sid, fromTurn, toTurn)
+	}
+	return nil, ErrNotEnabled
+}
+
 func (d *dualWriteStore) InvalidateSourceRevisions(ctx context.Context, sid string, fromTurn int, lifecycleState, reason string, invalidatedAt time.Time) error {
 	primary, primaryOK := memoryLifecycleSourceStore(d.primary)
 	shadow, shadowOK := memoryLifecycleSourceStore(d.shadow)
@@ -781,6 +826,16 @@ func (d *dualWriteStore) ClaimMemoryReprocessingJob(ctx context.Context, owner s
 		return shadow.ClaimMemoryReprocessingJob(ctx, owner, now, lease)
 	}
 	return nil, ErrNotEnabled
+}
+
+func (d *dualWriteStore) NextMemoryReprocessingWakeAt(ctx context.Context) (time.Time, error) {
+	if primary, ok := d.primary.(MemoryReprocessingWakeScheduleStore); ok {
+		return primary.NextMemoryReprocessingWakeAt(ctx)
+	}
+	if shadow, ok := d.shadow.(MemoryReprocessingWakeScheduleStore); ok {
+		return shadow.NextMemoryReprocessingWakeAt(ctx)
+	}
+	return time.Time{}, ErrNotEnabled
 }
 
 func (d *dualWriteStore) CompleteMemoryReprocessingJob(ctx context.Context, id int64, owner string, now time.Time) error {
@@ -849,6 +904,16 @@ func (d *dualWriteStore) ClaimMemoryVectorOperations(ctx context.Context, owner 
 	return nil, ErrNotEnabled
 }
 
+func (d *dualWriteStore) ClaimMemoryVectorOperationsByOperation(ctx context.Context, owner string, now time.Time, lease time.Duration, operation string) ([]*MemoryVectorOutboxItem, error) {
+	if primary, ok := d.primary.(MemoryVectorOutboxLaneStore); ok {
+		return primary.ClaimMemoryVectorOperationsByOperation(ctx, owner, now, lease, operation)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorOutboxLaneStore); ok {
+		return shadow.ClaimMemoryVectorOperationsByOperation(ctx, owner, now, lease, operation)
+	}
+	return nil, ErrNotEnabled
+}
+
 func (d *dualWriteStore) CompleteMemoryVectorOperation(ctx context.Context, id int64, owner string, now time.Time) error {
 	if primary, ok := d.primary.(MemoryVectorOutboxStore); ok {
 		return primary.CompleteMemoryVectorOperation(ctx, id, owner, now)
@@ -857,6 +922,26 @@ func (d *dualWriteStore) CompleteMemoryVectorOperation(ctx context.Context, id i
 		return shadow.CompleteMemoryVectorOperation(ctx, id, owner, now)
 	}
 	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) CompleteMemoryVectorMaterializedOperation(ctx context.Context, id int64, owner string, now time.Time, materialization MemoryVectorMaterialization) error {
+	if primary, ok := d.primary.(MemoryVectorMaterializedCompletionStore); ok {
+		return primary.CompleteMemoryVectorMaterializedOperation(ctx, id, owner, now, materialization)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorMaterializedCompletionStore); ok {
+		return shadow.CompleteMemoryVectorMaterializedOperation(ctx, id, owner, now, materialization)
+	}
+	return ErrNotEnabled
+}
+
+func (d *dualWriteStore) CoalesceInactiveMemoryVectorDeleteOperations(ctx context.Context, chatSessionID string, now time.Time) (int64, error) {
+	if primary, ok := d.primary.(MemoryVectorOutboxMaintenanceStore); ok {
+		return primary.CoalesceInactiveMemoryVectorDeleteOperations(ctx, chatSessionID, now)
+	}
+	if shadow, ok := d.shadow.(MemoryVectorOutboxMaintenanceStore); ok {
+		return shadow.CoalesceInactiveMemoryVectorDeleteOperations(ctx, chatSessionID, now)
+	}
+	return 0, ErrNotEnabled
 }
 
 func (d *dualWriteStore) FailMemoryVectorOperation(ctx context.Context, id int64, owner string, now, retryAfter time.Time, permanent bool, failure string) error {

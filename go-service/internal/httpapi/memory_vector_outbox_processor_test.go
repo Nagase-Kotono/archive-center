@@ -22,6 +22,7 @@ type memoryVectorProcessorStore struct {
 	store.Store
 	items            []*store.MemoryVectorOutboxItem
 	completed        []int64
+	materialized     []store.MemoryVectorMaterialization
 	failed           []int64
 	failureRetryAt   []time.Time
 	failurePermanent []bool
@@ -65,8 +66,33 @@ func (f *memoryVectorProcessorStore) ClaimMemoryVectorOperations(_ context.Conte
 	return items, nil
 }
 
+func (f *memoryVectorProcessorStore) ClaimMemoryVectorOperationsByOperation(ctx context.Context, owner string, now time.Time, lease time.Duration, operation string) ([]*store.MemoryVectorOutboxItem, error) {
+	index := -1
+	for candidateIndex, item := range f.items {
+		if item != nil && item.Operation == operation {
+			index = candidateIndex
+			break
+		}
+	}
+	if index < 0 {
+		return nil, store.ErrNotFound
+	}
+	if index > 0 {
+		selected := f.items[index]
+		copy(f.items[1:index+1], f.items[:index])
+		f.items[0] = selected
+	}
+	return f.ClaimMemoryVectorOperations(ctx, owner, now, lease)
+}
+
 func (f *memoryVectorProcessorStore) CompleteMemoryVectorOperation(_ context.Context, id int64, _ string, _ time.Time) error {
 	f.completed = append(f.completed, id)
+	return f.completeErr
+}
+
+func (f *memoryVectorProcessorStore) CompleteMemoryVectorMaterializedOperation(_ context.Context, id int64, _ string, _ time.Time, materialization store.MemoryVectorMaterialization) error {
+	f.completed = append(f.completed, id)
+	f.materialized = append(f.materialized, materialization)
 	return f.completeErr
 }
 
@@ -233,8 +259,51 @@ func TestMemoryVectorProcessorRecordsRetryAfterVectorFailure(t *testing.T) {
 	}
 	if !result.Processed || result.CanonicalState != "retryable" ||
 		len(st.failed) != 1 || len(st.completed) != 0 ||
-		!st.failureRetryAt[0].Equal(now) {
+		!st.failureRetryAt[0].After(now) {
 		t.Fatalf("result=%+v failed=%v completed=%v retry=%v", result, st.failed, st.completed, st.failureRetryAt)
+	}
+}
+
+func TestMemoryWorkerReservesDeleteServiceBehindOlderUpserts(t *testing.T) {
+	items := make([]*store.MemoryVectorOutboxItem, 0, 13)
+	for id := int64(1); id <= 12; id++ {
+		document := verifiedMemoryVectorProcessorDocument(vector.VectorDocument{
+			ID: fmt.Sprintf("memory:session:%d", id), ChatSessionID: "session",
+			SourceTable: "precise_memory_units", SourceRowID: fmt.Sprint(id),
+			SchemaVersion: store.PreciseMemoryUnitContract, DocumentText: "grounded",
+			Embedding: []float32{0.1, 0.2},
+		}, fmt.Sprintf("revision-%d", id))
+		documentJSON, err := materializedMemoryVectorDocumentJSON(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, &store.MemoryVectorOutboxItem{
+			ID: id, Operation: "upsert", ChatSessionID: "session",
+			SourceRevision: fmt.Sprintf("revision-%d", id), DocumentID: document.ID,
+			DocumentJSON: documentJSON, EmbeddingReady: true,
+			RequiredSourceState: "active", Status: "pending",
+		})
+	}
+	items = append(items, &store.MemoryVectorOutboxItem{
+		ID: 99, Operation: "delete", ChatSessionID: "session",
+		SourceRevision: "revision-deleted", DocumentID: "memory:session:deleted",
+		EmbeddingReady: true, RequiredSourceState: "inactive", Status: "pending",
+	})
+	st := &memoryVectorProcessorStore{Store: store.NewNoopStore(), items: items}
+	vec := &memoryVectorProcessorVector{VectorStore: vector.NewFakeVectorStore()}
+	srv := &Server{
+		Cfg: config.Default(), Store: st, Vector: vec,
+		RuntimeConfig: RuntimeConfig{
+			Synced: true, CriticTimeoutSec: 1, EmbeddingTimeoutSec: 10,
+			FailedQueueMaxAttempts: 4,
+		},
+	}
+	srv.processMemoryWorkerWake(context.Background(), "worker", time.Now().UTC())
+	if len(st.completed) == 0 || st.completed[0] != 99 {
+		t.Fatalf("delete did not receive reserved service: completed=%v", st.completed)
+	}
+	if len(vec.deletes) != 1 || len(vec.deletes[0]) != 1 || vec.deletes[0][0] != "memory:session:deleted" {
+		t.Fatalf("delete calls=%v", vec.deletes)
 	}
 }
 
@@ -422,7 +491,7 @@ func TestMemoryVectorOutboxVoyageGroupEmbeddingFailureRetriesEverySibling(t *tes
 		t.Fatalf("failed=%v completed=%v permanent=%v upserts=%#v", st.failed, st.completed, st.failurePermanent, vec.upserts)
 	}
 	for index := range st.failed {
-		if st.failurePermanent[index] || !st.failureRetryAt[index].Equal(now) {
+		if st.failurePermanent[index] || !st.failureRetryAt[index].After(now) {
 			t.Fatalf("failure %d permanent=%v retry=%v", index, st.failurePermanent[index], st.failureRetryAt[index])
 		}
 	}
@@ -725,6 +794,60 @@ func TestMemoryVectorProcessorMaterializesDeferredEmbedding(t *testing.T) {
 		len(vec.upserts) != 1 || len(vec.upserts[0]) != 1 ||
 		len(vec.upserts[0][0].Embedding) != 2 {
 		t.Fatalf("result=%+v completed=%v upserts=%+v", result, st.completed, vec.upserts)
+	}
+}
+
+func TestMemoryVectorProcessorPersistsVerifiedDeferredMemoryEmbeddingBeforeCompletion(t *testing.T) {
+	now := time.Date(2026, 8, 26, 2, 0, 0, 0, time.UTC)
+	document := vector.VectorDocument{
+		ID: "memory:session:17", ChatSessionID: "session",
+		Tier: "memory", SourceTable: "memories", SourceRowID: "17",
+		SchemaVersion: "memory.v2", DocumentText: "Mina kept the active promise.",
+	}
+	document = verifiedMemoryVectorProcessorDocument(document, "sar_active")
+	documentJSON, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &memoryVectorProcessorStore{
+		Store: store.NewNoopStore(),
+		items: []*store.MemoryVectorOutboxItem{{
+			ID: 15, Operation: "upsert", ChatSessionID: "session",
+			SourceRevision: "sar_active", DocumentID: document.ID,
+			DocumentJSON: string(documentJSON), EmbeddingReady: false,
+			RequiredSourceState: "active", Status: "needs_embedding",
+		}},
+	}
+	vec := &memoryVectorProcessorVector{VectorStore: vector.NewFakeVectorStore()}
+	oldClient := proxyHTTPClient
+	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		payload := `{"model":"embedding-resolved","data":[{"embedding":[0.2,0.4]}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header), Body: io.NopCloser(strings.NewReader(payload)),
+		}, nil
+	})}
+	defer func() { proxyHTTPClient = oldClient }()
+	server := &Server{
+		Store: st, Vector: vec,
+		RuntimeConfig: RuntimeConfig{
+			Synced: true, EmbeddingProvider: "openai", EmbeddingAPIKey: "test-key",
+			EmbeddingEndpoint: "https://example.invalid/v1", EmbeddingModel: "embedding-requested",
+			EmbeddingTimeoutSec: 30, FailedQueueMaxAttempts: 4,
+		},
+	}
+	result, err := server.processMemoryVectorOutboxOnce(context.Background(), "worker", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CanonicalState != "completed" || len(st.materialized) != 1 {
+		t.Fatalf("result=%+v completed=%v materialized=%+v", result, st.completed, st.materialized)
+	}
+	got := st.materialized[0]
+	if got.ChatSessionID != "session" || got.SourceRevision != "sar_active" ||
+		got.DocumentID != document.ID || got.SourceRowID != 17 ||
+		got.EmbeddingJSON != "[0.2,0.4]" || got.EmbeddingModel != "embedding-resolved" {
+		t.Fatalf("materialization=%+v", got)
 	}
 }
 

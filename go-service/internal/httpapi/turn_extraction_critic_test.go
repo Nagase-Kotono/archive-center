@@ -26,6 +26,65 @@ func combinedCriticPromptForTest(t *testing.T, userPrompt string) string {
 	return systemPrompt + "\n" + userPrompt
 }
 
+type characterTimelineRecordingStore struct {
+	*turnRecordingStore
+	characterStateRows []store.CharacterState
+}
+
+func (f *characterTimelineRecordingStore) ListCharacterStatesCurrentBefore(_ context.Context, sid string, beforeTurn int) ([]store.CharacterState, error) {
+	latest := map[string]store.CharacterState{}
+	for _, item := range f.characterStateRows {
+		if sid != "" && item.ChatSessionID != sid {
+			continue
+		}
+		if beforeTurn > 0 && item.TurnIndex >= beforeTurn {
+			continue
+		}
+		key := comparableEntityKey(item.CharacterName)
+		current, found := latest[key]
+		if !found || item.TurnIndex > current.TurnIndex || (item.TurnIndex == current.TurnIndex && item.ID > current.ID) {
+			latest[key] = item
+		}
+	}
+	out := make([]store.CharacterState, 0, len(latest))
+	for _, item := range latest {
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (f *characterTimelineRecordingStore) SaveCharacterState(_ context.Context, item *store.CharacterState) error {
+	copyItem := *item
+	copyItem.ID = int64(len(f.characterStateRows) + 1)
+	f.characterStateRows = append(f.characterStateRows, copyItem)
+	f.savedCharacterStates = append(f.savedCharacterStates, &copyItem)
+	return nil
+}
+
+func TestCriticPromptUsesExplicitNameMappingsWithoutChangingOutputLanguage(t *testing.T) {
+	t.Parallel()
+	prompt, source := readCriticSystemPrompt(filepath.Join("..", "..", "..", "prompts"))
+	if source == "fallback_builtin" {
+		t.Fatal("source critic_system.txt was not loaded")
+	}
+	for _, required := range []string{
+		"explicit user-supplied name-matching list or table",
+		"Preserve both mapped strings exactly",
+		"preserve the mapped given-name identity first",
+		"Never swap or mix surnames between rows",
+		"exempt from surname/given-name matching",
+		"identity-only rules do not change the Language Contract",
+		"Follow runtime language guidance from `summary_language` or `session_output_language`",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("critic prompt missing explicit name-mapping contract %q", required)
+		}
+	}
+	if strings.Contains(prompt, "Use only English for the task") {
+		t.Fatal("name-mapping guidance must not override the runtime output-language contract")
+	}
+}
+
 func criticWireJSONForTest(canonical map[string]any) string {
 	raw, err := json.Marshal(canonical)
 	if err != nil {
@@ -736,6 +795,16 @@ func TestCriticPipelineErrorClassificationPreservesStageAndHTTPStatus(t *testing
 		t.Fatalf("empty response details = %#v", emptyDetails)
 	}
 
+	exhaustedDetails := criticPipelineErrorDetails(classifyCriticProviderError(
+		&proxyFinalOutputExhaustedError{Provider: "custom"}, http.StatusOK,
+	))
+	if exhaustedDetails["code"] != "CRITIC_OUTPUT_TOKEN_EXHAUSTED" ||
+		exhaustedDetails["stage"] != "provider_response" ||
+		exhaustedDetails["retryable"] != true ||
+		exhaustedDetails["http_status"] != http.StatusOK {
+		t.Fatalf("output-exhausted details = %#v", exhaustedDetails)
+	}
+
 	localDetails := criticPipelineErrorDetails(classifyCriticProviderError(
 		&proxyLocalRequestError{Stage: "request_build", Cause: errors.New("conflict")},
 		http.StatusBadRequest,
@@ -758,6 +827,88 @@ func TestCriticPipelineErrorClassificationPreservesStageAndHTTPStatus(t *testing
 		!strings.Contains(stringFromMap(trace, "raw_preview"), "[redacted]") ||
 		strings.Contains(stringFromMap(trace, "raw_preview"), "secret-key") {
 		t.Fatalf("failure trace = %#v", trace)
+	}
+}
+
+func TestCriticProviderRequestUsesCanonicalRoleDefaultAndPreservesExplicitLimits(t *testing.T) {
+	oldClient := proxyHTTPClient
+	defer func() { proxyHTTPClient = oldClient }()
+
+	roleDefault := completeTurnExtractionConfigFromMeta(nil).Critic.MaxTokens
+	if roleDefault <= 0 {
+		t.Fatalf("canonical critic role default must be positive, got %d", roleDefault)
+	}
+	providerResponse := criticWireJSONForTest(map[string]any{
+		"turn_summary":      "Mina kept the key.",
+		"importance_score":  6,
+		"evidence_excerpts": []any{"Mina kept the key."},
+	})
+	tests := []struct {
+		name              string
+		maxTokens         int64
+		maxCompletion     int64
+		wantMaxTokens     int64
+		wantMaxCompletion int64
+	}{
+		{
+			name:              "unset uses canonical critic role default",
+			wantMaxTokens:     roleDefault,
+			wantMaxCompletion: roleDefault,
+		},
+		{
+			name:              "explicit limits remain unchanged",
+			maxTokens:         4321,
+			maxCompletion:     6789,
+			wantMaxTokens:     4321,
+			wantMaxCompletion: 6789,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamBody map[string]any
+			proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatalf("read provider request: %v", err)
+				}
+				if err := json.Unmarshal(raw, &upstreamBody); err != nil {
+					t.Fatalf("decode provider request: %v", err)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+						`{"model":"critic-test","choices":[{"finish_reason":"stop","message":{"content":%s}}]}`,
+						strconv.Quote(providerResponse),
+					))),
+				}, nil
+			})}
+
+			srv := &Server{Cfg: config.Default(), Store: store.NewNoopStore()}
+			_, trace, err := srv.runCompleteTurnCritic(
+				context.Background(), "session", 1,
+				"Mina found the key.", "Mina kept the key.", nil, nil,
+				completeTurnLLMConfig{
+					Provider: "openai", Endpoint: "https://example.invalid/v1", APIKey: "test-key",
+					Model: "critic-test", TimeoutMs: 30_000,
+					MaxTokens: tt.maxTokens, MaxCompletionTokens: tt.maxCompletion,
+					RetryBudget: newLLMRetryBudget(0),
+				},
+			)
+			if err != nil {
+				t.Fatalf("runCompleteTurnCritic error: %v trace=%#v", err, trace)
+			}
+			if got := int64(intFromAny(upstreamBody["max_tokens"], 0)); got != tt.wantMaxTokens {
+				t.Fatalf("provider max_tokens=%d, want %d; body=%#v", got, tt.wantMaxTokens, upstreamBody)
+			}
+			ledger := mapFromAny(trace["provider_call_budget_ledger"])
+			if got := int64(intFromAny(ledger["requested_max_tokens"], 0)); got != tt.wantMaxTokens {
+				t.Fatalf("ledger requested_max_tokens=%d, want %d; ledger=%#v", got, tt.wantMaxTokens, ledger)
+			}
+			if got := int64(intFromAny(ledger["requested_max_completion_tokens"], 0)); got != tt.wantMaxCompletion {
+				t.Fatalf("ledger requested_max_completion_tokens=%d, want %d; ledger=%#v", got, tt.wantMaxCompletion, ledger)
+			}
+		})
 	}
 }
 
@@ -1318,6 +1469,10 @@ func TestCriticPromptRequiresEvidenceEligibleSubjectiveCoverageAndAllowsValidZer
 		"Before omitting this surface, inspect every named in-story entity",
 		"Omitting `subjective_entity_memories` remains valid",
 		"Each subjective memory needs an owner and memory text",
+		`"subjective_entity_memories":[{"owner_entity_name":"","memory_text":"","evidence_excerpt":"","importance_10":8,"emotional_weight":0.7}]`,
+		`"belief_updates":[{"perspective_owner":"","belief":"","evidence_excerpt":"","importance_10":6,"emotional_weight":0.4}]`,
+		"missing scores default per item",
+		`"state_claims":[{"subject":"","state_slot":"","value":"","transition":"set","evidence_excerpt":""}]`,
 		"extract useful source-grounded in-story facts and relationships broadly",
 		"A fact is not omitted merely because another typed lane also records it",
 		"evidence_excerpts are durable citations, not transcript samples",
@@ -1408,6 +1563,9 @@ func TestCriticPromptJSONExamplesRemainParseableAfterDeduplication(t *testing.T)
 
 func TestCriticCharacterDeltaNameContractPersistsState(t *testing.T) {
 	systemPrompt, _ := readCriticSystemPrompt(filepath.Join("..", "..", "..", "prompts"))
+	if !strings.Contains(systemPrompt, `"character_deltas":[{"name":"","status":{"key":"value"}}]`) {
+		t.Fatal("system critic prompt is missing the explicit character delta object shape")
+	}
 	systemJSONSection := strings.Index(systemPrompt, "[Wire Output Contract]")
 	if systemJSONSection < 0 {
 		t.Fatal("system critic prompt is missing the JSON surface section")
@@ -1446,6 +1604,169 @@ func TestCriticCharacterDeltaNameContractPersistsState(t *testing.T) {
 		if stringFromMap(reason, "surface") == "character_deltas" && stringFromMap(reason, "reason") == "missing_name" {
 			t.Fatalf("named character delta was discarded as missing_name: %#v", result.SkipReasons)
 		}
+	}
+}
+
+func TestCriticCharacterDeltaProviderAliasesPersistIndependentState(t *testing.T) {
+	tests := []struct {
+		name       string
+		delta      map[string]any
+		wantName   string
+		wantSlot   string
+		wantChange string
+	}{
+		{
+			name: "character_name_delta_type_change",
+			delta: map[string]any{
+				"character_name": "Mina",
+				"delta_type":     "intention",
+				"change":         "will return at dawn",
+			},
+			wantName: "Mina", wantSlot: "intention", wantChange: "will return at dawn",
+		},
+		{
+			name: "character_dimension_value",
+			delta: map[string]any{
+				"character": "Rowan",
+				"dimension": "authority",
+				"value":     "now leads the watch",
+			},
+			wantName: "Rowan", wantSlot: "authority", wantChange: "now leads the watch",
+		},
+		{
+			name: "scalar_status_open_slot",
+			delta: map[string]any{
+				"character_name": "Sora",
+				"status":         "keeps watch by the door",
+			},
+			wantName: "Sora", wantSlot: "observed_change", wantChange: "keeps watch by the door",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &turnRecordingStore{}
+			srv := NewServer(config.Default())
+			srv.Store = fake
+			result := srv.saveCriticExtractionArtifacts(
+				context.Background(),
+				"critic-character-alias-"+tc.name,
+				2,
+				normalizeCriticExtraction(map[string]any{"character_deltas": []any{tc.delta}}),
+				tc.wantName+" changed.",
+				completeTurnEmbeddingConfig{},
+				time.Unix(200, 0),
+			)
+			if result.CharacterStates != 1 || len(fake.savedCharacterStates) != 1 {
+				t.Fatalf("provider alias delta was not persisted: result=%#v states=%#v", result, fake.savedCharacterStates)
+			}
+			saved := fake.savedCharacterStates[0]
+			if saved.CharacterName != tc.wantName {
+				t.Fatalf("saved name=%q want=%q", saved.CharacterName, tc.wantName)
+			}
+			status := map[string]any{}
+			if err := json.Unmarshal([]byte(saved.StatusJSON), &status); err != nil {
+				t.Fatalf("status JSON=%q: %v", saved.StatusJSON, err)
+			}
+			if got := stringFromMap(status, tc.wantSlot); got != tc.wantChange {
+				t.Fatalf("status[%q]=%q want=%q; status=%#v", tc.wantSlot, got, tc.wantChange, status)
+			}
+		})
+	}
+}
+
+func TestCriticCharacterDeltaNormalizationPreservesCanonicalAndValidSiblings(t *testing.T) {
+	canonicalStatus := map[string]any{"role": "captain"}
+	normalized := normalizeCriticCharacterDeltas([]any{
+		map[string]any{"change": "unnamed change"},
+		map[string]any{"name": "Mina", "status": canonicalStatus, "evidence_excerpt": "Mina took command."},
+	})
+	if len(normalized) != 2 {
+		t.Fatalf("normalized deltas=%#v", normalized)
+	}
+	valid := mapFromAny(normalized[1])
+	if stringFromMap(valid, "name") != "Mina" || stringFromMap(mapFromAny(valid["status"]), "role") != "captain" ||
+		stringFromMap(valid, "evidence_excerpt") != "Mina took command." {
+		t.Fatalf("canonical delta changed=%#v", valid)
+	}
+
+	fake := &turnRecordingStore{}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	result := srv.saveCriticExtractionArtifacts(
+		context.Background(), "critic-character-mixed", 3,
+		map[string]any{"character_deltas": normalized},
+		"Mina took command.", completeTurnEmbeddingConfig{}, time.Unix(300, 0),
+	)
+	if result.CharacterStates != 1 || len(fake.savedCharacterStates) != 1 || fake.savedCharacterStates[0].CharacterName != "Mina" {
+		t.Fatalf("valid sibling was not independently persisted: result=%#v states=%#v", result, fake.savedCharacterStates)
+	}
+	foundMissingName := false
+	for _, reason := range result.SkipReasons {
+		if stringFromMap(reason, "surface") == "character_deltas" && stringFromMap(reason, "reason") == "missing_name" {
+			foundMissingName = true
+		}
+	}
+	if !foundMissingName {
+		t.Fatalf("malformed sibling was not traced independently: %#v", result.SkipReasons)
+	}
+}
+
+func TestCharacterStateReplayUsesPriorTurnAndIsSameTurnIdempotent(t *testing.T) {
+	base := &turnRecordingStore{}
+	fake := &characterTimelineRecordingStore{
+		turnRecordingStore: base,
+		characterStateRows: []store.CharacterState{
+			{
+				ID: 1, ChatSessionID: "character-replay", CharacterName: "Mina", TurnIndex: 2,
+				AppearanceJSON: "{}", PersonalityJSON: "{}", StatusJSON: `{"role":"scout"}`,
+				RelationshipsJSON: "{}", SpeechStyleJSON: "{}",
+			},
+			{
+				ID: 2, ChatSessionID: "character-replay", CharacterName: "Mina", TurnIndex: 10,
+				AppearanceJSON: "{}", PersonalityJSON: "{}", StatusJSON: `{"role":"general","secret":"future"}`,
+				RelationshipsJSON: "{}", SpeechStyleJSON: "{}",
+			},
+		},
+	}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	extraction := map[string]any{
+		"character_deltas": []any{
+			map[string]any{"name": "Mina", "status": map[string]any{"intention": "wait at the gate"}},
+			map[string]any{"name": "Mina", "status": map[string]any{"authority": "leads the watch"}},
+		},
+	}
+	first := srv.saveCriticExtractionArtifacts(
+		context.Background(), "character-replay", 5, extraction,
+		"Mina waits at the gate and leads the watch.", completeTurnEmbeddingConfig{}, time.Unix(500, 0),
+	)
+	if first.CharacterStates != 1 || len(fake.savedCharacterStates) != 1 {
+		t.Fatalf("first replay state count=%d saved=%#v errors=%#v", first.CharacterStates, fake.savedCharacterStates, first.ErrorDetails)
+	}
+	status := map[string]any{}
+	if err := json.Unmarshal([]byte(fake.savedCharacterStates[0].StatusJSON), &status); err != nil {
+		t.Fatal(err)
+	}
+	if stringFromMap(status, "role") != "scout" || stringFromMap(status, "intention") != "wait at the gate" ||
+		stringFromMap(status, "authority") != "leads the watch" || stringFromMap(status, "secret") != "" {
+		t.Fatalf("historical replay leaked or lost state: %#v", status)
+	}
+
+	second := srv.saveCriticExtractionArtifacts(
+		context.Background(), "character-replay", 5, extraction,
+		"Mina waits at the gate and leads the watch.", completeTurnEmbeddingConfig{}, time.Unix(600, 0),
+	)
+	if second.CharacterStates != 0 || len(fake.savedCharacterStates) != 1 {
+		t.Fatalf("same-turn replay appended a duplicate: result=%#v saved=%#v", second, fake.savedCharacterStates)
+	}
+	foundDuplicate := false
+	for _, reason := range second.SkipReasons {
+		if stringFromMap(reason, "surface") == "character_deltas" && stringFromMap(reason, "reason") == "duplicate_same_turn_state" {
+			foundDuplicate = true
+		}
+	}
+	if !foundDuplicate {
+		t.Fatalf("same-turn idempotency was not traced: %#v", second.SkipReasons)
 	}
 }
 
@@ -1536,6 +1857,140 @@ func TestCriticBeliefTransferCreatesGroundedSubjectiveMemoryPerNamedListener(t *
 	}
 	if !owners["Rowan"] || !owners["Jules"] {
 		t.Fatalf("named listener coverage = %#v", owners)
+	}
+}
+
+func TestCriticBeliefOwnerAliasCreatesClaimSubjectiveMemory(t *testing.T) {
+	claim := "Han-eol's proposal may be larger than Mihyang's current role, but it is not yet trustworthy."
+	excerpt := "Mihyang did not answer and watched Han-eol in silence."
+	normalized := normalizeCriticExtraction(map[string]any{
+		"belief_updates": []any{
+			"malformed optional item",
+			map[string]any{
+				"owner": "Mihyang", "belief": claim, "evidence_excerpt": excerpt,
+			},
+		},
+		"subjective_entity_memories": []any{},
+	})
+	beliefs := sliceFromAny(normalized["belief_updates"])
+	if len(beliefs) != 1 || stringFromMap(mapFromAny(beliefs[0]), "perspective_owner") != "Mihyang" {
+		t.Fatalf("owner alias was not canonicalized without erasing the valid item: %#v", beliefs)
+	}
+	memories := sliceFromAny(normalized["subjective_entity_memories"])
+	if len(memories) != 1 {
+		t.Fatalf("owner-scoped belief did not create one subjective memory: %#v", memories)
+	}
+	memory := mapFromAny(memories[0])
+	if stringFromMap(memory, "owner_entity_name") != "Mihyang" ||
+		stringFromMap(memory, "memory_text") != claim ||
+		stringFromMap(memory, "evidence_excerpt") != excerpt {
+		t.Fatalf("owner-scoped belief projection mismatch: %#v", memory)
+	}
+}
+
+func TestCriticSubjectiveScoresSurviveDirectBeliefAliasFallbackAndReplay(t *testing.T) {
+	extraction := normalizeCriticExtraction(map[string]any{
+		"subjective_entity_memories": []any{map[string]any{
+			"owner_entity_name": "Direct",
+			"memory_text":       "Direct remembers the gate opening.",
+			"evidence_excerpt":  "Direct watched the gate open.",
+			"importance_10":     8,
+			"emotional_weight":  0.7,
+		}},
+		"belief_updates": []any{
+			map[string]any{
+				"owner": "Mihyang", "belief": "The proposal is still uncertain.",
+				"evidence_excerpt": "Mihyang watched in silence.",
+				"importance_10":    9, "emotional_weight": 0.8,
+			},
+			map[string]any{
+				"owner": "Rowan", "belief": "The gatekeeper may be lying.",
+				"evidence_excerpt": "Rowan narrowed his eyes at the gatekeeper.",
+				"importance_score": 7, "emotional_intensity": 0.6,
+			},
+			map[string]any{
+				"owner": "Jules", "belief": "The eastern road may be safer.",
+				"evidence_excerpt": "Jules glanced toward the eastern road.",
+			},
+		},
+	})
+
+	items := sliceFromAny(extraction["subjective_entity_memories"])
+	if len(items) != 4 {
+		t.Fatalf("subjective memories = %d, want all four independent items: %#v", len(items), items)
+	}
+	wantScores := map[string][2]float64{
+		"Direct":  {8, 0.7},
+		"Mihyang": {9, 0.8},
+		"Rowan":   {7, 0.6},
+		"Jules":   {5, 0.5},
+	}
+	for _, raw := range items {
+		item := mapFromAny(raw)
+		owner := stringFromMap(item, "owner_entity_name")
+		want, ok := wantScores[owner]
+		if !ok {
+			t.Fatalf("unexpected subjective owner %q: %#v", owner, item)
+		}
+		if got := extractionFloatFromAny(item["importance_10"], 0); got != want[0] {
+			t.Fatalf("%s importance_10 = %v, want %v: %#v", owner, got, want[0], item)
+		}
+		if got := extractionFloatFromAny(item["emotional_weight"], 0); got != want[1] {
+			t.Fatalf("%s emotional_weight = %v, want %v: %#v", owner, got, want[1], item)
+		}
+	}
+
+	content := strings.Join([]string{
+		"Direct watched the gate open.",
+		"Mihyang watched in silence.",
+		"Rowan narrowed his eyes at the gatekeeper.",
+		"Jules glanced toward the eastern road.",
+	}, " ")
+	fake := &turnRecordingStore{}
+	srv := NewServer(config.Default())
+	srv.Store = fake
+	first := srv.saveCriticExtractionArtifacts(context.Background(), "subjective-score-replay", 12, extraction, content, completeTurnEmbeddingConfig{}, time.Unix(1200, 0))
+	if first.SubjectiveEntityMemories != 4 || len(fake.savedEntityMemories) != 4 {
+		t.Fatalf("first subjective save = %d/%d, want 4/4: %#v", first.SubjectiveEntityMemories, len(fake.savedEntityMemories), first)
+	}
+	for _, saved := range fake.savedEntityMemories {
+		want := wantScores[saved.OwnerEntityName]
+		if saved.Importance10 != want[0] || saved.EmotionalWeight != want[1] {
+			t.Fatalf("stored score mismatch for %s: %#v", saved.OwnerEntityName, saved)
+		}
+		fake.returnEntityMemories = append(fake.returnEntityMemories, *saved)
+	}
+	fake.savedEntityMemories = nil
+	second := srv.saveCriticExtractionArtifacts(context.Background(), "subjective-score-replay", 12, extraction, content, completeTurnEmbeddingConfig{}, time.Unix(1201, 0))
+	if second.SubjectiveEntityMemories != 0 || len(fake.savedEntityMemories) != 0 {
+		t.Fatalf("replay duplicated subjective memories: result=%#v saved=%#v", second, fake.savedEntityMemories)
+	}
+}
+
+func TestCriticBeliefOwnerEntityNameAliasIsPerspectiveClaimBeforeNormalization(t *testing.T) {
+	excerpt := "Mihyang privately admitted that she did not trust the proposal yet."
+	extraction := map[string]any{
+		"belief_updates": []any{map[string]any{
+			"owner_entity_name": "Mihyang", "belief": "The proposal is not yet trustworthy.",
+			"evidence_excerpt": excerpt,
+		}},
+		"state_claims": []any{
+			map[string]any{
+				"subject": "proposal", "state_slot": "trust", "value": "not yet trustworthy",
+				"evidence_excerpt": excerpt,
+			},
+			map[string]any{
+				"subject": "gate", "state_slot": "access", "value": "open",
+				"evidence_excerpt": "The public gate remained open.",
+			},
+		},
+	}
+	if quarantined := quarantineCriticPerspectiveClaimsFromObjectiveLanes(extraction); quarantined != 1 {
+		t.Fatalf("owner_entity_name belief quarantined=%d, want 1: %#v", quarantined, extraction)
+	}
+	claims := sliceFromAny(extraction["state_claims"])
+	if len(claims) != 1 || stringFromMap(mapFromAny(claims[0]), "subject") != "gate" {
+		t.Fatalf("independent objective item was not preserved: %#v", claims)
 	}
 }
 

@@ -162,6 +162,17 @@ func appendBeliefUpdateSubjectiveMemories(subjective []any, beliefUpdates any) [
 		if !explicitState {
 			state = "unknown"
 		}
+		hasTransferHolder := len(stringsFromAny(item["listener_names"])) > 0 ||
+			len(stringsFromAny(item["knowledge_holders"])) > 0 ||
+			len(stringsFromAny(item["knowers"])) > 0 ||
+			len(sliceFromAny(item["listeners"])) > 0
+		explicitOwnerScoped := strings.TrimSpace(extractionFirstNonEmpty(
+			stringFromMap(item, "owner"), stringFromMap(item, "owner_entity_name"),
+		)) != "" || (!hasTransferHolder && strings.TrimSpace(stringFromMap(item, "perspective_owner")) != "")
+		memoryText := extractionFirstNonEmpty(evidence, claim)
+		if explicitOwnerScoped {
+			memoryText = claim
+		}
 		for _, holder := range perspectiveMemoryHolderProposals(item, state, true) {
 			ownerName := strings.TrimSpace(holder.surface)
 			if ownerName == "" {
@@ -173,9 +184,17 @@ func appendBeliefUpdateSubjectiveMemories(subjective []any, beliefUpdates any) [
 			}
 			derived := normalizeSubjectiveEntityMemories([]any{map[string]any{
 				"owner_entity_name": ownerName,
-				"memory_text":       extractionFirstNonEmpty(evidence, claim),
+				"memory_text":       memoryText,
 				"evidence_excerpt":  evidence,
-				"tags":              []any{"belief_fact_transfer", "source_grounded_recollection"},
+				"importance_10": extractionFloatFromAny(
+					item["importance_10"],
+					extractionFloatFromAny(item["importance_score"], 5),
+				),
+				"emotional_weight": extractionFloatFromAny(
+					item["emotional_weight"],
+					extractionFloatFromAny(item["emotional_intensity"], 0.5),
+				),
+				"tags": []any{"belief_fact_transfer", "source_grounded_recollection"},
 			}})
 			if len(derived) == 0 {
 				continue
@@ -822,6 +841,25 @@ func (s *Server) canonicalSubjectiveEntityOwner(ctx context.Context, sid, rawKey
 	if proposed != "" {
 		canonicalName = strings.TrimSpace(s.canonicalCharacterName(ctx, sid, proposed))
 	}
+	return subjectiveEntityOwnerCanonicalFromName(rawKey, rawName, canonicalName)
+}
+
+func subjectiveEntityOwnerCanonicalFromReadMap(rawKey, rawName string, canonicalBySurface map[string]string) subjectiveEntityOwnerCanonical {
+	rawKey = strings.TrimSpace(rawKey)
+	rawName = strings.TrimSpace(rawName)
+	proposed := strings.TrimSpace(firstNonEmpty(rawName, rawKey))
+	canonicalName := proposed
+	if resolved := strings.TrimSpace(canonicalBySurface[comparableEntityKey(proposed)]); resolved != "" {
+		canonicalName = resolved
+	}
+	return subjectiveEntityOwnerCanonicalFromName(rawKey, rawName, canonicalName)
+}
+
+func subjectiveEntityOwnerCanonicalFromName(rawKey, rawName, canonicalName string) subjectiveEntityOwnerCanonical {
+	rawKey = strings.TrimSpace(rawKey)
+	rawName = strings.TrimSpace(rawName)
+	proposed := strings.TrimSpace(firstNonEmpty(rawName, rawKey))
+	canonicalName = strings.TrimSpace(canonicalName)
 	if canonicalName == "" {
 		canonicalName = proposed
 	}
@@ -867,11 +905,15 @@ func (s *Server) canonicalSubjectiveEntityOwner(ctx context.Context, sid, rawKey
 	return out
 }
 
-func (s *Server) canonicalizeSubjectiveEntityMemoryForRead(ctx context.Context, sid string, memory store.ProtagonistEntityMemory) store.ProtagonistEntityMemory {
+func canonicalizeSubjectiveEntityMemoryWithReadMap(memory store.ProtagonistEntityMemory, canonicalBySurface map[string]string) store.ProtagonistEntityMemory {
 	if subjectiveEntityMemoryHasAnyTag(memory, "entity_manual_owner_edit", "entity_force_merged") {
 		return memory
 	}
-	owner := s.canonicalSubjectiveEntityOwner(ctx, sid, firstNonEmpty(memory.OwnerEntityKey, memory.PersonaEntityKey), firstNonEmpty(memory.OwnerEntityName, memory.PersonaEntityName))
+	owner := subjectiveEntityOwnerCanonicalFromReadMap(
+		firstNonEmpty(memory.OwnerEntityKey, memory.PersonaEntityKey),
+		firstNonEmpty(memory.OwnerEntityName, memory.PersonaEntityName),
+		canonicalBySurface,
+	)
 	if owner.Key == "" {
 		return memory
 	}
@@ -888,9 +930,13 @@ func (s *Server) canonicalizeSubjectiveEntityMemoryForRead(ctx context.Context, 
 }
 
 func (s *Server) canonicalizeSubjectiveEntityMemoriesForRead(ctx context.Context, sid string, memories []store.ProtagonistEntityMemory) []store.ProtagonistEntityMemory {
+	return canonicalizeSubjectiveEntityMemoriesWithReadMap(memories, s.characterCanonicalSurfaceMapForRead(ctx, sid))
+}
+
+func canonicalizeSubjectiveEntityMemoriesWithReadMap(memories []store.ProtagonistEntityMemory, canonicalBySurface map[string]string) []store.ProtagonistEntityMemory {
 	out := make([]store.ProtagonistEntityMemory, 0, len(memories))
 	for _, memory := range memories {
-		out = append(out, s.canonicalizeSubjectiveEntityMemoryForRead(ctx, sid, memory))
+		out = append(out, canonicalizeSubjectiveEntityMemoryWithReadMap(memory, canonicalBySurface))
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].SourceTurn != out[j].SourceTurn {
@@ -977,7 +1023,13 @@ func (s *Server) saveSubjectiveEntityMemoriesFromExtraction(ctx context.Context,
 	if result == nil {
 		return
 	}
-	items := sliceFromAny(extraction["subjective_entity_memories"])
+	// Fresh Critic results already derive belief-scoped memories during
+	// normalization. Committed replay intentionally does not rewrite its stored
+	// result JSON or hash, so derive the same local projection here as well.
+	items := appendBeliefUpdateSubjectiveMemories(
+		sliceFromAny(extraction["subjective_entity_memories"]),
+		extraction["belief_updates"],
+	)
 	if len(items) == 0 {
 		return
 	}

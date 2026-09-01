@@ -880,8 +880,8 @@ func enqueueAdmissionVectorOperation(
 	if err := exec.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM memory_vector_outbox
-		WHERE document_id = ? AND id > ?
-	`, documentID, outboxID).Scan(&newer); err != nil {
+		WHERE chat_session_id = ? AND document_id = ? AND id > ?
+	`, sid, documentID, outboxID).Scan(&newer); err != nil {
 		return false, err
 	}
 	if newer > 0 {
@@ -1020,11 +1020,12 @@ func enqueueAdmissionVectorDeleteTx(
 ) (bool, error) {
 	item := &MemoryVectorOutboxItem{
 		ContractVersion:     MemoryVectorOutboxContract,
-		OperationKey:        memoryAdmissionVectorOperationKey("delete:"+reason, admission, documentID),
+		OperationKey:        memoryAdmissionVectorOperationKey("delete:"+requiredSourceState, admission, documentID),
 		Operation:           "delete",
 		ChatSessionID:       admission.ChatSessionID,
 		SourceRevision:      admission.SourceRevision,
 		DocumentID:          documentID,
+		DocumentJSON:        memoryVectorDeleteAuditJSON(reason),
 		EmbeddingReady:      true,
 		RequiredSourceState: requiredSourceState,
 		Status:              "pending",
@@ -1035,6 +1036,14 @@ func enqueueAdmissionVectorDeleteTx(
 }
 
 func memoryAdmissionVectorOperationKey(operation string, admission *MemoryAdmission, documentID string) string {
+	if strings.HasPrefix(strings.TrimSpace(operation), "delete") {
+		return memoryVectorOperationKey(
+			operation,
+			admission.ChatSessionID,
+			admission.SourceRevision,
+			documentID,
+		)
+	}
 	return memoryVectorOperationKey(
 		operation,
 		admission.ChatSessionID,

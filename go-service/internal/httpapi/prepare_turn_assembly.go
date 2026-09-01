@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	archivebridge "github.com/risulongmemory/archive-center-go/internal/archive"
@@ -272,8 +273,8 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 			kgClosedDropped++
 			continue
 		}
-		line := strings.TrimSpace(fmt.Sprintf("%s --%s--> %s", t.Subject, t.Predicate, t.Object))
-		if line == "-->" {
+		relation := strings.TrimSpace(fmt.Sprintf("%s --%s--> %s", t.Subject, t.Predicate, t.Object))
+		if relation == "-->" {
 			continue
 		}
 		eligible, reason := prepareTurnKGRecallEligible(relationshipQuery, t)
@@ -284,13 +285,28 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 			}
 			continue
 		}
-		kgLines = append(kgLines, line)
+		sourceTurn := "unrecorded"
+		if t.SourceTurn > 0 {
+			sourceTurn = strconv.Itoa(t.SourceTurn)
+		}
+		validFrom := "unrecorded"
+		if t.ValidFrom > 0 {
+			validFrom = strconv.Itoa(t.ValidFrom)
+		}
+		validTo := "end_unrecorded"
+		if t.ValidTo > 0 {
+			validTo = strconv.Itoa(t.ValidTo)
+		}
+		kgLines = append(kgLines, fmt.Sprintf(
+			"- [source_turn=%s; valid=%s..%s] %s",
+			sourceTurn, validFrom, validTo, relation,
+		))
 	}
-	out.KGText = makePrepareTurnSection("[Knowledge Graph]", kgLines)
+	out.KGText = makePrepareTurnSection("[Knowledge Graph Support History; context only, not current-state authority; end_unrecorded means no closing turn recorded]", kgLines)
 
 	directEvidenceLines := make([]string, 0, len(artifactHydration.Evidence))
 	for _, ev := range artifactHydration.Evidence {
-		text := compactPrepareTurnLine(ev.EvidenceText, 320)
+		text := compactPrepareTurnLine(ev.EvidenceText, 0)
 		if text == "" {
 			continue
 		}
@@ -320,7 +336,7 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 		if desc == "" {
 			desc = strings.TrimSpace(sl.Name)
 		}
-		desc = compactPrepareTurnLine(desc, 170)
+		desc = compactPrepareTurnLine(desc, 0)
 		if desc != "" {
 			if !prepareTurnRequestFirstRelevant(rawSupportQuery, goalQuery, desc) {
 				storylineIrrelevantDropped++
@@ -421,7 +437,6 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 		if value := prepareTurnSurfaceText(parseSurfacePayload(wr.ValueJSON)); value != "" {
 			desc = strings.TrimSpace(desc + ": " + value)
 		}
-		desc = compactPrepareTurnLine(desc, 180)
 		if desc != "" {
 			worldAnchors := []string{wr.ScopeName, wr.Key}
 			scope := strings.ToLower(strings.TrimSpace(wr.Scope))
@@ -603,22 +618,32 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 
 	pendingLines := make([]string, 0, minInt(len(pendingThreads), recallLimit))
 	pendingIrrelevantDropped := 0
+	pendingPinnedActiveSelected := 0
+	pendingSuppressedDropped := 0
 	for _, pt := range pendingThreads {
 		if len(pendingLines) >= recallLimit {
 			break
 		}
+		if pt.Suppressed {
+			pendingSuppressedDropped++
+			continue
+		}
 		rawDescription := strings.TrimSpace(pt.Description)
-		desc := compactPrepareTurnLine(rawDescription, 170)
+		desc := compactPrepareTurnLine(rawDescription, 0)
 		status := strings.TrimSpace(pt.Status)
 		if status != "" && desc != "" {
-			desc = compactPrepareTurnLine("status="+status+"; "+desc, 190)
+			desc = compactPrepareTurnLine("status="+status+"; "+desc, 0)
 		}
 		if desc != "" {
-			if !prepareTurnRequestFirstRelevant(rawSupportQuery, goalQuery, desc) {
+			pinnedActive := pt.Pinned && strings.EqualFold(status, "open")
+			if !pinnedActive && !prepareTurnRequestFirstRelevant(rawSupportQuery, goalQuery, desc) {
 				pendingIrrelevantDropped++
 				continue
 			}
 			pendingLines = append(pendingLines, "- "+desc)
+			if pinnedActive {
+				pendingPinnedActiveSelected++
+			}
 		}
 	}
 	out.PendingThreadText = makePrepareTurnSection("[Pending Threads]", pendingLines)
@@ -629,12 +654,12 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 		if len(episodeLines) >= recallLimit {
 			break
 		}
-		summary := compactPrepareTurnLine(es.SummaryText, 180)
+		summary := compactPrepareTurnLine(es.SummaryText, 0)
 		if summary == "" {
 			summary = fmt.Sprintf("Episode %d-%d", es.FromTurn, es.ToTurn)
 		}
-		if anchors := episodeDenseAnchorPreview(es, summary, 260); anchors != "" {
-			summary = compactPrepareTurnLine(summary+"; "+anchors, 360)
+		if anchors := episodeDenseAnchorPreview(es, summary, 0); anchors != "" {
+			summary = compactPrepareTurnLine(summary+"; "+anchors, 0)
 		}
 		if !prepareTurnSupportRecallEligible(memoryQuery, summary) {
 			episodeIrrelevantDropped++
@@ -651,7 +676,7 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 	out.CharacterPrivateText = buildCharacterPrivateRecollectionText(characterPrivateMemories, maxChars)
 
 	if latest := latestPrepareTurnEvidence(evidence); latest != nil {
-		out.LatestDirectEvidenceText = compactPrepareTurnLine(latest.EvidenceText, 260)
+		out.LatestDirectEvidenceText = compactPrepareTurnLine(latest.EvidenceText, 0)
 	}
 	out.RecentRawTurnText = recentPrepareTurnRawTurn(chatLogs)
 	out.ScopedVerbatimSupport = archivebridge.BuildScopedVerbatimSupport(evidence)
@@ -738,7 +763,7 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 					return
 				}
 				encoded, _ := json.Marshal(subset)
-				text := compactPrepareTurnLine(string(encoded), 320)
+				text := compactPrepareTurnLine(string(encoded), 0)
 				if text == "" || !prepareTurnRequestFirstRelevant(rawQuery, fallbackQuery, text) {
 					return
 				}
@@ -972,6 +997,8 @@ func buildPrepareTurnInjectionAssemblyWithBudget(memories []store.Memory, kgTrip
 	out.Counts["typed_voice_projection_deferred_to_3_9_e"] = typedVoiceProjectionDeferred
 	out.Counts["character_memory_delivery"] = out.CharacterMemorySupport
 	out.Counts["pending_thread_irrelevant_dropped"] = pendingIrrelevantDropped
+	out.Counts["pending_thread_pinned_active_selected"] = pendingPinnedActiveSelected
+	out.Counts["pending_thread_suppressed_dropped"] = pendingSuppressedDropped
 	out.Counts["episode_irrelevant_dropped"] = episodeIrrelevantDropped
 	out.Counts["direct_evidence_bound"] = len(directEvidenceLines)
 
@@ -1675,17 +1702,21 @@ func prunePrepareTurnEmptySurface(value any) (any, bool) {
 
 func episodeDenseAnchorPreview(es store.EpisodeSummary, summary string, limit int) string {
 	parts := []string{}
-	if key := compactEpisodeJSONPreview(es.KeyEvents, 120); key != "" {
+	componentLimit := 120
+	if limit <= 0 {
+		componentLimit = 0
+	}
+	if key := compactEpisodeJSONPreview(es.KeyEvents, componentLimit); key != "" {
 		summaryKey := collapseTextKey(summary)
 		keyText := collapseTextKey(key)
 		if summaryKey == "" || keyText == "" || (summaryKey != keyText && !strings.Contains(summaryKey, keyText)) {
 			parts = append(parts, "key_event="+key)
 		}
 	}
-	if rel := compactEpisodeJSONPreview(es.RelationshipChangesJSON, 120); rel != "" {
+	if rel := compactEpisodeJSONPreview(es.RelationshipChangesJSON, componentLimit); rel != "" {
 		parts = append(parts, "rel="+rel)
 	}
-	if loop := compactEpisodeJSONPreview(es.OpenLoopsJSON, 120); loop != "" {
+	if loop := compactEpisodeJSONPreview(es.OpenLoopsJSON, componentLimit); loop != "" {
 		parts = append(parts, "open_loop="+loop)
 	}
 	return compactPrepareTurnLine(strings.Join(parts, "; "), limit)
