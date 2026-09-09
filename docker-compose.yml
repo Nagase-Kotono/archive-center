@@ -62,7 +62,9 @@ services:
   # 스키마 마이그레이션 (일회성 실행 후 종료).
   # 3.6부터 003~ 마이그레이션은 initdb.d가 아니라 mariadb-schema 도구로만 적용돼요.
   # initdb.d는 빈 볼륨 최초 1회뿐이라 기존 DB는 여기를 거쳐야 스키마가 올라가요.
-  # 구문이 전부 rerunnable(ADD COLUMN IF NOT EXISTS 류)이라 매 기동마다 돌아도 안전해요.
+  # 구문이 전부 rerunnable(ADD COLUMN IF NOT EXISTS, MODIFY 류)이라 매 기동마다 돌아도 안전해요.
+  # 다만 013의 MODIFY는 결과가 같아도 테이블을 재구축하니, precise_memory_units 가
+  # 크게 늘면 기동 지연으로 나타날 수 있어요 (2026-09 기준 2천 행이라 체감 없음).
   # 이미지는 ac-go가 빌드한 것을 그대로 재사용해요 (build 정의는 ac-go 쪽에만 둠).
   ac-schema:
     image: archive-center-kotono:local
@@ -91,7 +93,7 @@ services:
     restart: unless-stopped
     network_mode: "container:pocketrisu-ts"   # 리수와 같은 namespace → 프록시 127.0.0.1:28080 도달
     environment:
-      AC_BUILD_VERSION: "4.0.9"
+      AC_BUILD_VERSION: "4.3.0"
       # namespace loopback 에만 바인드 (외부 노출 없음, 리수 프록시만 접근).
       AC_BIND_ADDR: "127.0.0.1:28080"
       # live + mariadb_authority = 실제 영속 저장. 같은 namespace라 DB/Chroma도 127.0.0.1.

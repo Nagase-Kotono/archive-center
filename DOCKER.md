@@ -119,6 +119,7 @@ docker exec ac-mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N \
 - 3.9.9 → 3.9.11: 새 마이그레이션 없음 (`ac-schema` 재실행은 멱등적이라 그대로 통과)
 - 3.9.11 → 4.0.0: `010`~`012` 자동 적용 (lorebook 참조 스냅샷 테이블, `session_fork_lineage` 컬럼 추가)
 - 4.0.0 → 4.0.9: 새 마이그레이션 SQL 없음 (세션 마이그레이션 검증 로직만 바뀌어서 `ac-schema` 재실행으로 통과)
+- 4.0.9 → 4.3.0: `013_precise_memory_text_fields.sql` 자동 적용 (`precise_memory_units` 의 `memory_subtype`·`relationship_key`·`reveal_condition` 을 `VARCHAR` 에서 `LONGTEXT` 로 확장)
 
 ## 데이터 / 백업
 
