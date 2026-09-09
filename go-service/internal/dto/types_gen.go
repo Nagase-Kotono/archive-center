@@ -1020,10 +1020,16 @@ type PrepareTurnSettings struct {
 	// PRESENCE: Optional non-null scalar int: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
 	// DEFAULT: Optional field with default (18000): Go handler must apply default when field is absent in request.
 	MaxInjectionChars *int `json:"max_injection_chars,omitempty"`
+	// MemoryTransportMode selects the representation of the already-selected long-term-memory lane.
+	// DEFAULT: text preserves the existing payload path.
+	MemoryTransportMode *string `json:"memory_transport_mode,omitempty"`
 	// MemoryDeliveryBudgetMode selects automatic profile budgets or user-supplied per-class reservations.
 	MemoryDeliveryBudgetMode *string `json:"memory_delivery_budget_mode,omitempty"`
 	// MemoryDeliveryBudgets carries character reservations for the seven Go-owned delivery classes.
 	MemoryDeliveryBudgets map[string]int `json:"memory_delivery_budgets,omitempty"`
+	// TurnFinalizationMode selects immediate persistence or previous-turn persistence at the next user input.
+	// DEFAULT: immediate_after_response preserves the 4.1 lifecycle.
+	TurnFinalizationMode *string `json:"turn_finalization_mode,omitempty"`
 	// LorebookReferenceMode controls the separate read-only Host lorebook reference lane.
 	// Missing values default to reference_assist; the lorebook remains bounded support, not primary memory authority.
 	LorebookReferenceMode *string `json:"lorebook_reference_mode,omitempty"`
@@ -1032,6 +1038,7 @@ type PrepareTurnSettings struct {
 	LorebookReferenceMaxChars *int `json:"lorebook_reference_max_chars,omitempty"`
 	// PRESENCE: Optional non-null scalar int controlling only the final objective-event memory item ceiling.
 	// DEFAULT: No default: absent callers preserve the legacy character-budget-only delivery behavior.
+	// Legacy wire key: per-group core priority target; remaining facts use the character budget.
 	CoreObjectiveMemoryMaxItems *int `json:"core_objective_memory_max_items,omitempty"`
 	// PRESENCE: Optional non-null scalar int carrying the independent original-work reference cap.
 	// DEFAULT: Optional field with default (3000): Go handler must apply default when field is absent in request.
@@ -1057,6 +1064,9 @@ type PrepareTurnSettings struct {
 	// PRESENCE: Optional non-null scalar string: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
 	// DEFAULT: Optional field with default ("off"): Go handler must apply default when field is absent in request.
 	TakeoverMode *string `json:"takeover_mode,omitempty"`
+	// PRESENCE: Optional non-null scalar int: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
+	// DEFAULT: Optional field with default (5): Go handler must apply default when field is absent in request.
+	RecentConversationReferenceCount *int `json:"recent_conversation_reference_count,omitempty"`
 	// PRESENCE: Optional non-null scalar int: absent vs zero-value distinction requires pointer type or custom decode logic when zero is semantically meaningful.
 	// DEFAULT: Optional field with default (5): Go handler must apply default when field is absent in request.
 	TopK *int `json:"top_k,omitempty"`
@@ -1092,6 +1102,14 @@ func (dto *PrepareTurnSettings) ApplyDefaults() {
 		v := 18000
 		dto.MaxInjectionChars = &v
 	}
+	if dto.MemoryTransportMode == nil {
+		v := "text"
+		dto.MemoryTransportMode = &v
+	}
+	if dto.TurnFinalizationMode == nil {
+		v := "immediate_after_response"
+		dto.TurnFinalizationMode = &v
+	}
 	if dto.LorebookReferenceMode == nil {
 		v := "reference_assist"
 		dto.LorebookReferenceMode = &v
@@ -1119,6 +1137,10 @@ func (dto *PrepareTurnSettings) ApplyDefaults() {
 	if dto.TakeoverMode == nil {
 		v := "off"
 		dto.TakeoverMode = &v
+	}
+	if dto.RecentConversationReferenceCount == nil {
+		v := 5
+		dto.RecentConversationReferenceCount = &v
 	}
 	if dto.TopK == nil {
 		v := 5

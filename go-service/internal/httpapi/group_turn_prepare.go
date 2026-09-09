@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/risulongmemory/archive-center-go/internal/dto"
+	"github.com/risulongmemory/archive-center-go/internal/pdfmemory"
 	"github.com/risulongmemory/archive-center-go/internal/store"
 )
 
@@ -72,7 +74,11 @@ func resolvePrepareTurnHistoryScope(ctx context.Context, st store.Store, session
 		})
 		confirmedDepth++
 		cursor = strings.TrimSpace(worldline.ParentSessionID)
-		upperTurn = boundary
+		// A child can fork inside its parent's inherited prefix. Keep the
+		// earlier child's cut while walking through more distant ancestors.
+		if upperTurn == 0 || (upperTurn > 0 && boundary < upperTurn) {
+			upperTurn = boundary
+		}
 		if upperTurn == 0 {
 			upperTurn = -1
 		}
@@ -101,7 +107,15 @@ func appendPrepareTurnHistorySegment(segments []prepareTurnHistorySegment, segme
 }
 
 func prepareTurnHistorySegmentContains(segment prepareTurnHistorySegment, turn int) bool {
-	if segment.ToTurn < 0 || turn < segment.FromTurn {
+	if segment.ToTurn < 0 {
+		return false
+	}
+	// Negative turns are external memory imports, not positions in the RP
+	// message timeline. The segment still establishes their session scope.
+	if turn < 0 {
+		return true
+	}
+	if turn < segment.FromTurn {
 		return false
 	}
 	return segment.ToTurn <= 0 || turn <= segment.ToTurn
@@ -210,6 +224,31 @@ func listPrepareTurnHistoryChatLogs(ctx context.Context, reader store.Store, seg
 	return items, firstErr
 }
 
+func prepareTurnPreprocessingSearchTrace(shadow map[string]any) map[string]any {
+	trace := map[string]any{
+		"status": shadow["status"], "query_text_count": shadow["query_text_count"], "query_embedding_count": shadow["query_embedding_count"],
+		"search_skipped_reason": shadow["search_skipped_reason"], "memory_search_result": shadow["memory_search_result"], "search_result": shadow["search_result"],
+		"precise_search_result": shadow["precise_memory_search_result"], "precise_hydration": "unavailable",
+	}
+	if timings, ok := shadow["breakdown_ms"].(map[string]float64); ok {
+		copyTimings := make(map[string]float64, len(timings))
+		for key, elapsed := range timings {
+			copyTimings[key] = elapsed
+		}
+		trace["breakdown_ms"] = copyTimings
+	}
+	for _, key := range []string{"search_error", "memory_search_error", "precise_memory_search_error", "query_embedding_error", "health_error"} {
+		if detail := extractionStringFromAny(shadow[key]); detail != "" {
+			trace[key] = truncateRunes(scrubCriticFailureText(detail, ""), 500)
+		}
+	}
+	if shadow["precise_memory_search_result"] == "error" && shadow["memory_search_result"] == "ok" {
+		trace["status"] = "partial"
+		trace["reason_code"] = "precise_search_failed_memory_search_available"
+	}
+	return trace
+}
+
 func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	timing := newBackendTimingTrace("prepare_turn.backend_timing.v1")
 	decodeStartedAt := time.Now()
@@ -231,6 +270,8 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	sessionBootstrap := buildPrepareTurnSessionBootstrap(request, sid)
 	hostContextSnapshot := buildPrepareTurnRisuHostContextSnapshot(request, sid)
 	hostContextReferenceEvidence := buildPrepareTurnHostContextReferenceEvidence(hostContextSnapshot)
+	turnFinalizationMode := normalizePrepareTurnFinalizationMode(stringPtrValue(req.Settings.TurnFinalizationMode, prepareTurnFinalizationImmediate))
+	turnFinalizationPolicy := buildPrepareTurnFinalizationPolicy(turnFinalizationMode)
 	responseProjection := strings.TrimSpace(request.ResponseProjection)
 	if request.SourceDecisionOnly {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -263,6 +304,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			"session_bootstrap":               sessionBootstrap,
 			"risu_host_context_snapshot":      hostContextSnapshot,
 			"host_context_reference_evidence": hostContextReferenceEvidence,
+			"turn_finalization_policy":        turnFinalizationPolicy,
 			"recall_result": map[string]any{
 				"status": "not_applicable", "reason": currentInputDecision.ReasonCode,
 			},
@@ -330,13 +372,18 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			"session_bootstrap":               sessionBootstrap,
 			"risu_host_context_snapshot":      hostContextSnapshot,
 			"host_context_reference_evidence": hostContextReferenceEvidence,
+			"turn_finalization_policy":        turnFinalizationPolicy,
 		})
 		return
 	}
 	timing.addElapsed("migration_guard", migrationStartedAt)
 	workflowRequestID := prepareTurnWorkflowRequestID(prepareSourceContract, request)
 	if s.TurnWorkflows != nil && workflowRequestID != "" {
-		s.TurnWorkflows.begin(workflowRequestID, sid, intPtrValue(req.TurnIndex, 0))
+		if turnFinalizationMode == prepareTurnFinalizationNextInput {
+			s.TurnWorkflows.beginForNextInputFinalization(workflowRequestID, sid, intPtrValue(req.TurnIndex, 0))
+		} else {
+			s.TurnWorkflows.begin(workflowRequestID, sid, intPtrValue(req.TurnIndex, 0))
+		}
 		s.TurnWorkflows.setFact(workflowRequestID, turnWorkflowHUDFact{
 			Key:         "host_observation",
 			Owner:       "risu_host",
@@ -353,6 +400,10 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	// Resolve settings from the request/default DTO contract.
 	defaultSettings := dto.PrepareTurnSettings{}
 	defaultSettings.ApplyDefaults()
+	memoryTransportMode := normalizePrepareTurnMemoryTransportMode(stringPtrValue(
+		req.Settings.MemoryTransportMode,
+		stringPtrValue(defaultSettings.MemoryTransportMode, prepareTurnMemoryTransportModeText),
+	))
 	manualMaxInjectionChars := 0
 	if req.Settings.MaxInjectionChars != nil {
 		manualMaxInjectionChars = *req.Settings.MaxInjectionChars
@@ -406,12 +457,44 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	rawUserInput := stringPtrValue(req.RawUserInput, "")
 	turnIndex := intPtrValue(req.TurnIndex, 0)
+	priorityMemoryRequest := req
+	priorityMemoryRequest.Messages = request.RecentConversationMessages
+	recentConversationReferenceCount := prepareTurnRecentConversationReferenceLimit(req.Settings)
+	priorityMemoryRetrievalQueries := prepareTurnRetrievalQueries(priorityMemoryRequest, recentConversationReferenceCount)
+	priorityMemoryQuery, priorityMemoryQuerySource := prepareTurnEffectiveContinuityQuery(priorityMemoryRequest, recentConversationReferenceCount)
+	priorityMemoryQuerySet := make([]string, 0, len(priorityMemoryRetrievalQueries))
+	for _, query := range priorityMemoryRetrievalQueries {
+		priorityMemoryQuerySet = append(priorityMemoryQuerySet, query.Text)
+	}
 	languageContext := completeTurnLanguageContextFromClientMeta(req.ClientMeta)
 	perspectiveContext := prepareTurnPerspectiveContextFromRequest(req)
 	perspectiveContext = resolvePrepareTurnPerspectiveIdentity(r.Context(), s.Store, sid, perspectiveContext)
 	historyScope := resolvePrepareTurnHistoryScope(r.Context(), s.Store, sid, currentTurnFence)
+	priorityPreciseUnits := map[string][]store.PreciseMemoryUnit{}
+	priorityPreciseCandidateLimits := map[string]int{}
+	priorityPreciseCandidateTrace := map[string]any{
+		"contract_version": "prepare_turn.precise_fact_candidate_snapshot.v1",
+		"status":           "unavailable",
+		"reason":           "general_precise_memory_reader_unavailable",
+		"candidate_count":  0,
+		"session_count":    0,
+	}
+	if preciseReader, ok := s.Store.(store.GeneralVectorPreciseMemoryReader); ok {
+		priorityPreciseUnits, priorityPreciseCandidateLimits, priorityPreciseCandidateTrace = prepareTurnLoadGeneralPreciseMemoryUnits(
+			r.Context(),
+			preciseReader,
+			sid,
+			historyScope,
+		)
+	}
 	vectorStartedAt := time.Now()
-	vectorShadow := s.prepareTurnVectorShadow(r.Context(), req, memoryTopK, historyScope)
+	vectorShadow := s.prepareTurnVectorShadowWithPreciseCandidateLimits(
+		r.Context(),
+		priorityMemoryRequest,
+		memoryTopK,
+		priorityPreciseCandidateLimits,
+		historyScope,
+	)
 	timing.addElapsed("vector_recall", vectorStartedAt)
 	vectorMemoryIDs, vectorEvidenceIDs := prepareTurnVectorHistoryRowIDs(vectorShadow)
 
@@ -446,6 +529,12 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	var reversibleCurrentValues []store.StatusCurrentValue
 	var characterPerspectiveUnits []store.PreciseMemoryUnit
 	var activeInteractionUnits []store.PreciseMemoryUnit
+	var prioritySemanticFacts []prepareTurnPrioritySemanticFact
+	prioritySemanticTrace := map[string]any{
+		"contract_version": "prepare_turn.precise_fact_vector_hydration.v1",
+		"status":           "unavailable", "reason": "general_precise_memory_reader_unavailable",
+		"score_owner": "precise_memory_unit_vector_similarity",
+	}
 	characterMemoryReadContext := buildPrepareTurnCharacterMemoryReadContext(r.Context(), s.Store, sid)
 
 	readErrs := []error{}
@@ -474,6 +563,21 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	storeReadsStartedAt := time.Now()
 	if s.Store != nil {
 		ctx := r.Context()
+		if preciseReader, ok := s.Store.(store.GeneralVectorPreciseMemoryReader); ok {
+			prioritySemanticFacts, prioritySemanticTrace = prepareTurnHydratePreciseMemoryVectorFacts(
+				ctx,
+				preciseReader,
+				vectorShadow,
+				historyScope,
+				priorityPreciseUnits,
+			)
+			prioritySemanticTrace["candidate_snapshot"] = priorityPreciseCandidateTrace
+			if status := strings.TrimSpace(extractionStringFromAny(prioritySemanticTrace["status"])); status == "ready" || status == "partial" {
+				readsOK++
+				sessionStateReads["precise_memory_vector_facts"] = true
+			}
+		}
+		delete(vectorShadow, prepareTurnPrivatePreciseMemorySearchResultsKey)
 		if interactionReader, ok := s.Store.(store.ActiveInteractionMemoryReader); ok {
 			units, err := interactionReader.ListActiveInteractionMemoryUnits(ctx, sid)
 			if err == nil {
@@ -900,18 +1004,96 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		documents = buildUnifiedRetrievalDocuments(sid, safeRetrievalMemories, safeRetrievalEvidence, kgTriples, episodeSums, resumePack, nil)
 		if injectionEnabled && memoryInjectionBudget > 0 {
 			assemblyPerspectiveContext := prepareTurnPerspectiveWithNarrativeState(perspectiveContext, narrativeCurrentValues, activeStates)
+			priorityMemoryMaxItems := 5
+			if req.Settings.CoreObjectiveMemoryMaxItems != nil {
+				priorityMemoryMaxItems = *req.Settings.CoreObjectiveMemoryMaxItems
+			}
+			assemblyPerspectiveContext["_priority_memory_enabled"] = true
+			assemblyPerspectiveContext["_priority_memory_max_items"] = priorityMemoryMaxItems
 			assemblyPerspectiveContext["_character_perspective_text"] = characterPerspectiveCandidateText
+			assemblyPerspectiveContext["_character_perspective_fact_seeds"] = characterPerspectivePacket["_character_perspective_fact_seeds"]
 			assemblyPerspectiveContext["_character_perspective_candidate_count"] = intFromAny(characterPerspectivePacket["candidate_count"], 0)
 			assemblyPerspectiveContext["_active_interaction_public_text"] = activeInteractionPublicCandidateText
 			assemblyPerspectiveContext["_active_interaction_guarded_text"] = activeInteractionGuardedCandidateText
 			assemblyPerspectiveContext["_active_interaction_candidate_count"] = intFromAny(activeInteractionPacket["candidate_count"], 0)
 			assemblyPerspectiveContext[prepareTurnCharacterMemoryContextKey] = characterMemoryReadContext
 			assemblyPerspectiveContext[prepareTurnEntityIdentityAliasesContextKey] = entityIdentityAliases
+			assemblyPerspectiveContext["_priority_memory_query"] = priorityMemoryQuery
+			assemblyPerspectiveContext["_priority_memory_query_source"] = priorityMemoryQuerySource
+			assemblyPerspectiveContext[prepareTurnPriorityQuerySetContextKey] = priorityMemoryQuerySet
+			assemblyPerspectiveContext["_priority_memory_current_turn"] = maxInt(turnIndex, currentTurnFence)
+			assemblyPerspectiveContext[prepareTurnPrioritySemanticFactsContextKey] = prioritySemanticFacts
+			assemblyPerspectiveContext["_priority_precise_vector_trace"] = prioritySemanticTrace
 			if req.Settings.CoreObjectiveMemoryMaxItems != nil {
 				assemblyPerspectiveContext["_core_objective_memory_max_items_present"] = true
 				assemblyPerspectiveContext["_core_objective_memory_max_items"] = *req.Settings.CoreObjectiveMemoryMaxItems
 			}
 			injectionAssembly = buildPrepareTurnInjectionAssemblyWithBudget(memories, kgTriples, evidence, chatLogs, selectedStorylines, worldRules, charStates, pendingThreads, canonicalLayers, episodeSums, resumePack, personaEntries, characterPrivateMemories, memoryTopK, memoryInjectionBudget, rawUserInput, profile, documents, vectorShadow, languageContext, stringPtrValue(req.Settings.MemoryDeliveryBudgetMode, "auto"), req.Settings.MemoryDeliveryBudgets, assemblyPerspectiveContext)
+			multiConfig, multiConfigErr := s.loadMultiAgentSettings()
+			if multiConfigErr != nil {
+				injectionAssembly.MemoryDeliveryPlan["preprocessing_config_error"] = multiConfigErr.Error()
+			} else if multiConfig.Enabled {
+				facts, summaries := multiAgentCandidatePool(&injectionAssembly, assemblyPerspectiveContext)
+				laneCaps, _ := prepareTurnPriorityDeliveryCaps(memoryInjectionBudget, stringPtrValue(req.Settings.MemoryDeliveryBudgetMode, "auto"), req.Settings.MemoryDeliveryBudgets)
+				// Retrieval overlaps; candidate assembly retains its existing shared-input
+				// ownership inside this request, without a service-wide lock.
+				var searchAssemblyMu sync.Mutex
+				selection := s.runMultiAgent(context.WithValue(r.Context(), multiAgentHUDRequestKey{}, workflowRequestID), multiConfig, priorityMemoryRequest, facts, summaries, memoryInjectionBudget, priorityMemoryMaxItems, laneCaps, func(question string) ([]prepareTurnPriorityMemoryCandidate, []prepareTurnPriorityTurnSummaryCandidate, map[string]any) {
+					searchReq := req
+					searchReq.RawUserInput, searchReq.ContinuityQuery, searchReq.Messages = &question, &question, nil
+					searchReq.ClientMeta = map[string]any{}
+					for key, value := range req.ClientMeta {
+						if key != "chroma_query_vector" {
+							searchReq.ClientMeta[key] = value
+						}
+					}
+					shadow := s.prepareTurnVectorShadowWithPreciseCandidateLimits(r.Context(), searchReq, memoryTopK, priorityPreciseCandidateLimits, historyScope)
+					assemblyWaitStarted := time.Now()
+					searchAssemblyMu.Lock()
+					defer searchAssemblyMu.Unlock()
+					assemblyWaitMS := durationMilliseconds(time.Since(assemblyWaitStarted))
+					searchPerspective := map[string]any{}
+					for key, value := range assemblyPerspectiveContext {
+						searchPerspective[key] = value
+					}
+					trace := prepareTurnPreprocessingSearchTrace(shadow)
+					breakdown := trace["breakdown_ms"].(map[string]float64)
+					breakdown["assembly_wait"] = assemblyWaitMS
+					hydrationStarted := time.Now()
+					if reader, ok := s.Store.(store.GeneralVectorPreciseMemoryReader); ok {
+						additional, hydration := prepareTurnHydratePreciseMemoryVectorFacts(r.Context(), reader, shadow, historyScope, priorityPreciseUnits)
+						searchPerspective[prepareTurnPrioritySemanticFactsContextKey] = append(append([]prepareTurnPrioritySemanticFact{}, prioritySemanticFacts...), additional...)
+						trace["precise_hydration"] = hydration["status"]
+					}
+					breakdown["hydration"] = durationMilliseconds(time.Since(hydrationStarted))
+					delete(shadow, prepareTurnPrivatePreciseMemorySearchResultsKey)
+					assemblyStarted := time.Now()
+					searched := buildPrepareTurnInjectionAssemblyWithBudget(memories, kgTriples, evidence, chatLogs, selectedStorylines, worldRules, charStates, pendingThreads, canonicalLayers, episodeSums, resumePack, personaEntries, characterPrivateMemories, memoryTopK, memoryInjectionBudget, rawUserInput, profile, documents, shadow, languageContext, stringPtrValue(req.Settings.MemoryDeliveryBudgetMode, "auto"), req.Settings.MemoryDeliveryBudgets, searchPerspective)
+					found, sums := multiAgentCandidatePool(&searched, searchPerspective)
+					breakdown["assembly"] = durationMilliseconds(time.Since(assemblyStarted))
+					trace["candidate_count"] = len(found)
+					return found, sums, trace
+				}, map[string]any{
+					"perspective": injectionAssembly.PerspectiveContext, "protected_memory_guidance": injectionAssembly.ProtectedMemoryText,
+					"lorebook_candidates": prepareTurnLorebookPreprocessingCandidates(lorebookReference), "lorebook_budget_chars": lorebookReferenceMaxChars,
+				})
+				if len(selection.Searches) > 0 {
+					timing.addMilliseconds("preprocessing_search", selection.SearchDurationMS)
+				}
+				lorebookReference.preprocessingRefs = selection.LorebookRefs
+				selection.CandidateSources = map[string]any{
+					"pending_threads_materialized": len(pendingThreads), "pending_threads_read_failed": pendingThreadReadErr != nil,
+					"storylines_materialized": len(storylines), "storylines_selected_for_assembly": len(selectedStorylines),
+					"pending_thread_irrelevant_dropped": injectionAssembly.Counts["pending_thread_irrelevant_dropped"],
+					"pending_thread_suppressed_dropped": injectionAssembly.Counts["pending_thread_suppressed_dropped"],
+					"storyline_irrelevant_dropped":      injectionAssembly.Counts["storyline_irrelevant_dropped"],
+				}
+				selection.captureBaseline(injectionAssembly.MemoryDeliveryPlan)
+				injectionAssembly.Preprocessing = selection
+				injectionAssembly.MemoryDeliveryPlan = buildPrepareTurnPriorityMemoryDeliveryPlan(&injectionAssembly, memoryInjectionBudget, priorityMemoryMaxItems, stringPtrValue(req.Settings.MemoryDeliveryBudgetMode, "auto"), req.Settings.MemoryDeliveryBudgets, assemblyPerspectiveContext)
+				injectionAssembly.MemoryDeliveryLineage = finalizePrepareTurnMemoryDeliveryLineage(injectionAssembly.MemoryDeliveryLineage, injectionAssembly.MemoryDeliveryPlan)
+				injectionAssembly.CharacterMemorySupport = finalizePrepareTurnCharacterMemorySupport(injectionAssembly.CharacterMemorySupport, injectionAssembly.MemoryDeliveryPlan)
+			}
 		}
 	}
 	methods := mapFromAny(injectionAssembly.Counts["retrieval_methods"])
@@ -1240,6 +1422,12 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	responseExecutionContract := buildResponseExecutionContractWithMemoryLineage(sid, inputAnchorGovernor, selectedStorylines, pendingThreads, activeStates, canonicalLayers, worldRules, injectionAssembly, languageContext, currentInputDecision, hostContextReferenceEvidence, inputContextText)
 	supervisorSupportPacket := buildSupervisorSupportPacket(sid, rawUserInput, responseExecutionContract, injectionAssembly.MemoryDeliveryLineage, inputContextText, injectionAssembly.CharacterMemorySupport, injectionAssembly.MemoryDeliveryPlan)
 	attachPrepareTurnLorebookPublisherSupport(responseExecutionContract, supervisorSupportPacket, &lorebookReference)
+	preprocessingNotes := buildPrepareTurnPreprocessingNotes(injectionAssembly.Preprocessing, injectionAssembly.MemoryDeliveryPlan, &lorebookReference)
+	if preprocessingNotes != nil {
+		injectionAssembly.MemoryDeliveryPlan["preprocessing_notes"] = preprocessingNotes
+		supervisorSupportPacket["delivered_preprocessing_notes"] = preprocessingNotes["items"]
+		supervisorSupportPacket["preprocessing_source_catalog"] = preprocessingNotes["source_catalog"]
+	}
 	guideEligibility := buildPrepareTurnGuideEligibility(guideMode, guideStrength, injectionEnabled, narrativeSupportMaxChars, responseExecutionContract)
 	responseExecutionContract["guide_eligibility"] = guideEligibility
 	supervisorInputPack["guide_eligibility"] = guideEligibility
@@ -1321,7 +1509,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 						proposalStatus,
 					)
 					if s.TurnWorkflows != nil && workflowRequestID != "" {
-						s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "succeeded", supervisorCallReason)
+						s.TurnWorkflows.finishStage(workflowRequestID, turnWorkflowStagePublisherLLM, "failed", supervisorCallReason)
 						s.TurnWorkflows.addWarning(workflowRequestID, "PUBLISHER_LLM_MALFORMED_FAILED_OPEN", "turn_hud.warning.publisher_llm_malformed_failed_open", turnWorkflowStagePublisherLLM)
 					}
 				case "valid_empty":
@@ -1401,6 +1589,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		effectiveNarrativeSupportMaxChars,
 		guidanceItems,
 		supervisorCallStatus,
+		preprocessingNotes,
 	)
 	if lorebookReference.Mode == prepareTurnLorebookModeReferenceAssist {
 		attachPrepareTurnLorebookReferenceLane(
@@ -1441,6 +1630,11 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			),
 			"lorebook_reference": prepareTurnLorebookPayloadBudgetStats(lorebookReference),
 			"output_guidance":    prepareTurnGuidancePayloadBudgetStats(payloadApplicationPlan),
+			"preprocessing_notes": {
+				CandidateCount: intFromAny(preprocessingNotes["count"], 0), CandidateChars: intFromAny(preprocessingNotes["used_chars"], 0),
+				SelectedCount: intFromAny(preprocessingNotes["count"], 0), SelectedChars: intFromAny(preprocessingNotes["used_chars"], 0),
+				FinalCount: intFromAny(preprocessingNotes["count"], 0), EffectiveCap: intFromAny(preprocessingNotes["used_chars"], 0),
+			},
 		},
 	)
 	payloadApplicationPlan["recomposer_enhancement_contract"] = buildPrepareTurnRecomposerEnhancementContract(
@@ -1455,6 +1649,12 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(requestCorrelationID) == "" {
 		requestCorrelationID = extractionStringFromAny(req.ClientMeta["archive_center_request_correlation_id"])
 	}
+	memoryTransportPlan, memoryTransportPayload := buildPrepareTurnMemoryTransport(
+		memoryTransportMode,
+		payloadApplicationPlan,
+		requestCorrelationID,
+		pdfmemory.Generate,
+	)
 	memoryRecallBindings := map[string]any{
 		"chat_session_id": sid,
 	}
@@ -1474,10 +1674,20 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		responseExecutionContract,
 		boundedMemoryDeliveryLineage,
 	)
+	memoryInjectionBaseline := buildMemoryInjectionBaseline41(
+		sid, requestCorrelationID, rawUserInput,
+		memories, evidence, kgTriples, worldRules, charStates, activeStates, canonicalLayers,
+		personaEntries, characterPrivateMemories, storylines, pendingThreads, episodeSums, chatLogs,
+		reversibleStateText, injectionAssembly, boundedMemoryDeliveryLineage,
+	)
+	sourceToPayloadLineage["memory_injection_baseline_id"] = memoryInjectionBaseline["baseline_id"]
+	sourceToPayloadLineage["memory_injection_baseline"] = memoryInjectionBaseline
 	injectionPack["payload_application_plan"] = payloadApplicationPlan
 	injectionPack["memory_recall_plan"] = memoryRecallPlan
 	injectionPack["memory_delivery_lineage"] = boundedMemoryDeliveryLineage
 	injectionPack["source_to_payload_lineage"] = sourceToPayloadLineage
+	injectionPack["memory_injection_baseline"] = memoryInjectionBaseline
+	injectionPack["memory_transport_plan"] = memoryTransportPlan
 	injectionPack["memory_budget_resolution"] = memoryBudgetResolution
 	injectionPack["lorebook_reference_recall"] = lorebookReference
 	injectionText = extractionStringFromAny(payloadApplicationPlan["auxiliary_text"])
@@ -1538,12 +1748,20 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	helperBudgetGovernorTrace := buildHelperBudgetGovernorTrace(injectionAssembly, maxInjectionChars)
 
 	tracePreview := map[string]any{
-		"source":              "go_r1_read_shadow",
-		"would_call_llm":      false,
-		"would_write":         false,
-		"prompt_source":       promptAssembly["prompt_source"],
-		"evidence_counts":     evidenceCounts,
-		"section_summary":     sectionSummary,
+		"source":          "go_r1_read_shadow",
+		"would_call_llm":  false,
+		"would_write":     false,
+		"prompt_source":   promptAssembly["prompt_source"],
+		"evidence_counts": evidenceCounts,
+		"section_summary": sectionSummary,
+		"vector_recall_query": map[string]any{
+			"query_text_source":                   stringFromMap(vectorShadow, "query_text_source"),
+			"query_text_count":                    intFromAny(vectorShadow["query_text_count"], 0),
+			"recent_conversation_query_limit":     intFromAny(vectorShadow["recent_conversation_query_limit"], 0),
+			"recent_conversation_query_count":     intFromAny(vectorShadow["recent_conversation_query_count"], 0),
+			"query_vector_count":                  intFromAny(vectorShadow["query_vector_count"], 0),
+			"query_history_embedding_error_count": intFromAny(vectorShadow["query_history_embedding_error_count"], 0),
+		},
 		"supervisor_status":   supervisorInputPack["status"],
 		"critic_status":       criticInputPack["status"],
 		"storyline_selection": supervisorInputPack["storyline_selection"],
@@ -1562,6 +1780,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	shadowCompareRecord := buildGenerationPacketShadowCompareRecord(injectionAssembly, inputContextText)
 	inputTransparencyModel := buildPrepareTurnInputTransparencyRenderModel(sid, turnIndex, rawUserInput, inputContextText, injectionEnabled, inputContextEnabled, inputContextTruncated, degraded, fallbackReason, injectionAssembly)
 	inputTransparencyModel["payload_application_plan"] = payloadApplicationPlan
+	inputTransparencyModel["memory_transport_plan"] = memoryTransportPlan
 	if counts := mapFromAny(inputTransparencyModel["counts"]); len(counts) > 0 {
 		counts["auxiliary_context_chars"] = intFromAny(payloadApplicationPlan["auxiliary_chars"], 0)
 		counts["input_context_chars"] = intFromAny(payloadApplicationPlan["input_context_chars"], 0)
@@ -1571,6 +1790,7 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 	effectiveInputPreview["post_generation_data_included"] = false
 	effectiveInputPreview["input_context_source"] = inputContextSource
 	effectiveInputPreview["payload_application_plan"] = payloadApplicationPlan
+	effectiveInputPreview["memory_transport_plan"] = memoryTransportPlan
 	effectiveInputPreview["auxiliary_context_chars"] = len([]rune(injectionText))
 	effectiveInputPreview["input_context_chars"] = len([]rune(inputContextText))
 	timing.addElapsed("response_assembly", responseAssemblyStartedAt)
@@ -1598,6 +1818,9 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			"memory_delivery_plan":            injectionPack["memory_delivery_plan"],
 			"memory_delivery_lineage":         boundedMemoryDeliveryLineage,
 			"source_to_payload_lineage":       sourceToPayloadLineage,
+			"memory_injection_baseline":       memoryInjectionBaseline,
+			"memory_transport_plan":           memoryTransportPlan,
+			"turn_finalization_policy":        turnFinalizationPolicy,
 			"temporal_packet":                 injectionPack["temporal_packet"],
 			"temporal_packet_text":            injectionPack["temporal_packet_text"],
 			"character_perspective_packet":    injectionPack["character_perspective_packet"],
@@ -1623,6 +1846,10 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 			"injection_pack":                  compactInjectionPack,
 			"payload_application_plan":        payloadApplicationPlan,
 			"source_to_payload_lineage":       sourceToPayloadLineage,
+			"memory_injection_baseline":       memoryInjectionBaseline,
+			"memory_transport_plan":           memoryTransportPlan,
+			"turn_finalization_policy":        turnFinalizationPolicy,
+			"memory_transport_payload":        memoryTransportPayload,
 			"memory_budget_resolution":        memoryBudgetResolution,
 			"language_context":                languageContext,
 			"input_transparency_model":        inputTransparencyModel,
@@ -1664,6 +1891,10 @@ func (s *Server) handlePrepareTurn(w http.ResponseWriter, r *http.Request) {
 		"injection_pack":                  injectionPack,
 		"payload_application_plan":        payloadApplicationPlan,
 		"source_to_payload_lineage":       sourceToPayloadLineage,
+		"memory_injection_baseline":       memoryInjectionBaseline,
+		"memory_transport_plan":           memoryTransportPlan,
+		"turn_finalization_policy":        turnFinalizationPolicy,
+		"memory_transport_payload":        memoryTransportPayload,
 		"supervisor_result":               supervisorResult,
 		"publisher_call_budget_ledger":    publisherCallBudgetLedger,
 		"memory_budget_resolution":        memoryBudgetResolution,

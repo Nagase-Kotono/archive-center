@@ -1974,6 +1974,28 @@
           "title": "Max Injection Chars",
           "default": 18000
         },
+		"memory_transport_mode": {
+		  "type": "string",
+		  "title": "Memory Transport Mode",
+		  "description": "Representation used only for the already-selected long-term-memory lane. Text preserves the existing path; PDF modes alter only the final provider body.",
+		  "default": "text",
+		  "enum": [
+			"text",
+			"google_pdf",
+			"llm_gateway_pdf",
+			"provider_manager_pdf"
+		  ]
+		},
+		"turn_finalization_mode": {
+		  "type": "string",
+		  "title": "Turn Finalization Mode",
+		  "description": "Chooses whether the accepted response is persisted immediately or the previous completed pair is finalized when the next user input begins. The latter pipelines the previous Critic with the current generation and never blocks the current model request.",
+		  "default": "immediate_after_response",
+		  "enum": [
+			"immediate_after_response",
+			"next_user_input"
+		  ]
+		},
         "core_objective_memory_max_items": {
           "type": "integer",
           "minimum": 1,
@@ -2021,6 +2043,13 @@
           "type": "boolean",
           "title": "Supervisor Enabled",
           "default": true
+        },
+        "recent_conversation_reference_count": {
+          "type": "integer",
+          "minimum": 1,
+          "title": "Recent Conversation Reference Count",
+          "description": "Number of recent completed user/final-assistant conversations used by the existing memory recall query set. This is independent of top_k and the final core-memory item ceiling.",
+          "default": 5
         },
         "top_k": {
           "type": "integer",

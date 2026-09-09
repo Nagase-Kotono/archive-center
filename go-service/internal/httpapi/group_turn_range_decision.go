@@ -359,48 +359,37 @@ func verifyRollbackAssistantDeletionEvidence(
 		return rollbackAssistantDeletionEvidence{Verified: true, Reason: "no_active_completed_source_revisions"}, nil
 	}
 
-	used := make([]bool, len(observations))
-	lastMatched := -1
-	findMatch := func(source store.MemorySourceRevision, identityOnly bool) int {
-		search := func(start int) int {
-			for index := start; index < len(observations); index++ {
-				// Disabled or still-streaming output is not a cold-start candidate,
-				// but it is still present in the host chat and therefore cannot be
-				// deletion evidence.
-				if used[index] {
-					continue
-				}
-				if rollbackAssistantObservationMatchesSource(source, observations[index], identityOnly) {
-					return index
-				}
-			}
-			return -1
+	// Preserve the 4.0.2 rollback contract: the current Host assistant history
+	// must be an exact prefix of the durable active-source history. Only the
+	// contiguous missing suffix is deletion evidence. A middle replacement,
+	// stale source revision, reordered observation, or later matched turn after
+	// a mismatch is a historical conflict and must never widen the rollback.
+	orderedObservations := append([]rollbackAssistantObservation(nil), observations...)
+	sort.SliceStable(orderedObservations, func(i, j int) bool {
+		return orderedObservations[i].MessageIndex < orderedObservations[j].MessageIndex
+	})
+	for index := 1; index < len(orderedObservations); index++ {
+		if orderedObservations[index-1].MessageIndex == orderedObservations[index].MessageIndex {
+			return rollbackAssistantDeletionEvidence{Reason: "historical_revision_conflict"}, nil
 		}
-		if match := search(lastMatched + 1); match >= 0 {
-			return match
-		}
-		return search(0)
 	}
 
-	removedCount := 0
-	firstRemovedTurn := 0
-	for _, source := range filtered {
-		match := findMatch(source, true)
-		if match < 0 {
-			match = findMatch(source, false)
-		}
-		if match >= 0 {
-			used[match] = true
-			if match > lastMatched {
-				lastMatched = match
-			}
+	prefixLength := minInt(len(filtered), len(orderedObservations))
+	for index := 0; index < prefixLength; index++ {
+		source := filtered[index]
+		observation := orderedObservations[index]
+		if rollbackAssistantObservationMatchesSource(source, observation, true) ||
+			rollbackAssistantObservationMatchesSource(source, observation, false) {
 			continue
 		}
-		removedCount++
-		if firstRemovedTurn == 0 || source.TurnIndex < firstRemovedTurn {
-			firstRemovedTurn = source.TurnIndex
-		}
+		return rollbackAssistantDeletionEvidence{Reason: "historical_revision_conflict"}, nil
 	}
+	if len(orderedObservations) >= len(filtered) {
+		return rollbackAssistantDeletionEvidence{Verified: true, Reason: "verified_no_assistant_output_removed"}, nil
+	}
+
+	removedCount := len(filtered) - len(orderedObservations)
+	firstRemovedTurn := filtered[len(orderedObservations)].TurnIndex
 	reason := "verified_no_assistant_output_removed"
 	if removedCount > 0 {
 		reason = "verified_assistant_output_removed"
@@ -726,6 +715,7 @@ func calculateRollbackDecision(req rollbackDecisionRequest) rollbackDecisionResp
 }
 
 type sessionRoutingTurnResolutionRequest struct {
+	worldlineOriginDepth   int
 	ChatSessionID          string                    `json:"chat_session_id"`
 	Mode                   string                    `json:"mode"`
 	StableCharacterID      string                    `json:"stable_character_id,omitempty"`
@@ -756,6 +746,7 @@ type risuWorldlineObservation struct {
 	BranchMarker        string                            `json:"branch_marker"`
 	MarkerIndex         int                               `json:"marker_index"`
 	Messages            []risuWorldlineMessageObservation `json:"messages"`
+	MessageOrigins      *risuWorldlineOriginObservation   `json:"message_origins,omitempty"`
 }
 
 type risuWorldlineMessageObservation struct {
@@ -1205,8 +1196,26 @@ func resolveAssistantObservationTurnIdentities(
 
 func (s *Server) resolveRisuWorldlineObservation(ctx context.Context, req sessionRoutingTurnResolutionRequest, childSessionID string) (vm worldlineViewModel) {
 	observation := req.WorldlineObservation
+	ancestorRead := s.resolveRisuWorldlineParentObservation(ctx, req)
 	durable := currentWorldlineViewModel(ctx, s.Store, childSessionID)
+	defer func() {
+		if ancestorRead != nil {
+			vm.OriginReadRequest = ancestorRead
+			return
+		}
+		if observation == nil || vm.MessageOriginsRecorded || observation.MessageOrigins != nil {
+			return
+		}
+		parent, _, source, ok := parseExactRisuBranchMarker(observation.BranchMarker)
+		if ok {
+			vm.OriginReadRequest = &risuWorldlineOriginReadRequest{ParentHostChatID: parent, SourceMessageID: source, ChildHostChatID: req.HostChatID, ChildMarkerIndex: observation.MarkerIndex}
+		}
+	}()
 	if durable.State == "confirmed" && durable.ForkSourceRole != "" {
+		if observation != nil && observation.MessageOrigins != nil {
+			s.enrichRisuWorldlineOrigins(ctx, childSessionID, req.StableCharacterID, observation)
+			return currentWorldlineViewModel(ctx, s.Store, childSessionID)
+		}
 		return durable
 	}
 	vm = worldlineViewModel{
@@ -1303,11 +1312,6 @@ func (s *Server) resolveRisuWorldlineObservation(ctx context.Context, req sessio
 		vm.Reason = "fork_source_message_unresolved"
 		return vm
 	}
-	if strings.TrimSpace(sourceMessage.MessageChatID) != sourceMessageID {
-		vm.State = "conflict"
-		vm.Reason = "fork_source_message_conflict"
-		return vm
-	}
 	if sourceMessage.Disabled || (sourceMessage.Role != "user" && sourceMessage.Role != "char") {
 		vm.Reason = "fork_source_message_unresolved"
 		return vm
@@ -1347,6 +1351,11 @@ func (s *Server) resolveRisuWorldlineObservation(ctx context.Context, req sessio
 			return vm
 		}
 		userAnchorMessageID = strings.TrimSpace(anchor.MessageChatID)
+	}
+	// The marker names a message in the parent, not an ID in the child.
+	// Official hosts may either preserve or reissue the child's IDs.
+	if parentAnchor := risuWorldlineParentUserAnchor(observation, parentHostChatID, sourceMessageID); parentAnchor != "" {
+		userAnchorMessageID = parentAnchor
 	}
 	bindingStore, ok := s.Store.(store.SessionRouteBindingStore)
 	if !ok {
@@ -1418,6 +1427,15 @@ func (s *Server) resolveRisuWorldlineObservation(ctx context.Context, req sessio
 		matchingTurns = prioritizedWorldlineSourceTurns(
 			history, expectedUserLogicalTurnID, sourceRole, sourceMessageID,
 		)
+		if len(matchingTurns) == 0 {
+			matchingTurns = s.risuWorldlineInheritedSourceTurns(ctx, parentSessionID, parentHostChatID, sourceMessageID, userAnchorMessageID, sourceRole)
+		}
+		if len(matchingTurns) == 0 {
+			if turn := s.risuWorldlineObservedSourceTurn(ctx, observation, parentSessionID, parentHostChatID, sourceMessageID, append(parentSources, history...)); turn > 0 {
+				matchingTurns = []int{turn}
+				confirmedReason = "official_branch_marker_observed_prefix_validated"
+			}
+		}
 		vm.CandidateParentID = parentSessionID
 		vm.CandidateForkTurns = matchingTurns
 		assessmentParentSessionID = parentSessionID
@@ -1426,7 +1444,9 @@ func (s *Server) resolveRisuWorldlineObservation(ctx context.Context, req sessio
 			vm.Reason = "parent_fork_source_history_unresolved"
 			return vm
 		case 1:
-			confirmedReason = "official_branch_marker_historical_source_validated"
+			if confirmedReason != "official_branch_marker_observed_prefix_validated" {
+				confirmedReason = "official_branch_marker_historical_source_validated"
+			}
 		default:
 			vm.State = "conflict"
 			vm.Reason = "parent_fork_source_history_ambiguous"
@@ -1495,6 +1515,7 @@ func persistRisuWorldlineAssessment(
 	if record.LineageState == "confirmed" {
 		record.ForkTurn = forkTurn
 		record.CopiedFromSessionID = strings.TrimSpace(parentSessionID)
+		record.InheritedItemsJSON = risuWorldlineOriginItems(observation)
 	}
 	saved, err := lineageStore.SaveForkLineageRecord(ctx, record)
 	if err != nil {

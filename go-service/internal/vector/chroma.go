@@ -644,10 +644,13 @@ func (s *chromaStore) doJSON(ctx context.Context, method string, path string, bo
 		return 0, fmt.Errorf("chroma store: %s %s failed: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if !statusAllowed(resp.StatusCode, okStatuses) {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return resp.StatusCode, fmt.Errorf("chroma store: %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
+	// Successful candidate queries include stored embeddings and can exceed
+	// the diagnostic error-body limit. Decode their complete JSON response.
+	data, _ := io.ReadAll(resp.Body)
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
 			return resp.StatusCode, fmt.Errorf("chroma store: decode %s %s: %w", method, path, err)
@@ -677,6 +680,9 @@ func chromaWhere(sessionID string, filter string) map[string]any {
 	if tier := tierFromFilter(filter); tier != "" {
 		clauses = append(clauses, map[string]any{"tier": tier})
 	}
+	if sourceTable := metadataStringEqualityFromFilter(filter, "source_table"); sourceTable != "" {
+		clauses = append(clauses, map[string]any{"source_table": sourceTable})
+	}
 	switch len(clauses) {
 	case 0:
 		return nil
@@ -685,6 +691,33 @@ func chromaWhere(sessionID string, filter string) map[string]any {
 	default:
 		return map[string]any{"$and": clauses}
 	}
+}
+
+func metadataStringEqualityFromFilter(filter, field string) string {
+	original := strings.TrimSpace(filter)
+	lower := strings.ToLower(original)
+	field = strings.ToLower(strings.TrimSpace(field))
+	if original == "" || field == "" {
+		return ""
+	}
+	index := strings.Index(lower, field)
+	if index < 0 {
+		return ""
+	}
+	remainder := strings.TrimSpace(original[index+len(field):])
+	if !strings.HasPrefix(remainder, "==") {
+		return ""
+	}
+	remainder = strings.TrimSpace(strings.TrimPrefix(remainder, "=="))
+	if len(remainder) < 2 || (remainder[0] != '"' && remainder[0] != '\'') {
+		return ""
+	}
+	quote := remainder[0]
+	end := strings.IndexByte(remainder[1:], quote)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(remainder[1 : end+1])
 }
 
 func tierFromFilter(filter string) string {

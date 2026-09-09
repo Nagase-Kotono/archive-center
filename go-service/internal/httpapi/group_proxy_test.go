@@ -180,16 +180,18 @@ func TestProxyResolveVertexProjectIDRejectsMissingProjectID(t *testing.T) {
 
 func TestProxyProviderBaseURLDefaults(t *testing.T) {
 	wants := map[string]string{
-		"openai":     "https://api.openai.com/v1",
-		"openrouter": "https://openrouter.ai/api/v1",
-		"llmgateway": "https://api.llmgateway.io/v1",
-		"vercel":     "https://ai-gateway.vercel.sh/v1",
-		"neuralwatt": "https://api.neuralwatt.com/v1",
-		"copilot":    "https://api.githubcopilot.com",
-		"ollama":     "http://127.0.0.1:11434",
-		"claude":     "https://api.anthropic.com",
-		"gemini":     "https://generativelanguage.googleapis.com/v1beta",
-		"vertex":     "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/publishers/google/models",
+		"openai":      "https://api.openai.com/v1",
+		"openrouter":  "https://openrouter.ai/api/v1",
+		"opencode":    "https://opencode.ai/zen/v1",
+		"opencode-go": "https://opencode.ai/zen/go/v1",
+		"llmgateway":  "https://api.llmgateway.io/v1",
+		"vercel":      "https://ai-gateway.vercel.sh/v1",
+		"neuralwatt":  "https://api.neuralwatt.com/v1",
+		"copilot":     "https://api.githubcopilot.com",
+		"ollama":      "http://127.0.0.1:11434",
+		"claude":      "https://api.anthropic.com",
+		"gemini":      "https://generativelanguage.googleapis.com/v1beta",
+		"vertex":      "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/publishers/google/models",
 	}
 	for provider, want := range wants {
 		if got := proxyProviderBaseURL(provider, ""); got != want {
@@ -1372,7 +1374,7 @@ func TestProxyLLMGatewayInvalidAndConflictingTiersFailBeforeUpstream(t *testing.
 	}{
 		{name: "invalid", tier: "economy", wantError: "must be standard, flex, or priority"},
 		{name: "conflict", tier: "flex", extraBody: `{"service_tier":"priority"}`, wantError: "conflicts with extra_body_json"},
-		{name: "wrong provider", tier: "flex", wantError: "requires provider openai, llmgateway, vercel, neuralwatt, or custom"},
+		{name: "wrong provider", tier: "flex", wantError: "requires provider openai, llmgateway, vercel, neuralwatt, custom, or gemini"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2136,6 +2138,8 @@ func TestProxyReasoningWireUsesProviderAndEndpointTransport(t *testing.T) {
 		wantNoTemperature  bool
 	}{
 		{name: "LLM Gateway Luna", provider: "llmgateway", endpoint: "https://api.llmgateway.io/v1", model: "gpt-5.6-luna", effort: "low", wantEffort: "low", wantNoTemperature: true},
+		{name: "LLM Gateway Gemini 3.8 medium", provider: "llmgateway", endpoint: "https://api.llmgateway.io/v1", model: "gemini-3.8-flash", effort: "medium", wantEffort: "medium"},
+		{name: "OpenRouter Gemini 3.8 medium", provider: "openrouter", endpoint: "https://openrouter.ai/api/v1", model: "google/gemini-3.8-flash", effort: "medium", wantReasoning: "medium"},
 		{name: "LLM Gateway DeepSeek low", provider: "llmgateway", endpoint: "https://api.llmgateway.io/v1", model: "deepseek-v4-pro:0813-cloud", effort: "low", wantEffort: "low"},
 		{name: "LLM Gateway DeepSeek medium compatibility", provider: "llmgateway", endpoint: "https://api.llmgateway.io/v1", model: "deepseek-v4-pro:0813-cloud", effort: "medium", wantEffort: "high"},
 		{name: "OpenRouter DeepSeek low", provider: "openrouter", endpoint: "https://openrouter.ai/api/v1", model: "deepseek/deepseek-v4-pro", effort: "low", wantReasoning: "low"},
@@ -2659,6 +2663,45 @@ func TestProxyGeminiThinkingUsesModelGenerationContract(t *testing.T) {
 	}
 	if got := proxyGeminiThinkingLevel("gemini-3.6-flash", "minimal"); got != "minimal" {
 		t.Fatalf("Gemini 3.6 Flash minimal thinking level = %q", got)
+	}
+}
+
+func TestProxyGemini38ThinkingLevelReachesPublisherAndCriticWire(t *testing.T) {
+	for _, purpose := range []string{"publisher", "complete_turn_critic"} {
+		for _, effort := range []string{"none", "low", "medium", "high"} {
+			t.Run(purpose+"/"+effort, func(t *testing.T) {
+				oldClient := proxyHTTPClient
+				calls := 0
+				var body map[string]any
+				proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.URL.String() != "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent" {
+						t.Fatalf("target=%s", r.URL)
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Fatal(err)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"candidates":[{"content":{"parts":[{"text":"{}"}]}}]}`))}, nil
+				})}
+				defer func() { proxyHTTPClient = oldClient }()
+				req := dto.ProxyPluginMainRequest{
+					APIKey: strPtr("gemini-test"), Provider: strPtr("gemini"), Model: strPtr("gemini-3.8-flash"), Endpoint: strPtr("https://generativelanguage.googleapis.com/v1beta"),
+					Messages: []any{map[string]any{"role": "user", "content": "return JSON"}}, ReasoningEffort: &effort,
+				}
+				_, status, err := performProxyPluginMainWithRetryBudgetAndPolicy(context.Background(), req, nil, proxyRequestPolicy{JSONResponse: true, Purpose: purpose})
+				if err != nil || status != http.StatusOK || calls != 1 {
+					t.Fatalf("status=%d calls=%d err=%v", status, calls, err)
+				}
+				generation := mapFromAny(body["generationConfig"])
+				if effort == "none" {
+					if _, present := generation["thinkingConfig"]; present {
+						t.Fatalf("none stopped using provider default: %+v", generation)
+					}
+				} else if thinking := mapFromAny(generation["thinkingConfig"]); thinking["thinkingLevel"] != effort {
+					t.Fatalf("selected %s did not reach provider: %+v", effort, generation)
+				}
+			})
+		}
 	}
 }
 
@@ -3835,6 +3878,147 @@ func TestProxyVertexFlexAndExtraBodyOverrides(t *testing.T) {
 	}
 }
 
+func TestVertexRetainedServiceTierAcrossCriticPaths(t *testing.T) {
+	credential := testVertexServiceAccountJSON(t)
+	endpoint := "https://aiplatform.googleapis.com/v1/projects/proj/locations/global/publishers/google/models"
+	model := "gemini-3.5-flash"
+	for _, path := range []string{"connection_test", "configured_critic"} {
+		for _, tier := range []string{"", "standard", "flex", "priority"} {
+			for _, mode := range []string{"off", "provisioned_then_flex", "flex_only"} {
+				t.Run(path+"/tier="+tier+"/vertex="+mode, func(t *testing.T) {
+					srv := setupTestServer()
+					mux := http.NewServeMux()
+					srv.RegisterRoutes(mux)
+					update, err := json.Marshal(map[string]any{
+						"criticProvider": "vertex", "criticEndpoint": endpoint,
+						"criticApiKey": credential, "criticModel": model,
+						"criticLlmGatewayServiceTier": tier, "criticVertexFlexMode": mode,
+						"criticTemperature": 0.35, "criticMaxCompletionTokens": 1536, "criticTimeout": 30,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					updateRec := httptest.NewRecorder()
+					mux.ServeHTTP(updateRec, httptest.NewRequest(http.MethodPost, "/config/update", bytes.NewReader(update)))
+					if updateRec.Code != http.StatusOK {
+						t.Fatalf("config/update status=%d", updateRec.Code)
+					}
+					cfg := srv.completeTurnExtractionConfig(nil).Critic
+					if !cfg.hasConfig() {
+						t.Fatalf("incomplete test configuration: %v", cfg.missingFields())
+					}
+					if cfg.LLMGatewayServiceTier != tier || cfg.VertexFlexMode != mode {
+						t.Fatal("config sync changed saved processing options")
+					}
+
+					oldClient := proxyHTTPClient
+					t.Cleanup(func() { proxyHTTPClient = oldClient })
+					tokenCalls, generationCalls := 0, 0
+					proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if r.Method != http.MethodPost {
+							t.Fatalf("unexpected method: %s", r.Method)
+						}
+						responseText := ""
+						switch r.URL.String() {
+						case "https://oauth2.googleapis.com/token":
+							tokenCalls++
+							responseText = `{"access_token":"vertex-token","expires_in":3600}`
+						case endpoint + "/" + model + ":generateContent":
+							generationCalls++
+							if r.Header.Get("Authorization") != "Bearer vertex-token" {
+								t.Fatal("Vertex authentication changed")
+							}
+							wantShared, wantRequest := "", ""
+							if mode != "off" {
+								wantShared = "flex"
+							}
+							if mode == "flex_only" {
+								wantRequest = "shared"
+							}
+							if r.Header.Get("X-Vertex-AI-LLM-Shared-Request-Type") != wantShared ||
+								r.Header.Get("X-Vertex-AI-LLM-Request-Type") != wantRequest {
+								t.Fatal("Vertex processing headers no longer follow its own setting")
+							}
+							var body map[string]any
+							if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+								t.Fatal(err)
+							}
+							for _, key := range []string{"service_tier", "serviceTier", "llm_gateway_service_tier"} {
+								if _, exists := body[key]; exists {
+									t.Fatalf("Vertex body contains inapplicable %s", key)
+								}
+							}
+							gen := mapFromAny(body["generationConfig"])
+							text := "OK"
+							if path == "configured_critic" {
+								if gen["responseMimeType"] != "application/json" ||
+									gen["temperature"] != cfg.Temperature ||
+									intFromAny(gen["maxOutputTokens"], 0) != int(cfg.MaxCompletionTokens) {
+									t.Fatalf("Critic JSON/temperature/output budget changed: %+v", gen)
+								}
+								text = `{"turn_summary":"The traveler kept the key.","importance_score":6}`
+							} else if gen["responseMimeType"] != nil {
+								t.Fatal("connection test unexpectedly became a Critic extraction")
+							}
+							encoded, err := json.Marshal(map[string]any{
+								"candidates": []any{map[string]any{
+									"content":      map[string]any{"parts": []any{map[string]any{"text": text}}},
+									"finishReason": "STOP",
+								}},
+							})
+							if err != nil {
+								t.Fatal(err)
+							}
+							responseText = string(encoded)
+						default:
+							t.Fatalf("unexpected upstream URL: %s", r.URL.String())
+						}
+						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+							Body: io.NopCloser(strings.NewReader(responseText))}, nil
+					})}
+
+					if path == "connection_test" {
+						payload, err := json.Marshal(map[string]any{
+							"provider": cfg.Provider, "endpoint": cfg.Endpoint, "api_key": cfg.APIKey, "model": cfg.Model,
+							"llm_gateway_service_tier": cfg.LLMGatewayServiceTier, "vertex_flex_mode": cfg.VertexFlexMode,
+							"messages": []any{map[string]any{"role": "user", "content": "Reply with exactly: OK"}},
+						})
+						if err != nil {
+							t.Fatal(err)
+						}
+						rec := httptest.NewRecorder()
+						mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/proxy/plugin-main?connection_test=critic", bytes.NewReader(payload)))
+						var result map[string]any
+						if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+							t.Fatal(err)
+						}
+						if rec.Code != http.StatusOK || result["connection_ok"] != true || result["final_text"] != "OK" {
+							t.Fatalf("connection test failed: status=%d result=%+v", rec.Code, result)
+						}
+					} else {
+						result, trace, err := srv.runCompleteTurnCritic(context.Background(), "vertex-tier-session", 1,
+							"The traveler found the key.", "The traveler kept the key.", nil, nil, cfg)
+						if err != nil || result["turn_summary"] != "The traveler kept the key." {
+							t.Fatalf("configured Critic failed: %v", err)
+						}
+						overrides := mapFromAny(trace["request_overrides"])
+						if tier != "" && (overrides["llm_gateway_service_tier_applied"] != false ||
+							overrides["llm_gateway_service_tier_skip_reason"] != "vertex_uses_vertex_flex_mode") {
+							t.Fatalf("missing retained-setting diagnostic: %+v", overrides)
+						}
+					}
+					if tokenCalls != 1 || generationCalls != 1 {
+						t.Fatalf("token calls=%d generation calls=%d; expected one of each", tokenCalls, generationCalls)
+					}
+					if saved := srv.completeTurnExtractionConfig(nil).Critic; saved.LLMGatewayServiceTier != tier || saved.VertexFlexMode != mode {
+						t.Fatal("sending a request mutated saved processing options")
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestProxyRejectsInvalidExtraHeadersJSON(t *testing.T) {
 	bad := `["not-object"]`
 	_, status, err := performProxyPluginMain(context.Background(), dto.ProxyPluginMainRequest{
@@ -4337,9 +4521,11 @@ func TestHandleSupervisorUsesRuntimeLLMConfig(t *testing.T) {
 			t.Fatalf("supervisor request body still exposes the legacy proposal vocabulary: %s", userPrompt)
 		}
 		if !strings.Contains(systemPrompt, "Archive Center's Publisher LLM") ||
-			!strings.Contains(systemPrompt, "The current user input is the only command") ||
-			!strings.Contains(systemPrompt, "Use accepted recent context") {
-			t.Fatalf("supervisor system prompt missing memory-guide boundary: %s", systemPrompt)
+			!strings.Contains(systemPrompt, "The user decides the story's direction") ||
+			!strings.Contains(systemPrompt, "The user can adopt, change or disregard") ||
+			!strings.Contains(systemPrompt, "Accepted recent context and memory supply reference material") ||
+			!strings.Contains(systemPrompt, "taking precedence over the earlier record") {
+			t.Fatalf("runtime Publisher request lost user agency or optional memory context: %s", systemPrompt)
 		}
 		for _, forbidden := range []string{"Story Initiative", "max_new_beats", "narrative_stance", "auto_advance_trigger"} {
 			if strings.Contains(systemPrompt, forbidden) || strings.Contains(userPrompt, `"`+forbidden+`"`) {
@@ -4347,10 +4533,15 @@ func TestHandleSupervisorUsesRuntimeLLMConfig(t *testing.T) {
 			}
 		}
 		if !strings.Contains(systemPrompt, "publisher_output.v3") ||
-			!strings.Contains(systemPrompt, "cannot decide user or protagonist action") ||
-			!strings.Contains(systemPrompt, "quiet supported scene") ||
-			!strings.Contains(systemPrompt, "Do not add filler or meet a") {
-			t.Fatalf("supervisor prompt missing bounded publisher contract: %s", systemPrompt)
+			!strings.Contains(systemPrompt, "or execution priorities according to strength") ||
+			!strings.Contains(systemPrompt, "an optional tone suggestion") ||
+			!strings.Contains(systemPrompt, "creative additions to that context") {
+			t.Fatalf("runtime Publisher request lost optional creative planning: %s", systemPrompt)
+		}
+		for _, obsolete := range []string{"cannot decide", "Do not", "forbidden_moves", "guardrails", "scene_mandate", "required_outcomes"} {
+			if strings.Contains(systemPrompt, obsolete) {
+				t.Fatalf("runtime default Publisher still requests a prohibition or mandatory outcome %q: %s", obsolete, systemPrompt)
+			}
 		}
 		response := publisherV3OpenAIResponse("input:test", "preserve the current request boundary")
 		return &http.Response{
@@ -4450,5 +4641,163 @@ func TestHandleSupervisorUsesRuntimeLLMConfig(t *testing.T) {
 		if _, exists := traceSummary[key]; exists {
 			t.Fatalf("trace_summary exposes story-control field %q: %+v", key, traceSummary)
 		}
+	}
+}
+
+func TestOpenCodeAndOpenRouterProviderWireContracts(t *testing.T) {
+	cases := []struct{ name, provider, model, endpoint, target, shape, auth, effort string }{
+		{"Zen DeepSeek", "opencode", "deepseek-v4-pro", "", "https://opencode.ai/zen/v1/chat/completions", "chat", "Authorization", "low"},
+		{"Zen GLM", "opencode", "glm-5.2", "", "https://opencode.ai/zen/v1/chat/completions", "chat", "Authorization", "high"},
+		{"Zen Claude", "opencode", "claude-sonnet-4-6", "", "https://opencode.ai/zen/v1/messages", "claude", "x-api-key", "medium"},
+		{"Zen Gemini", "opencode", "gemini-3.8-flash", "", "https://opencode.ai/zen/v1/models/gemini-3.8-flash:generateContent", "gemini", "x-goog-api-key", "medium"},
+		{"Zen GPT", "opencode", "gpt-5.6-luna", "", "https://opencode.ai/zen/v1/responses", "responses", "Authorization", "low"},
+		{"explicit chat", "opencode", "gpt-5.6-luna", "https://relay.example/zen/v1/chat/completions", "https://relay.example/zen/v1/chat/completions", "chat", "Authorization", "low"},
+		{"explicit messages", "opencode", "qwen3.7-plus", "https://opencode.ai/zen/v1/messages", "https://opencode.ai/zen/v1/messages", "claude", "x-api-key", ""},
+		{"explicit Gemini model", "opencode", "gemini-3.8-flash", "https://opencode.ai/zen/v1/models/gemini-3.8-flash", "https://opencode.ai/zen/v1/models/gemini-3.8-flash:generateContent", "gemini", "x-goog-api-key", "medium"},
+		{"Go DeepSeek", "opencode-go", "deepseek-v4-pro", "", "https://opencode.ai/zen/go/v1/chat/completions", "chat", "Authorization", "low"},
+		{"Go Kimi", "opencode-go", "kimi-k2.7-code", "", "https://opencode.ai/zen/go/v1/chat/completions", "chat", "Authorization", ""},
+		{"Go GLM", "opencode-go", "glm-5.2", "", "https://opencode.ai/zen/go/v1/chat/completions", "chat", "Authorization", ""},
+		{"Go GPT", "opencode-go", "gpt-5.6-luna", "", "https://opencode.ai/zen/go/v1/responses", "responses", "Authorization", "low"},
+		{"Go MiniMax", "opencode-go", "minimax-m2.7", "", "https://opencode.ai/zen/go/v1/messages", "claude", "x-api-key", ""},
+		{"Go Qwen", "opencode-go", "qwen3.8-max", "", "https://opencode.ai/zen/go/v1/messages", "claude", "x-api-key", ""},
+		{"Go explicit chat", "opencode-go", "minimax-m2.7", "https://relay.example/v1/chat/completions", "https://relay.example/v1/chat/completions", "chat", "Authorization", ""},
+		{"OpenRouter default", "openrouter", "google/gemini-3.8-flash", "", "https://openrouter.ai/api/v1/chat/completions", "chat", "Authorization", "medium"},
+		{"OpenRouter override", "openrouter", "anthropic/claude-sonnet-4.6", "https://relay.example/api/v1", "https://relay.example/api/v1/chat/completions", "chat", "Authorization", "medium"},
+	}
+	for _, tc := range cases {
+		for _, purpose := range []string{"publisher", "critic", "memory_preprocessing"} {
+			t.Run(tc.name+"/"+purpose, func(t *testing.T) {
+				old := proxyHTTPClient
+				defer func() { proxyHTTPClient = old }()
+				calls := 0
+				proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.URL.String() != tc.target {
+						t.Fatalf("URL=%s want=%s", r.URL, tc.target)
+					}
+					wantAuth := "fixture-key"
+					if tc.auth == "Authorization" {
+						wantAuth = "Bearer " + wantAuth
+					}
+					if r.Header.Get(tc.auth) != wantAuth {
+						t.Fatal("missing provider authentication")
+					}
+					if tc.provider == "opencode-go" {
+						if r.Header.Get("User-Agent") != "ArchiveCenter/4.3.0" || !strings.HasPrefix(r.Header.Get("x-opencode-session"), "archive-center-") {
+							t.Fatal("Go client/session headers missing")
+						}
+					} else if r.Header.Get("x-opencode-session") != "" {
+						t.Fatal("Go header leaked to another provider")
+					}
+					var b map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+						t.Fatal(err)
+					}
+					if _, ok := b["service_tier"]; ok {
+						t.Fatal("unexpected service tier")
+					}
+					response := `{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`
+					switch tc.shape {
+					case "chat":
+						if len(sliceFromAny(b["messages"])) != 2 {
+							t.Fatalf("messages=%v", b)
+						}
+						if tc.provider == "openrouter" && stringFromMap(mapFromAny(b["reasoning"]), "effort") != tc.effort {
+							t.Fatalf("router reasoning=%v", b)
+						}
+						if tc.model == "deepseek-v4-pro" && stringFromMap(b, "reasoning_effort") != "low" {
+							t.Fatalf("DeepSeek reasoning=%v", b)
+						}
+						if b["max_tokens"] != float64(2048) && b["max_completion_tokens"] != float64(2048) {
+							t.Fatalf("tokens=%v", b)
+						}
+					case "claude":
+						if !strings.HasPrefix(tc.model, "claude-") && b["output_config"] != nil {
+							t.Fatal("Claude-specific structured output sent to a non-Claude Messages route")
+						}
+						if b["system"] != "Return JSON" || b["max_tokens"] != float64(2048) {
+							t.Fatalf("messages body=%v", b)
+						}
+						response = `{"content":[{"type":"text","text":"{}"}],"stop_reason":"end_turn"}`
+					case "gemini":
+						g := mapFromAny(b["generationConfig"])
+						if g["temperature"] != 0.3 || g["maxOutputTokens"] != float64(2048) || stringFromMap(mapFromAny(g["thinkingConfig"]), "thinkingLevel") != "medium" {
+							t.Fatalf("generation config=%v", g)
+						}
+						response = `{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}`
+					case "responses":
+						if _, exists := b["temperature"]; exists {
+							t.Fatal("reasoning GPT retained temperature")
+						}
+						if b["max_output_tokens"] != float64(2048) || len(sliceFromAny(b["input"])) != 2 || stringFromMap(mapFromAny(b["reasoning"]), "effort") != "low" {
+							t.Fatalf("responses body=%v", b)
+						}
+						response = `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}]}`
+					}
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
+				})}
+				temp := 0.3
+				result, status, err := performProxyPluginMainWithPolicy(context.Background(), dto.ProxyPluginMainRequest{
+					Provider: &tc.provider, Endpoint: &tc.endpoint, Model: &tc.model, APIKey: strPtr("fixture-key"), Temperature: &temp, MaxTokens: int64Ptr(2048), MaxCompletionTokens: int64Ptr(2048), ReasoningEffort: &tc.effort,
+					Messages: []any{map[string]any{"role": "system", "content": "Return JSON"}, map[string]any{"role": "user", "content": "Fixture input"}},
+				}, proxyRequestPolicy{JSONResponse: true, Purpose: purpose, SessionID: "wire-fixture-chat"})
+				if err != nil || status != 200 || calls != 1 {
+					t.Fatalf("status=%d calls=%d error=%v", status, calls, err)
+				}
+				choices := sliceFromAny(result["choices"])
+				if len(choices) != 1 || stringFromMap(mapFromAny(mapFromAny(choices[0])["message"]), "content") != "{}" {
+					t.Fatalf("normalized result=%v", result)
+				}
+			})
+		}
+	}
+}
+
+func TestOpenCodeGoSessionHeadersAcrossCalls(t *testing.T) {
+	old := proxyHTTPClient
+	defer func() { proxyHTTPClient = old }()
+	headers := []http.Header{}
+	proxyHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Clone())
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`))}, nil
+	})}
+	req := dto.ProxyPluginMainRequest{Provider: strPtr("opencode-go"), Model: strPtr("kimi-k2.7-code"), APIKey: strPtr("fixture-key"), Messages: []any{map[string]any{"role": "user", "content": "fixture"}}}
+	for _, purpose := range []string{"publisher", "complete_turn_critic", "memory_preprocessing"} {
+		_, status, err := performProxyPluginMainWithPolicy(context.Background(), req, proxyRequestPolicy{Purpose: purpose, SessionID: "chat-A"})
+		if err != nil || status != 200 {
+			t.Fatalf("status=%d err=%v", status, err)
+		}
+	}
+	body, _ := json.Marshal(req)
+	srv := &Server{}
+	for _, sid := range []string{"chat-A", "chat-B"} {
+		w := httptest.NewRecorder()
+		srv.handleProxyPluginMain(w, httptest.NewRequest(http.MethodPost, "/proxy/plugin-main?chat_session_id="+sid, bytes.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	req.ExtraHeadersJSON = strPtr(`{"x-opencode-session":"explicit-session","User-Agent":"ArchiveCenterFixture/1.0"}`)
+	_, _, err := performProxyPluginMainWithPolicy(context.Background(), req, proxyRequestPolicy{SessionID: "chat-A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 6 {
+		t.Fatalf("calls=%d", len(headers))
+	}
+	sid := headers[0].Get("x-opencode-session")
+	if sid == "" || strings.Contains(sid, "chat-A") {
+		t.Fatal("session header missing or raw chat ID exposed")
+	}
+	for _, h := range headers[1:4] {
+		if h.Get("x-opencode-session") != sid {
+			t.Fatal("same conversation changed session header")
+		}
+	}
+	if headers[4].Get("x-opencode-session") == sid {
+		t.Fatal("different conversations share session header")
+	}
+	if headers[5].Get("x-opencode-session") != "explicit-session" || headers[5].Get("User-Agent") != "ArchiveCenterFixture/1.0" {
+		t.Fatal("explicit headers replaced")
 	}
 }

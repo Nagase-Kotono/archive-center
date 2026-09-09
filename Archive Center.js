@@ -1,8 +1,8 @@
 //@name Archive Center
-//@display-name Archive Center 4.0.9
+//@display-name Archive Center 4.3.0
 //@author memory-scaffold
 //@api 3.0
-//@version 4.0.9
+//@version 4.3.0
 //@update-url https://raw.githubusercontent.com/Flazer31/archive-center/main/Archive%20Center.js
 
 // ════════════════════════════════════════════════════════════════
@@ -37,15 +37,16 @@
   const PLUGIN_ID = "risu_memory_orchestrator";
   const SETTINGS_KEY = `${PLUGIN_ID}_settings`;
   const LOG_PREFIX = "[MemOrch]";
-  const VERSION = "4.0.9";
-  const BUILD_ID = "4.0.9";
-  const BUILD_CHANNEL = "release";
-  const BUILD_TIME = "2026-08-28 KST";
-  const BUILD_NOTES = "Archive Center 4.0.9 Web Risu direct bridge test";
+  const VERSION = "4.3.0";
+  const BUILD_ID = "4.3.0";
+  const BUILD_CHANNEL = "stable";
+  const BUILD_TIME = "2026-09-09 KST";
+  const BUILD_NOTES = "Archive Center 4.3 stable: optional memory editors, broader recall, branch repair and provider support";
   const BUILD_LABEL = VERSION;
   // Sprint 3-C-1: 실패 큐 영속화
   const FAILED_QUEUE_STORAGE_KEY = `${PLUGIN_ID}_failedQueue`;
   const PENDING_FINAL_CONFIRMATION_STORAGE_KEY = `${PLUGIN_ID}_pendingFinalConfirmation`;
+  const NEXT_INPUT_FINALIZATION_STORAGE_KEY = `${PLUGIN_ID}_nextInputFinalization`;
   const CHATLOG_RESTORE_SNAPSHOT_STORAGE_KEY = `${PLUGIN_ID}_chatLogRestoreSnapshot_v1`;
   const ACTIVE_CHAT_BACKFILL_LEDGER_KEY = `${PLUGIN_ID}_activeChatBackfillLedger_v1`;
   const PERSONA_CAPSULE_CANDIDATE_QUEUE_KEY = `${PLUGIN_ID}_personaCapsuleCandidateQueue_v1`;
@@ -68,6 +69,8 @@
   const PUBLISHER_GUIDANCE_FORMAT_OPTIONS = Object.freeze(["compact", "standard", "explicit"]);
   const COMPLETION_TOKEN_PROFILE_VERSION = "p409_30000_v1";
   const AUXILIARY_INJECTION_PLACEMENT_OPTIONS = Object.freeze(["auto", "before_latest_user", "after_anchor_marker", "after_last_cache_point", "after_first_system", "end"]);
+  const MEMORY_TRANSPORT_MODE_OPTIONS = Object.freeze(["text", "google_pdf", "llm_gateway_pdf", "provider_manager_pdf"]);
+  const TURN_FINALIZATION_MODE_OPTIONS = Object.freeze(["immediate_after_response", "next_user_input"]);
   const VERTEX_FLEX_MODE_OPTIONS = Object.freeze(["off", "provisioned_then_flex", "flex_only"]);
     // J-3a: Plugin Main apply mode 허용값
   const PLUGIN_MAIN_APPLY_MODES = Object.freeze(["off", "shadow", "reviewed_apply"]);
@@ -78,7 +81,7 @@
   const RECOMPOSER_BRIDGE_KEY = "__RISU_ARCHIVE_CENTER_RECOMPOSER_V1__";
   const RECOMPOSER_BRIDGE_CONTRACT = "archive_center.recomposer_bridge.v1";
   const RECOMPOSER_ENHANCEMENT_CONTRACT = "archive_center.recomposer_enhancement.v1";
-  const LLM_PROVIDER_OPTIONS = Object.freeze(["openai", "claude", "gemini", "openrouter", "llmgateway", "vercel", "neuralwatt", "vertex", "copilot", "ollama", "custom"]);
+  const LLM_PROVIDER_OPTIONS = Object.freeze(["openai", "claude", "gemini", "openrouter", "llmgateway", "vercel", "neuralwatt", "vertex", "copilot", "ollama", "opencode", "opencode-go", "custom"]);
   const EMBEDDING_PROVIDER_OPTIONS = Object.freeze(["openai", "gemini", "vertex", "voyageai", "ollama", "custom"]);
   const SOURCE_SEARCH_LLM_PROVIDER_OPTIONS = Object.freeze(["openai", "claude", "gemini", "ollama"]);
   const REASONING_PRESET_OPTIONS = Object.freeze(["auto", "gpt", "gemini", "claude", "glm", "custom"]);
@@ -154,6 +157,8 @@
     debug: false,
     topK: 5,
     coreObjectiveMemoryMaxItems: 5,
+    recentConversationReferenceCount: 5,
+    turnFinalizationMode: "immediate_after_response",
     requestTimeoutMs: 15000,
     auxiliaryInjectionPlacement: "auto",
     auxiliaryInjectionAnchorMarker: "",
@@ -164,6 +169,7 @@
     injectionBudgetProfileVersion: "p409_18000_base_v1",
     injectionBudgetExtraChars: 0,    // 자동 산정 예산 위에 허용할 추가 상한
     memoryDeliveryBudgetMode: "auto",
+    memoryTransportMode: "text",
     memoryDeliveryBudgets: Object.freeze({
       event_recent: 3500,
       character_objective: 2500,
@@ -598,7 +604,7 @@
       "dash.section.turnHistory": "최근 턴 이력",
       "dash.section.previews": "상세 미리보기 (Previews)",
       "dash.section.effectiveInput": "최종 입력 (Effective Input)",
-      "dash.section.effectiveInput.desc": "실제로 최종 요청에 포함된 입력 조립 결과만 표시합니다.",
+      "dash.section.effectiveInput.desc": "백엔드 조립 내용과 Archive Center가 요청 직전에 확인한 반영 상태를 표시합니다. 이후 플러그인 처리와 최종 제공자 요청은 이 화면의 관측 범위 밖입니다.",
       "dash.section.inputTransparency": "입력 조립 투명성 (Input Transparency)",
       "dash.section.inputTransparency.desc": "마지막 턴에서 실제로 어떤 보조 정보가 입력에 붙었는지 보여줍니다.",
       "dash.section.failedQueueDebug": "실패 큐 상세 (디버그)",
@@ -623,8 +629,14 @@
       "dash.preview.critic.notTried": "시도 안 함",
       "dash.preview.notApplied": "미적용",
       "dash.preview.payloadBudget.title": "본문 Payload 예산",
-      "dash.preview.payloadBudget.actual": "실제 전달",
-      "dash.preview.payloadBudget.planned": "전달 예정",
+      "dash.preview.payloadBudget.actual": "보조 입력 요청 반영 확인",
+      "dash.preview.payloadBudget.planned": "백엔드 조립 예상",
+      "dash.preview.verification.ready": "사용자 입력과 보조 입력이 Archive Center의 요청 직전 관측과 일치합니다. 최종 제공자 요청까지 확인한 것은 아닙니다.",
+      "dash.preview.verification.mismatch": "백엔드 조립 내용과 요청 직전 관측이 일치하지 않습니다. 아래 조립본은 확인용이며 검증된 최종 입력으로 저장되지 않습니다.",
+      "dash.preview.verification.unobserved": "요청 직전 반영은 아직 확인되지 않았습니다. 아래는 백엔드 조립본입니다.",
+      "dash.preview.verification.userObserved": "요청에서 확인한 사용자 입력",
+      "dash.preview.verification.userPlanned": "백엔드가 참조한 사용자 입력",
+      "dash.preview.verification.detail": "확인 결과",
       "dash.preview.payloadBudget.configured": "설정 상한",
       "dash.preview.payloadBudget.effective": "활성 상한",
       "dash.preview.payloadBudget.assembly": "제목·구분자 조립 비용",
@@ -636,6 +648,8 @@
       "dash.preview.payloadBudget.lane.original_work": "원작 DB",
       "dash.preview.payloadBudget.lane.lorebook_reference": "로어북",
       "dash.preview.payloadBudget.lane.output_guidance": "출판사 안내",
+      "dash.preview.payloadBudget.lane.preprocessing_notes": "전처리 담당별 해석",
+      "dash.preview.payloadBudget.additional": "추가 전달",
 
       // ── Dashboard Status Rows ──
       "dash.status.plugin": "플러그인",
@@ -763,10 +777,20 @@
       "explorer.activeRebuild.orderOldest": "처음 누락 턴부터",
       "explorer.activeRebuild.orderRecent": "최근 누락 턴부터",
       "explorer.hypaImport.title": "📥 HypaMemory 가져오기",
-      "explorer.hypaImport.desc": "현재 RisuAI 챗의 HypaMemory 요약을 읽어 평론가가 분석합니다.\nimportance 점수, KG triple, 임베딩이 자동 생성됩니다.\n가져오기 후 RisuAI의 HypaMemory를 꺼 주세요.",
-      "explorer.hypaImport.done": "✅ 가져오기 시작됨",
-      "explorer.hypaImport.bgNote": "평론가 분석이 백그라운드에서 진행 중입니다. 완료까지 시간이 걸릴 수 있습니다.",
-      "explorer.hypaImport.loading": "⏳ 전송 중...",
+      "explorer.hypaImport.desc": "현재 챗의 하이파 요약을 원문 그대로 한 개씩 저장합니다. 평론가 분석은 부가 정보로 추가됩니다.",
+      "explorer.hypaImport.done": "가져오기 처리 완료",
+      "explorer.hypaImport.loading": "가져오는 중…",
+      "hypaImport.allMemories": "전체 기억",
+      "hypaImport.original": "하이파 원문",
+      "hypaImport.details": "처리 내역",
+      "hypaImport.count.total": "읽음",
+      "hypaImport.count.saved": "새로 저장",
+      "hypaImport.count.existing": "이미 저장됨",
+      "hypaImport.count.failed": "저장 실패",
+      "hypaImport.count.skipped": "빈 항목",
+      "hypaImport.count.analysis_succeeded": "분석 완료",
+      "hypaImport.count.analysis_failed": "분석 실패",
+      "hypaImport.count.analysis_skipped": "분석 미설정",
       "explorer.hypaImport.runBtn": "📥 HypaMemory 가져오기",
       "explorer.filter.current": "현재 세션 필터:",
       "explorer.resetRouting.loading": "⏳ 라우팅 상태 초기화 중...",
@@ -1104,7 +1128,7 @@
       "rescan.confirmDesc": "대화 원문을 훑어 기억이 없는 턴을 찾고\n평론가로 재처리하여 누락된 기억/직접 근거/KG/상태를 다시 만듭니다.",
       "hypaImport.confirmTarget": "대상 세션:",
       "hypaImport.confirmCount": "발견된 요약 수:",
-      "hypaImport.confirmDesc": "각 요약을 평론가가 분석하여\nimportance, KG triple, 임베딩을 생성합니다.\n(요약 수에 따라 시간이 걸릴 수 있습니다)",
+      "hypaImport.confirmDesc": "각 요약의 원문을 별도 기억으로 저장하고 평론가 분석을 덧붙입니다.\n요약 수에 따라 완료까지 시간이 걸릴 수 있습니다.",
 
       // ── i18n parity backfill (generated; keep keysets aligned) ──
       "dash.status.activeChatBackfill": "활성 채팅 백필",
@@ -1143,12 +1167,21 @@
       "settings.label.llmRetryCount": "LLM 재시도 횟수",
       "settings.label.llmRetryCount.hint": "0 = 재시도 없음(1회만 시도), 3 = 실패 시 3회 추가 시도",
       "settings.label.maxInjectionChars": "일반 기억 예산 (chars)",
+      "settings.label.memoryTransportMode": "장기 기억 전달 방식",
+      "settings.memoryTransportMode.text": "기존 Text",
+      "settings.memoryTransportMode.google_pdf": "Google AI Studio·Vertex PDF",
+      "settings.memoryTransportMode.llm_gateway_pdf": "LLM Gateway PDF",
+      "settings.memoryTransportMode.provider_manager_pdf": "Yumi Provider Manager PDF (실험)",
+      "settings.hint.memoryTransportMode": "Go가 이미 선택한 장기 기억만 전송 형식으로 바꿉니다. Yumi 실험 모드는 Provider Manager의 Gemini PDF와 수동 지정 기능을 모두 켜야 합니다.",
+      "settings.label.turnFinalizationMode": "저장 확정 시점",
+      "settings.turnFinalizationMode.immediate_after_response": "현재 턴",
+      "settings.turnFinalizationMode.next_user_input": "이전 턴",
       "settings.label.referenceInjectionMaxChars": "원작 DB 예산 (chars)",
       "settings.label.lorebookReferenceMaxChars": "로어북 예산 (chars)",
       "settings.label.narrativeGuideMode": "서사 가이드 모드",
       "settings.label.narrativeGuideMode.help": "Auto는 본문 키워드로 장르를 추정하지 않고 Standard로 동작합니다. 특정 장르 모드는 사용자가 직접 선택할 때만 적용됩니다.",
       "settings.label.narrativeGuideStrength": "서사 가이드 강도",
-      "settings.label.narrativeGuideStrength.help": "없음은 출판사 LLM 호출만 끄고 기억·비밀 보호는 유지합니다. 강도가 높을수록 이번 응답의 우선순위와 적용 순서를 더 명확하게 안내하지만 사실 권한은 늘어나지 않습니다. 최대 강도도 사용자 행동·새 사실·관계 변화·사건 종결을 강제하지 않으며, 조용한 장면은 조용하게 유지할 수 있습니다.",
+      "settings.label.narrativeGuideStrength.help": "없음은 출판사 호출만 끄고 기억·비밀 보호는 유지합니다. 약하게는 짧은 참고, 중간은 맥락을 연결한 권고입니다. 강하게부터는 사용자 방향에 맞는 가이드의 실행을 본문에 요구하며, 매우 강하게는 행동·반응·결과를 연결하고 최대로는 이번 응답의 전개를 구체적으로 안내합니다. 모든 강도에서 사용자의 방향·설정 변경·진행 속도·선택이 우선하며 창작 표현은 자유롭습니다. 조용한 장면도 그대로 존중합니다.",
       "settings.label.publisherGuidanceFormat": "출판사 안내 표현 형식",
       "settings.label.publisherGuidanceFormat.help": "출판사가 승인한 같은 항목을 본문 모델에 표시하는 구조만 바꿉니다. 간결형은 짧은 표식, 표준형은 현재 형식, 명시형은 작은 모델이 역할과 필드를 구분하기 쉬운 구조입니다. 강도·사실 권한·항목 수는 바뀌지 않습니다.",
       "settings.label.narrativeSupportMaxChars": "서사 안내 예산 (chars)",
@@ -1161,8 +1194,10 @@
       "settings.label.supervisorTimeout": "출판사 LLM Timeout (초)",
       "settings.label.topK": "ChromaDB 의미 기억 검색 수",
       "settings.label.topK.hint": "ChromaDB가 현재 입력과 의미적으로 가까운 기억을 몇 개 찾을지 정합니다. MariaDB는 선택된 벡터 결과를 정본 기억 row로 확인합니다.",
-      "settings.label.coreObjectiveMemoryMaxItems": "핵심 연관 기억 최대 수",
-      "settings.label.coreObjectiveMemoryMaxItems.hint": "관련도·인물 coverage·중복 제거 뒤 본문에 전달할 객관적 사건 요약의 최대 수입니다. 직접 근거·비밀 보호·상태·주관 기억·계층 보조 자료는 이 숫자를 소비하지 않지만 전체 문자 예산은 지킵니다.",
+      "settings.label.coreObjectiveMemoryMaxItems": "분류별 핵심 기억 우선 수",
+      "settings.label.coreObjectiveMemoryMaxItems.hint": "턴 요약과 각 기억 분류에서 먼저 담을 핵심 항목 수입니다. 남은 공간에는 관련 기억을 추가합니다.",
+      "settings.label.recentConversationReferenceCount": "최근 대화 참고 수",
+      "settings.label.recentConversationReferenceCount.hint": "기억을 찾을 때 참고할 최근 완결 대화 수입니다.",
       "settings.label.uiDetailMode": "UI 상세 수준",
       "settings.label.uiLanguage": "UI 언어",
       "settings.label.turnWorkflowHUDEnabled": "플로팅 UI",
@@ -1230,6 +1265,7 @@
       "timeline.worldline.repairSuccess": "분기 계보를 복구했습니다.",
       "timeline.worldline.repairFailed": "분기 계보 복구 실패: {reason}",
       "timeline.worldline.reason.parent_fork_source_history_unresolved": "부모 세션의 기존 기록에서도 분기 원본 턴을 찾지 못했습니다.",
+      "timeline.worldline.reason.official_branch_marker_observed_prefix_validated": "부모 메시지 기록으로 분기 위치를 확인했습니다.",
       "timeline.worldline.reason.parent_fork_source_history_ambiguous": "같은 분기 표식과 일치하는 부모 턴이 여러 개입니다.",
       "timeline.worldline.state.confirmed": "확인됨",
       "timeline.worldline.state.unresolved": "확인 필요",
@@ -1307,6 +1343,8 @@
       "timeline.session.unknown": "알 수 없음",
       "turn_hud.turn": "{n}턴",
       "turn_hud.turn_unknown": "턴 확인 중",
+      "turn_hud.slot.current": "현재 턴 생성",
+      "turn_hud.slot.previous": "직전 턴 평론가·저장",
       "turn_hud.completed": "저장 완료",
       "turn_hud.completed_with_warning": "경고와 함께 저장 완료",
       "turn_hud.invalidated": "작업 중단",
@@ -1315,8 +1353,18 @@
       "turn_hud.retryable": "다시 시도할 수 있음",
       "turn_hud.not_retryable": "자동 재시도 불가",
       "turn_hud.elapsed_seconds": "{n}초",
-      "turn_hud.stage_ledger": "전체 작동 확인",
+      "turn_hud.elapsed_minutes_seconds": "{m}분 {s}초",
+      "turn_hud.preprocessing.role": "담당",
+      "turn_hud.preprocessing.selection": "선정",
+      "turn_hud.preprocessing.outcome.repaired": "보정",
+      "turn_hud.preprocessing.outcome.partial": "부분",
+      "turn_hud.stage_ledger": "진행 단계",
       "turn_hud.stage_status.succeeded": "정상",
+      "turn_hud.stage_status.repaired": "형식 보정 후 해석",
+      "turn_hud.stage_status.partial": "일부 결과 해석",
+      "turn_hud.stage_status.no_recommendation": "추천 없음",
+      "turn_hud.preprocessing.selection.ai": "최종 기억 선택 · AI 추천",
+      "turn_hud.preprocessing.selection.go_default": "최종 기억 선택 · Go 기본 선택",
       "turn_hud.stage_status.skipped": "건너뜀",
       "turn_hud.stage_status.failed": "실패",
       "turn_hud.stage_status.invalidated": "중단",
@@ -1349,6 +1397,43 @@
       "turn_hud.transport.response_decode_failed": "백엔드 응답을 JSON으로 읽지 못했습니다.",
       "turn_hud.transport.connection_failed": "백엔드에 연결하지 못했습니다.",
       "turn_hud.stage.prepare_source": "현재 입력과 요청 확인",
+      "turn_hud.preprocessing.title": "전처리 담당별 시간",
+      "turn_hud.preprocessing.event_recent": "사건·진행",
+      "turn_hud.preprocessing.character_objective": "인물 상태",
+      "turn_hud.preprocessing.subjective_relationship": "주관 기억·관계",
+      "turn_hud.preprocessing.world_state": "세계·사물",
+      "turn_hud.preprocessing.unresolved_goal": "미해결 목표",
+      "turn_hud.preprocessing.round": "{n}차",
+      "turn_hud.preprocessing.total": "호출 합계",
+      "turn_hud.search.title": "추가 기억 검색",
+      "turn_hud.search.progress": "{done}/{total}개 처리",
+      "turn_hud.search.partial": "일부 결과 확인",
+      "turn_hud.search.details": "검색별 세부 시간",
+      "turn_hud.search.health": "검색 서버 확인",
+      "turn_hud.search.embedding": "질문 임베딩",
+      "turn_hud.search.vector_search": "기억 검색",
+      "turn_hud.search.revision_checks": "기억 유효성 확인",
+      "turn_hud.search.hydration": "원문 연결",
+      "turn_hud.search.assembly_wait": "조립 순서 대기",
+      "turn_hud.search.assembly": "후보 조립",
+      "turn_hud.timing.response": "응답 수신 완료",
+      "turn_hud.timing.total": "전체",
+      "turn_hud.timing.main": "응답",
+      "turn_hud.timing.prepare": "준비",
+      "turn_hud.timing.backend": "준비 세부",
+      "turn_hud.timing.backendTotal": "백엔드 처리 전체",
+      "turn_hud.timing.preprocessing_search": "전처리 보완 검색",
+      "turn_hud.timing.request_decode": "요청 읽기",
+      "turn_hud.timing.source_decision": "현재 입력 확인",
+      "turn_hud.timing.migration_guard": "세션 준비",
+      "turn_hud.timing.vector_recall": "기억 검색",
+      "turn_hud.timing.store_reads": "저장 자료 조회",
+      "turn_hud.timing.lorebook_reference": "로어북 조회",
+      "turn_hud.timing.recollection_filter": "기억 범위 정리",
+      "turn_hud.timing.injection_assembly": "기억 조립",
+      "turn_hud.timing.reference_recall": "원작 자료 조회",
+      "turn_hud.timing.supervisor_llm": "출판사 호출",
+      "turn_hud.timing.response_assembly": "최종 조립",
       "turn_hud.stage.recall_materialization": "기억·근거 불러오기",
       "turn_hud.stage.context_assembly": "입력 맥락 조립",
       "turn_hud.stage.publisher_llm": "출판사 LLM 호출",
@@ -1415,6 +1500,7 @@
       "turn_hud.notice.duplicate_conflict_preserved": "같은 턴에 서로 다른 값이 확인되어 새 값을 저장하지 않고 기존 값을 유지했습니다.",
       "turn_hud.notice.ooc_recognized": "OOC 인식",
       "turn_hud.notice.ooc_recognized_detail": "OOC 판정으로 입력 처리를 취소했습니다.",
+      "turn_hud.notice.risu_request_retry_observed": "Risu 요청 재시도 감지 · {n}회째",
       "turn_hud.error.logical_turn_replace_failed": "리롤 턴 교체에 실패했습니다.",
       "turn_hud.error.user_input_missing": "저장할 사용자 원문이 없습니다.",
       "sessionNormalize.title": "세션 정상화 / 콜드 스타트",
@@ -1549,12 +1635,23 @@
       "settings.hint.reasoningEffort": "none is omitted. Use provider-supported values like low/medium/high.",
       "settings.label.topK": "ChromaDB Semantic Memories",
       "settings.label.topK.hint": "How many semantically relevant memories ChromaDB should retrieve for the current input. MariaDB hydrates selected vector hits as canonical rows.",
-      "settings.label.coreObjectiveMemoryMaxItems": "Core Relevant Memory Maximum",
-      "settings.label.coreObjectiveMemoryMaxItems.hint": "Maximum objective event summaries delivered after relevance, entity coverage, and deduplication. Direct evidence, secret guards, states, subjective memories, and hierarchy support do not consume this count, but all remain inside the character budget.",
+      "settings.label.coreObjectiveMemoryMaxItems": "Core Memory Priority per Category",
+      "settings.label.coreObjectiveMemoryMaxItems.hint": "Prioritizes this many core items per summary group and memory category. Related memories use the remaining space.",
+      "settings.label.recentConversationReferenceCount": "Recent Conversation Reference Count",
+      "settings.label.recentConversationReferenceCount.hint": "How many recent completed conversations are referenced when finding memory.",
       "settings.label.llmRetryCount": "LLM Retry Count",
       "settings.label.llmRetryCount.hint": "0 = no retry (1 attempt only), 3 = 3 additional attempts on failure",
       "settings.label.maxInjectionChars": "Memory Context Budget (chars)",
       "settings.hint.maxInjectionChars": "Independent limit for memory, world, and relationship context. Original-work and lorebook budgets are excluded.",
+      "settings.label.memoryTransportMode": "Long-term Memory Transport",
+      "settings.memoryTransportMode.text": "Existing Text",
+      "settings.memoryTransportMode.google_pdf": "Google AI Studio / Vertex PDF",
+      "settings.memoryTransportMode.llm_gateway_pdf": "LLM Gateway PDF",
+      "settings.memoryTransportMode.provider_manager_pdf": "Yumi Provider Manager PDF (experimental)",
+      "settings.hint.memoryTransportMode": "Changes only the representation of long-term memory already selected by Go. The Yumi experiment requires both Gemini PDF and manual selection in Provider Manager.",
+      "settings.label.turnFinalizationMode": "Save Finalization Time",
+      "settings.turnFinalizationMode.immediate_after_response": "Current turn",
+      "settings.turnFinalizationMode.next_user_input": "Previous turn",
       "settings.label.referenceInjectionMaxChars": "Original-work DB Budget (chars)",
       "settings.hint.referenceInjectionMaxChars": "Independent original-work reference limit. It does not borrow unused memory or lorebook capacity.",
       "settings.label.lorebookReferenceMaxChars": "Lorebook Budget (chars)",
@@ -1566,7 +1663,7 @@
       "settings.label.narrativeGuideMode": "Narrative Guide Mode",
       "settings.label.narrativeGuideMode.help": "Auto does not infer genre from story keywords; it uses Standard. Genre-specific modes apply only when selected explicitly.",
       "settings.label.narrativeGuideStrength": "Narrative Guide Strength",
-      "settings.label.narrativeGuideStrength.help": "None skips only the Publisher LLM call while memory and secret guards remain active. Higher strength makes current-response priorities and execution order more explicit without expanding truth authority. Even Maximum cannot force user actions, new facts, relationship changes, or event closure, and a quiet scene may remain quiet.",
+      "settings.label.narrativeGuideStrength.help": "None skips only the Publisher call while memory and secret guards remain active. Weak offers brief hints; Medium offers connected recommendations. Strong and above require the response to carry out guidance aligned with the user's direction. Extreme connects action, reaction and consequence; Maximum gives a concrete execution brief for this response. The user's direction, revisions, pacing and choices take priority at every level; creative expression stays free, and a quiet scene may remain quiet.",
       "settings.label.publisherGuidanceFormat": "Publisher Guidance Format",
       "settings.label.publisherGuidanceFormat.help": "Changes only how the same accepted Publisher items are structured for the main model. Compact uses short markers, Standard preserves the current form, and Explicit makes roles and fields easier for smaller models to distinguish. Strength, fact authority, and item count do not change.",
       "settings.label.narrativeSupportMaxChars": "Narrative guidance budget (chars)",
@@ -1609,6 +1706,7 @@
       "timeline.worldline.repairSuccess": "Branch lineage repaired.",
       "timeline.worldline.repairFailed": "Branch lineage repair failed: {reason}",
       "timeline.worldline.reason.parent_fork_source_history_unresolved": "No exact fork source turn was found in the parent session history.",
+      "timeline.worldline.reason.official_branch_marker_observed_prefix_validated": "Fork position confirmed from the parent messages.",
       "timeline.worldline.reason.parent_fork_source_history_ambiguous": "Multiple parent turns match the same branch marker.",
       "timeline.worldline.state.confirmed": "Confirmed",
       "timeline.worldline.state.unresolved": "Needs confirmation",
@@ -1998,7 +2096,7 @@
       // ── Dashboard ──
       "dash.section.previews": "Previews",
       "dash.section.effectiveInput": "Final Effective Input",
-      "dash.section.effectiveInput.desc": "Shows only the final composed input included in the request.",
+      "dash.section.effectiveInput.desc": "Shows backend-composed content and Archive Center's observation just before returning the request. Later plugins and the final provider request are outside this observation.",
       "dash.section.inputTransparency": "Input Assembly Transparency",
       "dash.section.inputTransparency.desc": "Shows what auxiliary information was attached to the input in the last turn.",
       "dash.section.failedQueueDebug": "失敗キュー詳細（デバッグ）",
@@ -2023,8 +2121,14 @@
       "dash.preview.critic.notTried": "Not attempted",
       "dash.preview.notApplied": "Not applied",
       "dash.preview.payloadBudget.title": "Main-model Payload Budget",
-      "dash.preview.payloadBudget.actual": "Delivered",
-      "dash.preview.payloadBudget.planned": "Planned delivery",
+      "dash.preview.payloadBudget.actual": "Auxiliary input observed in request",
+      "dash.preview.payloadBudget.planned": "Backend assembly preview",
+      "dash.preview.verification.ready": "User and auxiliary input match Archive Center's observation before returning the request. This does not verify the final provider request.",
+      "dash.preview.verification.mismatch": "The backend assembly and pre-request observation do not match. The assembly below is for inspection and will not be stored as verified effective input.",
+      "dash.preview.verification.unobserved": "Pre-request application has not been observed yet. The backend assembly is shown below.",
+      "dash.preview.verification.userObserved": "User input observed in request",
+      "dash.preview.verification.userPlanned": "User input used by backend",
+      "dash.preview.verification.detail": "Observation result",
       "dash.preview.payloadBudget.configured": "Configured cap",
       "dash.preview.payloadBudget.effective": "Effective cap",
       "dash.preview.payloadBudget.assembly": "Title and separator assembly",
@@ -2036,6 +2140,8 @@
       "dash.preview.payloadBudget.lane.original_work": "Original-work DB",
       "dash.preview.payloadBudget.lane.lorebook_reference": "Lorebook",
       "dash.preview.payloadBudget.lane.output_guidance": "Publisher guidance",
+      "dash.preview.payloadBudget.lane.preprocessing_notes": "Preprocessing specialist notes",
+      "dash.preview.payloadBudget.additional": "Additional input",
 
       // ── Dashboard Status Rows ──
       "dash.status.plugin": "Plugin",
@@ -2163,10 +2269,20 @@
       "explorer.activeRebuild.orderOldest": "First missing turns",
       "explorer.activeRebuild.orderRecent": "Recent missing turns",
       "explorer.hypaImport.title": "📥 Import HypaMemory",
-      "explorer.hypaImport.desc": "Reads HypaMemory summaries from the current RisuAI chat and analyzes them via Critic (Reviewer).\nImportance scores, KG triples, and embeddings are generated automatically.\nPlease disable RisuAI's HypaMemory after import.",
-      "explorer.hypaImport.done": "✅ Import Started",
-      "explorer.hypaImport.bgNote": "Critic (Reviewer) analysis is running in the background. It may take some time to complete.",
-      "explorer.hypaImport.loading": "⏳ Sending...",
+      "explorer.hypaImport.desc": "Saves each HypaMemory summary from the current chat as a separate memory with its original text. Critic analysis adds supporting information.",
+      "explorer.hypaImport.done": "Import finished",
+      "explorer.hypaImport.loading": "Importing…",
+      "hypaImport.allMemories": "All memories",
+      "hypaImport.original": "HypaMemory original",
+      "hypaImport.details": "Import details",
+      "hypaImport.count.total": "Read",
+      "hypaImport.count.saved": "Newly saved",
+      "hypaImport.count.existing": "Already saved",
+      "hypaImport.count.failed": "Save failed",
+      "hypaImport.count.skipped": "Empty",
+      "hypaImport.count.analysis_succeeded": "Analyzed",
+      "hypaImport.count.analysis_failed": "Analysis failed",
+      "hypaImport.count.analysis_skipped": "Analysis not configured",
       "explorer.hypaImport.runBtn": "📥 Import HypaMemory",
       "explorer.filter.current": "Current session filter:",
       "explorer.resetRouting.loading": "⏳ Resetting routing state...",
@@ -2504,7 +2620,7 @@
       "rescan.confirmDesc": "Scan chat_logs for turns without memories\nand reprocess them with Critic (Reviewer) to rebuild missing Memory/Direct Evidence/KG/state outputs.",
       "hypaImport.confirmTarget": "Target session:",
       "hypaImport.confirmCount": "Summaries found:",
-      "hypaImport.confirmDesc": "Critic (Reviewer) will analyze each summary to generate\nimportance, KG triples, and embeddings.\n(May take time depending on summary count)",
+      "hypaImport.confirmDesc": "Each original summary is saved as a separate memory with Critic analysis added.\nCompletion may take time depending on the number of summaries.",
 
       // ── i18n parity backfill (generated; keep keysets aligned) ──
       "dash.section.activitySnapshot": "Activity Snapshot",
@@ -2512,6 +2628,8 @@
       "dash.section.turnTrace": "Last Turn Trace",
       "turn_hud.turn": "Turn {n}",
       "turn_hud.turn_unknown": "Resolving turn",
+      "turn_hud.slot.current": "Current turn generation",
+      "turn_hud.slot.previous": "Previous turn Critic and save",
       "turn_hud.completed": "Save complete",
       "turn_hud.completed_with_warning": "Saved with warnings",
       "turn_hud.invalidated": "Operation stopped",
@@ -2520,8 +2638,18 @@
       "turn_hud.retryable": "Retry is available",
       "turn_hud.not_retryable": "Automatic retry unavailable",
       "turn_hud.elapsed_seconds": "{n}s",
+      "turn_hud.elapsed_minutes_seconds": "{m}m {s}s",
+      "turn_hud.preprocessing.role": "Role",
+      "turn_hud.preprocessing.selection": "Pick",
+      "turn_hud.preprocessing.outcome.repaired": "Repaired",
+      "turn_hud.preprocessing.outcome.partial": "Partial",
       "turn_hud.stage_ledger": "Full operation check",
       "turn_hud.stage_status.succeeded": "OK",
+      "turn_hud.stage_status.repaired": "Format repaired",
+      "turn_hud.stage_status.partial": "Partial result read",
+      "turn_hud.stage_status.no_recommendation": "No recommendation",
+      "turn_hud.preprocessing.selection.ai": "Final memory selection · AI recommendation",
+      "turn_hud.preprocessing.selection.go_default": "Final memory selection · Go default",
       "turn_hud.stage_status.skipped": "Skipped",
       "turn_hud.stage_status.failed": "Failed",
       "turn_hud.stage_status.invalidated": "Stopped",
@@ -2554,6 +2682,43 @@
       "turn_hud.transport.response_decode_failed": "The backend response could not be decoded as JSON.",
       "turn_hud.transport.connection_failed": "Could not connect to the backend.",
       "turn_hud.stage.prepare_source": "Confirming current input and request",
+      "turn_hud.preprocessing.title": "Preprocessing call times",
+      "turn_hud.preprocessing.event_recent": "Events and recent history",
+      "turn_hud.preprocessing.character_objective": "Objective character state",
+      "turn_hud.preprocessing.subjective_relationship": "Subjective memory and relationships",
+      "turn_hud.preprocessing.world_state": "World and item state",
+      "turn_hud.preprocessing.unresolved_goal": "Unresolved goals",
+      "turn_hud.preprocessing.round": "Round {n}",
+      "turn_hud.preprocessing.total": "Call total",
+      "turn_hud.search.title": "Supplemental memory search",
+      "turn_hud.search.progress": "{done}/{total} processed",
+      "turn_hud.search.partial": "Partial results",
+      "turn_hud.search.details": "Search timing details",
+      "turn_hud.search.health": "Search server check",
+      "turn_hud.search.embedding": "Question embedding",
+      "turn_hud.search.vector_search": "Memory search",
+      "turn_hud.search.revision_checks": "Memory validity check",
+      "turn_hud.search.hydration": "Source hydration",
+      "turn_hud.search.assembly_wait": "Assembly wait",
+      "turn_hud.search.assembly": "Candidate assembly",
+      "turn_hud.timing.response": "Response received",
+      "turn_hud.timing.total": "Total",
+      "turn_hud.timing.main": "Response",
+      "turn_hud.timing.prepare": "Preparation",
+      "turn_hud.timing.backend": "Preparation details",
+      "turn_hud.timing.backendTotal": "Backend processing total",
+      "turn_hud.timing.preprocessing_search": "Preprocessing supplemental searches",
+      "turn_hud.timing.request_decode": "Read request",
+      "turn_hud.timing.source_decision": "Resolve current input",
+      "turn_hud.timing.migration_guard": "Prepare session",
+      "turn_hud.timing.vector_recall": "Memory retrieval",
+      "turn_hud.timing.store_reads": "Stored data reads",
+      "turn_hud.timing.lorebook_reference": "Lorebook retrieval",
+      "turn_hud.timing.recollection_filter": "Memory scope processing",
+      "turn_hud.timing.injection_assembly": "Memory assembly",
+      "turn_hud.timing.reference_recall": "Original work retrieval",
+      "turn_hud.timing.supervisor_llm": "Publisher call",
+      "turn_hud.timing.response_assembly": "Final assembly",
       "turn_hud.stage.recall_materialization": "Loading memory and evidence",
       "turn_hud.stage.context_assembly": "Assembling input context",
       "turn_hud.stage.publisher_llm": "Publisher LLM call",
@@ -2620,6 +2785,7 @@
       "turn_hud.notice.duplicate_conflict_preserved": "Different values were found for the same turn, so the existing value was kept and the new value was not saved.",
       "turn_hud.notice.ooc_recognized": "OOC recognized",
       "turn_hud.notice.ooc_recognized_detail": "Input processing was cancelled after the OOC decision.",
+      "turn_hud.notice.risu_request_retry_observed": "Risu request retry detected · attempt {n}",
       "turn_hud.error.logical_turn_replace_failed": "Failed to replace the rerolled turn.",
       "turn_hud.error.user_input_missing": "The user source required for saving is missing.",
       "sessionNormalize.title": "Session Normalize / Cold Start",
@@ -2754,12 +2920,23 @@
       "settings.hint.reasoningEffort": "none は送信しません。low/medium/high など provider 対応値を使用してください。",
       "settings.label.topK": "ChromaDB意味記憶検索数",
       "settings.label.topK.hint": "現在の入力に意味的に近い記憶をChromaDBで何件取得するかを指定します。MariaDBは選ばれたベクトル結果を正本rowとして確認します。",
-      "settings.label.coreObjectiveMemoryMaxItems": "核心関連記憶の最大数",
-      "settings.label.coreObjectiveMemoryMaxItems.hint": "関連度・人物coverage・重複除去の後に本文へ渡す客観的事件要約の最大数です。直接根拠、秘密guard、状態、主観記憶、階層supportはこの数を消費しませんが、全体の文字予算には従います。",
+      "settings.label.coreObjectiveMemoryMaxItems": "分類ごとの核心記憶の優先数",
+      "settings.label.coreObjectiveMemoryMaxItems.hint": "ターン要約と各記憶分類で先に入れる核心項目数です。残りの領域には関連する記憶を追加します。",
+      "settings.label.recentConversationReferenceCount": "最近の会話参照数",
+      "settings.label.recentConversationReferenceCount.hint": "記憶検索で参照する最近の完結会話数です。",
       "settings.label.llmRetryCount": "LLMリトライ回数",
       "settings.label.llmRetryCount.hint": "0 = リトライなし（1回のみ）、3 = 失敗時3回追加試行",
       "settings.label.maxInjectionChars": "一般記憶予算（chars）",
       "settings.hint.maxInjectionChars": "記憶・世界・関係コンテキスト専用の上限です。原作DBとロアブックの予算は含みません。",
+      "settings.label.memoryTransportMode": "長期記憶の転送方式",
+      "settings.memoryTransportMode.text": "既存 Text",
+      "settings.memoryTransportMode.google_pdf": "Google AI Studio・Vertex PDF",
+      "settings.memoryTransportMode.llm_gateway_pdf": "LLM Gateway PDF",
+      "settings.memoryTransportMode.provider_manager_pdf": "Yumi Provider Manager PDF（実験）",
+      "settings.hint.memoryTransportMode": "Go が選択済みの長期記憶だけ転送形式を変更します。Yumi 実験モードでは Provider Manager の Gemini PDF と手動指定を両方有効にしてください。",
+      "settings.label.turnFinalizationMode": "保存確定時点",
+      "settings.turnFinalizationMode.immediate_after_response": "現在のターン",
+      "settings.turnFinalizationMode.next_user_input": "直前のターン",
       "settings.label.referenceInjectionMaxChars": "原作DB予算（chars）",
       "settings.hint.referenceInjectionMaxChars": "原作参照専用の独立上限です。記憶やロアブックの未使用分を借用しません。",
       "settings.label.lorebookReferenceMaxChars": "ロアブック予算（chars）",
@@ -2771,7 +2948,7 @@
       "settings.label.narrativeGuideMode": "ナラティブガイドモード",
       "settings.label.narrativeGuideMode.help": "Autoは本文キーワードからジャンルを推定せずStandardとして動作します。ジャンル別モードはユーザーが明示的に選んだ場合のみ適用されます。",
       "settings.label.narrativeGuideStrength": "ナラティブガイド強度",
-      "settings.label.narrativeGuideStrength.help": "なしはPublisher LLM呼び出しだけを停止し、記憶と秘密保護は維持します。強度が高いほど現在の応答の優先順位と適用順序を明確にしますが、事実権限は増えません。最大でもユーザー行動、新事実、関係変化、事件終結を強制せず、静かな場面は静かなまま維持できます。",
+      "settings.label.narrativeGuideStrength.help": "なしはPublisherの呼び出しだけを停止し、記憶と秘密保護は維持します。弱くは短いヒント、中は文脈を結ぶ提案です。強く以上はユーザーの方向に沿うガイドの実行を本文に求め、非常に強くは行動・反応・結果を結び、最大は今回の応答の展開を具体的に示します。全段階でユーザーの方向・設定変更・ペース・選択を優先し、創作表現は自由です。静かな場面も尊重します。",
       "settings.label.publisherGuidanceFormat": "Publisher案内の表現形式",
       "settings.label.publisherGuidanceFormat.help": "承認済みの同じPublisher項目を本文モデルに示す構造だけを変更します。Compactは短い表記、Standardは現在の形式、Explicitは小規模モデルが役割とフィールドを区別しやすい構造です。強度・事実権限・項目数は変わりません。",
       "settings.label.narrativeSupportMaxChars": "ナラティブ案内予算（chars）",
@@ -2814,6 +2991,7 @@
       "timeline.worldline.repairSuccess": "分岐系譜を復旧しました。",
       "timeline.worldline.repairFailed": "分岐系譜の復旧に失敗しました: {reason}",
       "timeline.worldline.reason.parent_fork_source_history_unresolved": "親セッション履歴に一致する分岐元ターンがありません。",
+      "timeline.worldline.reason.official_branch_marker_observed_prefix_validated": "親メッセージの記録から分岐位置を確認しました。",
       "timeline.worldline.reason.parent_fork_source_history_ambiguous": "同じ分岐マーカーに一致する親ターンが複数あります。",
       "timeline.worldline.state.confirmed": "確認済み",
       "timeline.worldline.state.unresolved": "確認が必要",
@@ -3163,7 +3341,7 @@
       "dash.section.turnHistory": "最近のターン履歴",
       "dash.section.previews": "詳細プレビュー",
       "dash.section.effectiveInput": "最終入力 (Effective Input)",
-      "dash.section.effectiveInput.desc": "実際に最終リクエストへ入った入力のみを表示します。",
+      "dash.section.effectiveInput.desc": "バックエンドの組立内容とArchive Centerがリクエストを返す直前に確認した反映状態を表示します。その後のプラグイン処理と最終プロバイダーリクエストは観測範囲外です。",
       "dash.section.inputTransparency": "入力組立透明性 (Input Transparency)",
       "dash.section.inputTransparency.desc": "最後のターンで実際にどの補助情報が入力に付加されたかを表示します。",
       "dash.section.failedQueueDebug": "失敗キュー詳細（デバッグ）",
@@ -3188,8 +3366,14 @@
       "dash.preview.critic.notTried": "未試行",
       "dash.preview.notApplied": "未適用",
       "dash.preview.payloadBudget.title": "本文Payload予算",
-      "dash.preview.payloadBudget.actual": "実際の配信",
-      "dash.preview.payloadBudget.planned": "配信予定",
+      "dash.preview.payloadBudget.actual": "補助入力のリクエスト反映を確認",
+      "dash.preview.payloadBudget.planned": "バックエンド組立プレビュー",
+      "dash.preview.verification.ready": "ユーザー入力と補助入力がリクエスト直前の観測と一致しました。最終プロバイダーリクエストの確認ではありません。",
+      "dash.preview.verification.mismatch": "バックエンドの組立内容とリクエスト直前の観測が一致しません。以下は確認用の組立内容で、検証済み最終入力として保存されません。",
+      "dash.preview.verification.unobserved": "リクエスト直前の反映はまだ確認されていません。以下はバックエンドの組立内容です。",
+      "dash.preview.verification.userObserved": "リクエストで確認したユーザー入力",
+      "dash.preview.verification.userPlanned": "バックエンドが参照したユーザー入力",
+      "dash.preview.verification.detail": "確認結果",
       "dash.preview.payloadBudget.configured": "設定上限",
       "dash.preview.payloadBudget.effective": "有効上限",
       "dash.preview.payloadBudget.assembly": "タイトル・区切り組み立て費用",
@@ -3201,6 +3385,8 @@
       "dash.preview.payloadBudget.lane.original_work": "原作DB",
       "dash.preview.payloadBudget.lane.lorebook_reference": "ロアブック",
       "dash.preview.payloadBudget.lane.output_guidance": "パブリッシャー案内",
+      "dash.preview.payloadBudget.lane.preprocessing_notes": "前処理担当の解釈",
+      "dash.preview.payloadBudget.additional": "追加入力",
 
       // ── Dashboard Status Rows ──
       "dash.status.plugin": "プラグイン",
@@ -3328,10 +3514,20 @@
       "explorer.activeRebuild.orderOldest": "最初の欠落ターンから",
       "explorer.activeRebuild.orderRecent": "最近の欠落ターンから",
       "explorer.hypaImport.title": "📥 HypaMemoryインポート",
-      "explorer.hypaImport.desc": "現在のRisuAIチャットのHypaMemory要約を評論家が分析します。\nimportanceスコア、KG triple、埋め込みが自動生成されます。\nインポート後はRisuAIのHypaMemoryをオフにしてください。",
-      "explorer.hypaImport.done": "✅ インポート開始",
-      "explorer.hypaImport.bgNote": "評論家分析がバックグラウンドで進行中です。完了まで時間がかかる場合があります。",
-      "explorer.hypaImport.loading": "⏳ 送信中...",
+      "explorer.hypaImport.desc": "現在のチャットのハイパ要約を、原文のまま一件ずつ記憶として保存します。評論家の分析は補足情報として追加されます。",
+      "explorer.hypaImport.done": "インポート処理完了",
+      "explorer.hypaImport.loading": "インポート中…",
+      "hypaImport.allMemories": "すべての記憶",
+      "hypaImport.original": "ハイパ原文",
+      "hypaImport.details": "処理内訳",
+      "hypaImport.count.total": "読み込み",
+      "hypaImport.count.saved": "新規保存",
+      "hypaImport.count.existing": "保存済み",
+      "hypaImport.count.failed": "保存失敗",
+      "hypaImport.count.skipped": "空の項目",
+      "hypaImport.count.analysis_succeeded": "分析完了",
+      "hypaImport.count.analysis_failed": "分析失敗",
+      "hypaImport.count.analysis_skipped": "分析未設定",
       "explorer.hypaImport.runBtn": "📥 HypaMemoryインポート",
       "explorer.filter.current": "現在のセッションフィルタ:",
       "explorer.resetRouting.loading": "⏳ ルーティング状態を初期化中...",
@@ -3669,7 +3865,7 @@
       "rescan.confirmDesc": "会話原文を走査して記憶のないターンを見つけ\n評論家で再処理し、欠落した記憶/直接根拠/KG/状態を再生成します。",
       "hypaImport.confirmTarget": "対象セッション:",
       "hypaImport.confirmCount": "発見された要約数:",
-      "hypaImport.confirmDesc": "各要約を評論家が分析し\nimportance、KGトリプル、embeddingを生成します。\n（要約数によっては時間がかかる場合があります）",
+      "hypaImport.confirmDesc": "各要約の原文を個別の記憶として保存し、評論家の分析を追加します。\n要約数によっては完了まで時間がかかる場合があります。",
 
       // ── i18n parity backfill (generated; keep keysets aligned) ──
       "timeline.button.cleanup": "元セッションを整理",
@@ -3715,6 +3911,8 @@
       "timeline.session.rollbackTitle": "ledgerに基づき最新のセッション移行をロールバック",
       "turn_hud.turn": "ターン {n}",
       "turn_hud.turn_unknown": "ターン確認中",
+      "turn_hud.slot.current": "現在ターンの生成",
+      "turn_hud.slot.previous": "直前ターンの批評・保存",
       "turn_hud.completed": "保存完了",
       "turn_hud.completed_with_warning": "警告付きで保存完了",
       "turn_hud.invalidated": "処理中断",
@@ -3723,8 +3921,18 @@
       "turn_hud.retryable": "再試行できます",
       "turn_hud.not_retryable": "自動再試行はできません",
       "turn_hud.elapsed_seconds": "{n}秒",
+      "turn_hud.elapsed_minutes_seconds": "{m}分{s}秒",
+      "turn_hud.preprocessing.role": "担当",
+      "turn_hud.preprocessing.selection": "選定",
+      "turn_hud.preprocessing.outcome.repaired": "補正",
+      "turn_hud.preprocessing.outcome.partial": "一部",
       "turn_hud.stage_ledger": "全処理の確認",
       "turn_hud.stage_status.succeeded": "正常",
+      "turn_hud.stage_status.repaired": "形式を補正して読取",
+      "turn_hud.stage_status.partial": "一部の結果を読取",
+      "turn_hud.stage_status.no_recommendation": "推薦なし",
+      "turn_hud.preprocessing.selection.ai": "最終記憶選択 · AI推薦",
+      "turn_hud.preprocessing.selection.go_default": "最終記憶選択 · Go標準選択",
       "turn_hud.stage_status.skipped": "スキップ",
       "turn_hud.stage_status.failed": "失敗",
       "turn_hud.stage_status.invalidated": "中断",
@@ -3757,6 +3965,43 @@
       "turn_hud.transport.response_decode_failed": "バックエンド応答をJSONとして読み取れませんでした。",
       "turn_hud.transport.connection_failed": "バックエンドに接続できませんでした。",
       "turn_hud.stage.prepare_source": "現在の入力とリクエストを確認",
+      "turn_hud.preprocessing.title": "前処理の担当別呼び出し時間",
+      "turn_hud.preprocessing.event_recent": "事件・進行履歴",
+      "turn_hud.preprocessing.character_objective": "人物の客観的状態",
+      "turn_hud.preprocessing.subjective_relationship": "主観記憶・関係",
+      "turn_hud.preprocessing.world_state": "世界・事物の状態",
+      "turn_hud.preprocessing.unresolved_goal": "未解決の目標",
+      "turn_hud.preprocessing.round": "{n}回目",
+      "turn_hud.preprocessing.total": "呼び出し合計",
+      "turn_hud.search.title": "追加の記憶検索",
+      "turn_hud.search.progress": "{done}/{total}件処理",
+      "turn_hud.search.partial": "一部の結果を確認",
+      "turn_hud.search.details": "検索別の詳細時間",
+      "turn_hud.search.health": "検索サーバー確認",
+      "turn_hud.search.embedding": "質問の埋め込み",
+      "turn_hud.search.vector_search": "記憶検索",
+      "turn_hud.search.revision_checks": "記憶の有効性確認",
+      "turn_hud.search.hydration": "原文の接続",
+      "turn_hud.search.assembly_wait": "組み立て待ち",
+      "turn_hud.search.assembly": "候補の組み立て",
+      "turn_hud.timing.response": "応答を受信",
+      "turn_hud.timing.total": "全体",
+      "turn_hud.timing.main": "応答",
+      "turn_hud.timing.prepare": "準備",
+      "turn_hud.timing.backend": "準備の詳細",
+      "turn_hud.timing.backendTotal": "バックエンド処理全体",
+      "turn_hud.timing.preprocessing_search": "前処理の補足検索",
+      "turn_hud.timing.request_decode": "リクエスト読込",
+      "turn_hud.timing.source_decision": "現在入力の確認",
+      "turn_hud.timing.migration_guard": "セッション準備",
+      "turn_hud.timing.vector_recall": "記憶検索",
+      "turn_hud.timing.store_reads": "保存資料の取得",
+      "turn_hud.timing.lorebook_reference": "ロアブック検索",
+      "turn_hud.timing.recollection_filter": "記憶範囲の整理",
+      "turn_hud.timing.injection_assembly": "記憶組立 (担当分析・補完検索を含む)",
+      "turn_hud.timing.reference_recall": "原作資料検索",
+      "turn_hud.timing.supervisor_llm": "出版社呼出",
+      "turn_hud.timing.response_assembly": "最終組立 (出版社を含む)",
       "turn_hud.stage.recall_materialization": "記憶と根拠を読み込み",
       "turn_hud.stage.context_assembly": "入力コンテキストを組み立て",
       "turn_hud.stage.publisher_llm": "Publisher LLM 呼び出し",
@@ -3823,6 +4068,7 @@
       "turn_hud.notice.duplicate_conflict_preserved": "同じターンに異なる値が確認されたため、新規保存せず既存値を維持しました。",
       "turn_hud.notice.ooc_recognized": "OOCを認識",
       "turn_hud.notice.ooc_recognized_detail": "OOC判定により入力処理をキャンセルしました。",
+      "turn_hud.notice.risu_request_retry_observed": "Risuリクエストの再試行を検出 · {n}回目",
       "turn_hud.error.logical_turn_replace_failed": "再生成ターンの置換に失敗しました。",
       "turn_hud.error.user_input_missing": "保存するユーザー原文がありません。",
       "sessionNormalize.title": "セッション正規化 / コールドスタート",
@@ -4603,6 +4849,9 @@
   // request identifier. Keep the exact beforeRequest context as the callback
   // handoff, then detach it synchronously when afterRequest starts.
   let _activeFinalConfirmationRequestContext = null;
+  const _nextInputFinalizations = new Map();
+  let _nextInputFinalizationLoaded = false;
+  let _memoryTransportBodyInterceptorRegistration = null;
   const _pendingFinalConfirmations = new Map();
   const _pendingFinalConfirmationRecoveryEntries = new Map();
   let _pendingFinalConfirmationDrainInFlight = false;
@@ -5003,9 +5252,27 @@
     });
   }
 
+  function terminalizeActiveFinalConfirmationRequestContext(reasonCode) {
+    const active = _activeFinalConfirmationRequestContext;
+    if (!finalConfirmationRequestContextOwnsPendingResponse(active)) return false;
+    const reason = String(reasonCode || "host_lifecycle_superseded_pending_request");
+    active.state = "terminal";
+    active.terminalReason = reason;
+    _activeFinalConfirmationRequestContext = null;
+    updateRuntimeState("lastStreamingAfterRequest", "warn", {
+      detail: "pending Archive request context ended by a confirmed Host lifecycle signal",
+      reason_code: reason,
+      sessionId: String(active.sessionId || ""),
+      requestId: String(active.requestId || ""),
+      requestType: String(active.requestType || "model"),
+    });
+    return true;
+  }
+
   async function onInputHook(rawInput) {
     try {
       recordRisuHookLifecycle("input", "callback_observed");
+      terminalizeActiveFinalConfirmationRequestContext("new_host_input_observed");
       const sessionId = await getCurrentChatSessionId();
       cacheRawInputForSession(sessionId, rawInput);
       if (isRisuHistoryTrimCommandText(rawInput)) {
@@ -5048,6 +5315,17 @@
     }
     _activeFinalConfirmationRequestContext = null;
     try {
+      const registrationId = _memoryTransportBodyInterceptorRegistration && typeof _memoryTransportBodyInterceptorRegistration === "object"
+        ? _memoryTransportBodyInterceptorRegistration.id
+        : _memoryTransportBodyInterceptorRegistration;
+      if (registrationId && R && typeof R.unregisterBodyIntercepter === "function") {
+        await R.unregisterBodyIntercepter(registrationId);
+      }
+    } catch (err) {
+      debugLog("[unload] memory transport body interceptor cleanup failed:", err && err.message);
+    }
+    _memoryTransportBodyInterceptorRegistration = null;
+    try {
       await unloadTurnWorkflowHUD();
     } catch (err) {
       debugLog("[unload] turn workflow HUD cleanup failed:", err && err.message);
@@ -5085,6 +5363,7 @@
 
   async function registerRisuLifecycleHooks() {
     if (!R) return;
+    await registerMemoryTransportBodyInterceptor();
     try {
       if (typeof R.addRisuScriptHandler === "function") {
         recordRisuHookLifecycle("input", "registration_requested_unconfirmed");
@@ -7776,6 +8055,258 @@
     }
   }
 
+  function serializeNextInputFinalizationMarker(marker) {
+    const source = marker && typeof marker === "object" ? marker : {};
+    const sessionId = String(source.sessionId || "").trim();
+    const requestId = String(source.requestId || "").trim();
+    const userMessageIndex = Number(source.userMessageIndex);
+    if (!sessionId || !requestId || !Number.isInteger(userMessageIndex) || userMessageIndex < 0) return null;
+    return {
+      contract_version: "next_input_finalization_marker.v1",
+      marker_id: String(source.markerId || [sessionId, requestId, userMessageIndex].join("|")).slice(0, 1400),
+      session_id: sessionId.slice(0, 512),
+      request_id: requestId.slice(0, 512),
+      request_type: String(source.requestType || "model").slice(0, 64),
+      host_chat_id: String(source.hostChatId || "").slice(0, 512),
+      request_message_count: Math.max(0, Math.trunc(Number(source.requestMessageCount || 0))),
+      user_message_index: userMessageIndex,
+      user_observed_pair_ordinal: Math.max(0, Math.trunc(Number(source.userObservedPairOrdinal || 0))),
+      user_message_chat_id: String(source.userMessageChatId || "").slice(0, 512),
+      user_message_time_ms: Math.max(0, Math.trunc(Number(source.userMessageTimeMs || 0))),
+      user_observed_content_hash: String(source.userObservedContentHash || "").slice(0, 128),
+      accepted_assistant_hash: String(source.acceptedAssistantHash || "").slice(0, 128),
+      queued_at: String(source.queuedAt || new Date().toISOString()),
+    };
+  }
+
+  async function saveNextInputFinalizationsToStorage() {
+    const items = [];
+    for (const marker of _nextInputFinalizations.values()) {
+      const safe = serializeNextInputFinalizationMarker(marker);
+      if (safe) items.push(safe);
+    }
+    await persistentSet(NEXT_INPUT_FINALIZATION_STORAGE_KEY, JSON.stringify({
+      v: 1,
+      saved_at: new Date().toISOString(),
+      items,
+    }));
+  }
+
+  async function loadNextInputFinalizationsFromStorage() {
+    if (_nextInputFinalizationLoaded) return _nextInputFinalizations.size;
+    _nextInputFinalizationLoaded = true;
+    const raw = await persistentGet(NEXT_INPUT_FINALIZATION_STORAGE_KEY);
+    if (!raw || typeof raw !== "string") return 0;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.items)) return 0;
+      for (const item of parsed.items) {
+        const marker = serializeNextInputFinalizationMarker({
+          markerId: item && item.marker_id,
+          sessionId: item && item.session_id,
+          requestId: item && item.request_id,
+          requestType: item && item.request_type,
+          hostChatId: item && item.host_chat_id,
+          requestMessageCount: item && item.request_message_count,
+          userMessageIndex: item && item.user_message_index,
+          userObservedPairOrdinal: item && item.user_observed_pair_ordinal,
+          userMessageChatId: item && item.user_message_chat_id,
+          userMessageTimeMs: item && item.user_message_time_ms,
+          userObservedContentHash: item && item.user_observed_content_hash,
+          acceptedAssistantHash: item && item.accepted_assistant_hash,
+          queuedAt: item && item.queued_at,
+        });
+        if (marker) {
+          _nextInputFinalizations.set(marker.session_id, {
+            markerId: marker.marker_id,
+            sessionId: marker.session_id,
+            requestId: marker.request_id,
+            requestType: marker.request_type,
+            hostChatId: marker.host_chat_id,
+            requestMessageCount: marker.request_message_count,
+            userMessageIndex: marker.user_message_index,
+            userObservedPairOrdinal: marker.user_observed_pair_ordinal,
+            userMessageChatId: marker.user_message_chat_id,
+            userMessageTimeMs: marker.user_message_time_ms,
+            userObservedContentHash: marker.user_observed_content_hash,
+            acceptedAssistantHash: marker.accepted_assistant_hash,
+            queuedAt: marker.queued_at,
+            orchestrationResult: null,
+            inFlight: false,
+          });
+        }
+      }
+    } catch (err) {
+      warnLog("next-input finalization restore failed (non-fatal):", err && err.message);
+    }
+    return _nextInputFinalizations.size;
+  }
+
+  function queueNextInputFinalization(requestContext, sourceAcceptanceFinality) {
+    const context = requestContext && typeof requestContext === "object" ? requestContext : {};
+    const sessionId = String(context.sessionId || "").trim();
+    const requestId = String(context.requestId || "").trim();
+    const userMessageIndex = Number(context.userMessageIndex);
+    if (!sessionId || !requestId || !Number.isInteger(userMessageIndex) || userMessageIndex < 0) return false;
+    const marker = {
+      markerId: [sessionId, requestId, userMessageIndex].join("|"),
+      sessionId,
+      requestId,
+      requestType: String(context.requestType || "model"),
+      hostChatId: String(context.hostChatId || ""),
+      requestMessageCount: Math.max(0, Math.trunc(Number(context.requestMessageCount || 0))),
+      userMessageIndex,
+      userObservedPairOrdinal: Math.max(0, Math.trunc(Number(context.userObservedPairOrdinal || 0))),
+      userMessageChatId: String(context.userMessageChatId || ""),
+      userMessageTimeMs: Math.max(0, Math.trunc(Number(context.userMessageTimeMs || 0))),
+      userObservedContentHash: String(context.userObservedContentHash || ""),
+      acceptedAssistantHash: String(sourceAcceptanceFinality && sourceAcceptanceFinality.persistence_content_hash || ""),
+      queuedAt: new Date().toISOString(),
+      orchestrationResult: context.orchestrationResult || null,
+      hostContext: context.hostContext || null,
+      inFlight: false,
+    };
+    _nextInputFinalizations.set(sessionId, marker);
+    saveNextInputFinalizationsToStorage().catch(function(err) {
+      warnLog("next-input finalization marker save failed:", err && err.message);
+    });
+    return true;
+  }
+
+  async function buildNextInputSourceAcceptanceFinality(marker, pair, currentRequestContext, hostContext = null) {
+    const resolved = await resolveCurrentActiveChatObject(marker.sessionId, hostContext);
+    const chat = resolved && resolved.chat && typeof resolved.chat === "object" ? resolved.chat : null;
+    const messages = chat && Array.isArray(chat.message) ? chat.message : [];
+    const assistantIndex = Number(pair && pair.risuAssistantMessageIndex);
+    const currentUserIndex = Number(currentRequestContext && currentRequestContext.userMessageIndex);
+    if (!chat || !Number.isInteger(assistantIndex) || assistantIndex < 0 || assistantIndex >= messages.length) return null;
+    if (!Number.isInteger(currentUserIndex) || currentUserIndex <= assistantIndex || currentUserIndex >= messages.length) return null;
+    const assistantMessage = messages[assistantIndex];
+    const currentUserMessage = messages[currentUserIndex];
+    const assistantComparable = extractComparableMessageRoleAndContent(assistantMessage);
+    const currentUserComparable = extractComparableMessageRoleAndContent(currentUserMessage);
+    if (!assistantComparable || assistantComparable.role !== "assistant" || !currentUserComparable || currentUserComparable.role !== "user") return null;
+    const base = await buildCompleteTurnSourceAcceptanceObservation(
+      marker.sessionId,
+      pair.assistantContent,
+      { allowExistingActiveMessage: true, userInput: pair.userContent, hostContext }
+    );
+    const userHash = computeOrchestrationDirtyHashOr1c(String(pair.userContent || "").trim());
+    const assistantHash = computeOrchestrationDirtyHashOr1c(normalizeAssistantPersistenceCandidate(pair.assistantContent));
+    return Object.assign({}, base, {
+      accepted: true,
+      contract_version: "source_acceptance_observation.v2",
+      host_lifecycle_contract_version: "risu_host_lifecycle_observation.v1",
+      observed_at_ms: Date.now(),
+      session_id: marker.sessionId,
+      finality_source: "risu_next_host_signal_active_chat",
+      finality_state: "committed_assistant_observed",
+      host_signal_source: "beforeRequest",
+      archive_center_request_correlation_id: marker.requestId,
+      request_id_provenance: "archive_center_correlation",
+      request_correlation_state: "matched_before_request_context",
+      request_type: marker.requestType || "model",
+      response_role: "assistant",
+      after_request_content_hash: marker.acceptedAssistantHash || assistantHash,
+      host_chat_id: String(chat.id || marker.hostChatId || ""),
+      host_chat_id_state: String(chat.id || marker.hostChatId || "") ? "observed" : "unobserved",
+      chat_streaming_state: "unobserved",
+      active_message_count: messages.length,
+      request_message_count: marker.requestMessageCount,
+      message_index: assistantIndex,
+      message_role: "char",
+      message_disabled_state: "not_disabled",
+      user_message_index: marker.userMessageIndex,
+      user_observed_pair_ordinal: marker.userObservedPairOrdinal,
+      user_message_chat_id: marker.userMessageChatId,
+      user_message_chat_id_state: marker.userMessageChatId ? "observed_before_request" : "unobserved",
+      user_message_time_ms: marker.userMessageTimeMs,
+      user_message_time_state: marker.userMessageTimeMs > 0 ? "observed_before_request" : "unobserved",
+      user_observed_content_hash: userHash,
+      user_persistence_content_hash: userHash,
+      observed_content_hash: String(base && base.observed_content_hash || assistantHash),
+      persistence_content_hash: assistantHash,
+      hash_algorithm: "or1c_utf16_djb2.v1",
+      position_observation: "committed_before_next_host_signal",
+      later_active_turn_message_count: 1,
+      next_signal_active_role: "user",
+      next_signal_user_index: currentUserIndex,
+      next_signal_user_observed_content_hash: computeOrchestrationDirtyHashOr1c(String(currentUserComparable.content || "").trim()),
+      revision_state: "not_exposed_by_risuai",
+      prompt_memory_availability: "through_previous_confirmed_turn",
+    });
+  }
+
+  function beginNextInputFinalizationPipeline(sessionId, currentRequestContext, hostContext = null) {
+    const sid = String(sessionId || "").trim();
+    const marker = _nextInputFinalizations.get(sid);
+    if (!marker) return { owned: false, started: false, reason: "no_pending_previous_turn" };
+    const currentUserIndex = Number(currentRequestContext && currentRequestContext.userMessageIndex);
+    if (!Number.isInteger(currentUserIndex) || currentUserIndex <= Number(marker.userMessageIndex)) {
+      return { owned: true, started: false, reason: "same_user_row_reroll_or_edit" };
+    }
+    if (marker.inFlight) return { owned: true, started: false, reason: "previous_turn_finalization_in_flight" };
+    marker.inFlight = true;
+    const markerId = String(marker.markerId || "");
+    Promise.resolve().then(async function persistPreviousCompletedPairAtNextInput() {
+      const resolved = await resolveCurrentActiveChatObject(sid, hostContext);
+      const chat = resolved && resolved.chat && typeof resolved.chat === "object" ? resolved.chat : null;
+      const chatId = String(chat && chat.id || "").trim();
+      if (marker.hostChatId && chatId && marker.hostChatId !== chatId) {
+        return { status: "skipped", reason: "pending_host_chat_not_active" };
+      }
+      const sourceMessages = chat && Array.isArray(chat.message) ? chat.message : [];
+      const pendingUserMessage = sourceMessages[Number(marker.userMessageIndex)];
+      const pendingUserComparable = extractComparableMessageRoleAndContent(pendingUserMessage);
+      if (!pendingUserComparable || pendingUserComparable.role !== "user") {
+        return { status: "skipped", reason: "pending_user_row_not_observed" };
+      }
+      const observedUserChatId = String(pendingUserMessage && pendingUserMessage.chatId || "").trim();
+      const stableUserRowMatches = marker.userMessageChatId && observedUserChatId
+        ? marker.userMessageChatId === observedUserChatId
+        : computeOrchestrationDirtyHashOr1c(String(pendingUserComparable.content || "").trim()) === marker.userObservedContentHash;
+      if (!stableUserRowMatches) {
+        return { status: "skipped", reason: "pending_user_row_identity_changed" };
+      }
+      const comparable = resolved.chat ? extractActiveChatComparableMessages(resolved.chat) : [];
+      const pairs = buildCompletedTurnPairsFromActiveChatMessages(comparable, {
+        source: "risu_next_host_signal_active_chat",
+      });
+      const pair = pairs.find(function(item) {
+        return Number(item && item.risuUserMessageIndex) === Number(marker.userMessageIndex);
+      });
+      if (!pair) return { status: "skipped", reason: "pending_user_row_pair_not_observed" };
+      const finality = await buildNextInputSourceAcceptanceFinality(marker, pair, currentRequestContext, hostContext);
+      if (!finality) return { status: "skipped", reason: "next_host_signal_observation_unavailable" };
+      return backfillOneActiveChatCompletedTurn(sid, pair, {
+        source: "risu_next_host_signal_active_chat",
+        sourceAcceptanceFinality: finality,
+        orchestrationResult: marker.orchestrationResult || null,
+        hostContext: marker.hostContext || hostContext || null,
+        hostObservedActiveTailReplacement: true,
+      });
+    }).then(async function finishNextInputFinalization(result) {
+      const current = _nextInputFinalizations.get(sid);
+      const success = result && (result.status === "saved" || result.status === "exists" || result.status === "queued");
+      if (current && String(current.markerId || "") === markerId) {
+        if (success) _nextInputFinalizations.delete(sid);
+        else current.inFlight = false;
+        await saveNextInputFinalizationsToStorage();
+      }
+      updateRuntimeState("lastCompleteTurnStatus", success ? "ok" : "warn", {
+        source: "next_user_input_pipeline",
+        detail: String(result && result.reason || result && result.status || "previous turn finalization pending"),
+        turnIndex: result && result.turnIndex,
+        nonBlocking: true,
+      });
+    }).catch(function(err) {
+      const current = _nextInputFinalizations.get(sid);
+      if (current && String(current.markerId || "") === markerId) current.inFlight = false;
+      warnLog("next-input previous-turn finalization failed:", err && err.message);
+    });
+    return { owned: true, started: true, reason: "previous_turn_critic_pipelined" };
+  }
+
   async function findLatestActiveChatUnsavedCompletedTurnPair(sessionId, hostContext = null) {
     try {
       const sid = String(sessionId || "").trim();
@@ -8211,6 +8742,10 @@
       return { status: "failed", reason: "request_build_failed", turnIndex: turn };
     }
     body.client_meta = body.client_meta || {};
+    body.client_meta.turn_finalization_mode = sourceAcceptanceFinality
+      && sourceAcceptanceFinality.finality_source === "risu_next_host_signal_active_chat"
+      ? "next_user_input"
+      : "immediate_after_response";
     if (sourceAcceptanceFinality) {
       body.client_meta.risu_host_final_confirmation = {
         version: "risu_next_host_signal_confirmation.v1",
@@ -8328,6 +8863,13 @@
         hostChatId,
         hostChatIdState: hostChatId ? "observed" : "unobserved",
         worldlineObservation,
+        worldlineHostContext: {
+          characterIndex: resolvedActiveChat.charIdx,
+          childMessages: rawMessages.slice(0, worldlineObservation.marker_index).map((message, index) => ({
+            message_index: index, role: String(message && message.role || ""),
+            message_chat_id: String(message && message.chatId || ""), disabled: !!(message && message.disabled),
+          })),
+        },
       });
       if (!worldlineRouting || !worldlineRouting.worldline || worldlineRouting.worldline.state !== "confirmed") {
         const reason = String(
@@ -8349,6 +8891,13 @@
   async function ensureActiveChatCompletedTurnsBackfilled(sessionId, options = {}) {
     if (!settings.enabled || !settings.dbEnabled) return { status: "off" };
     const sid = String(sessionId || "").trim();
+    if (
+      typeof _nextInputFinalizations !== "undefined"
+      && _nextInputFinalizations.has(sid)
+      && !(options && options.manual === true)
+    ) {
+      return { status: "skipped", reason: "next_user_input_finalization_owns_automatic_save" };
+    }
     if (!sid || sid === SESSION_FALLBACK || _activeChatBackfillInFlight.has(sid)) {
       return { status: "skipped", reason: "busy_or_invalid" };
     }
@@ -10567,11 +11116,12 @@
     return sanitizeEnumValue(value, fallback, EMBEDDING_PROVIDER_OPTIONS);
   }
 
-  async function getCurrentActiveChatSourceObservationMessages(sessionId, hostContext = null) {
+  async function getCurrentActiveChatSourceObservationMessages(sessionId, hostContext = null, includeChat = false) {
     try {
       const resolved = await resolveCurrentActiveChatObject(sessionId || "", hostContext);
-      const rawMessages = resolved && resolved.chat ? extractActiveChatMessageList(resolved.chat) : [];
-      return rawMessages.map(function(raw, messageIndex) {
+      const chat = resolved && resolved.chat ? resolved.chat : null;
+      const rawMessages = chat ? extractActiveChatMessageList(chat) : [];
+      const messages = rawMessages.map(function(raw, messageIndex) {
         if (!raw || typeof raw !== "object") return null;
         const risuRole = String(raw.role || "").trim().toLowerCase();
         const role = risuRole === "user" ? "user" : (risuRole === "char" ? "assistant" : "");
@@ -10583,9 +11133,94 @@
           risuMessageIndex: messageIndex,
         };
       }).filter(Boolean);
+      return includeChat ? { chat, messages } : messages;
     } catch {
-      return [];
+      return includeChat ? { chat: null, messages: [] } : [];
     }
+  }
+
+  async function buildYumiV1ArchiveReadContext(payloadMessages, activeMessages, activeChat) {
+    const markerPattern = /<!--\s*yumi-tr:v1:([A-Za-z0-9_-]+):start\s*-->([\s\S]*?)<!--\s*yumi-tr:v1:\1:end\s*-->/gi;
+    const payloadSource = Array.isArray(payloadMessages) ? payloadMessages : [];
+    const activeSource = Array.isArray(activeMessages) ? activeMessages : [];
+    const scriptstate = activeChat && activeChat.scriptstate && typeof activeChat.scriptstate === "object"
+      ? activeChat.scriptstate
+      : null;
+    const modelTextById = new Map();
+    const markerIds = new Set();
+    const stats = {
+      markerBlocks: 0,
+      modelSourceBlocks: 0,
+      displayFallbackBlocks: 0,
+    };
+
+    function collectMarkerIds(messages) {
+      messages.forEach(function(message) {
+        if (!message || message.role !== "assistant" || typeof message.content !== "string") return;
+        markerPattern.lastIndex = 0;
+        let match;
+        while ((match = markerPattern.exec(message.content)) !== null) markerIds.add(String(match[1] || ""));
+      });
+    }
+
+    async function decodeRecord(rawRecord) {
+      if (typeof rawRecord !== "string" || !rawRecord) return null;
+      let jsonText = rawRecord;
+      if (rawRecord.startsWith("u:")) {
+        jsonText = rawRecord.slice(2);
+      } else if (rawRecord.startsWith("z:")) {
+        if (typeof atob !== "function" || typeof DecompressionStream !== "function"
+            || typeof Blob !== "function" || typeof Response !== "function") return null;
+        const binary = atob(rawRecord.slice(2));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+        jsonText = await new Response(stream).text();
+      }
+      const parsed = JSON.parse(jsonText);
+      return parsed && typeof parsed === "object" && typeof parsed.model === "string"
+        ? parsed.model
+        : null;
+    }
+
+    collectMarkerIds(payloadSource);
+    collectMarkerIds(activeSource);
+    if (scriptstate) {
+      for (const id of markerIds) {
+        try {
+          const modelText = await decodeRecord(scriptstate["$__yumi_tr." + id]);
+          if (typeof modelText === "string" && modelText.trim()) modelTextById.set(id, modelText);
+        } catch {
+          // Missing or malformed Yumi metadata must not block the main request.
+        }
+      }
+    }
+
+    function canonicalizeMessages(messages) {
+      return messages.map(function(message) {
+        if (!message || message.role !== "assistant" || typeof message.content !== "string") return message;
+        markerPattern.lastIndex = 0;
+        let changed = false;
+        const content = message.content.replace(markerPattern, function(_whole, id, translatedText) {
+          changed = true;
+          stats.markerBlocks += 1;
+          const modelText = modelTextById.get(String(id || ""));
+          if (typeof modelText === "string" && modelText.trim()) {
+            stats.modelSourceBlocks += 1;
+            return modelText;
+          }
+          stats.displayFallbackBlocks += 1;
+          return String(translatedText || "");
+        });
+        return changed ? { ...message, content } : message;
+      });
+    }
+
+    return {
+      payloadMessages: canonicalizeMessages(payloadSource),
+      activeMessages: canonicalizeMessages(activeSource),
+      stats,
+    };
   }
 
   function normalizeSourceSearchLlmProvider(value, defaultVal = DEFAULT_SETTINGS.sourceSearchPlannerProvider) {
@@ -10700,7 +11335,7 @@
     const normalizedModel = normalizeReasoningModelIdentifier(model);
     if (normalizedModel.indexOf("gemini-3.1-flash-lite-image") !== -1) return ["none", "minimal", "high"];
     if (normalizedModel.indexOf("gemini-3-pro-preview") !== -1) return ["none", "low", "high"];
-    if (normalizedModel.indexOf("gemini-3.1-pro") !== -1 || normalizedModel.indexOf("gemini-3.7-flash") !== -1) {
+    if (normalizedModel.indexOf("gemini-3.1-pro") !== -1 || normalizedModel.indexOf("gemini-3.7-flash") !== -1 || normalizedModel.indexOf("gemini-3.8-flash") !== -1) {
       return ["none", "low", "medium", "high"];
     }
     if (/gemini-3(?:\.5|\.6)?-(?:flash|flash-lite)/.test(normalizedModel)) {
@@ -10786,7 +11421,7 @@
           : "현재 전송 규약: Ollama OpenAI 호환 reasoning_effort",
       };
     }
-    if ((["llmgateway", "openrouter", "vercel", "neuralwatt"].includes(transport) && family !== "none") || (transport === "custom" && family === "deepseek_v4")) {
+    if ((["llmgateway", "openrouter", "vercel", "neuralwatt"].includes(transport) && family !== "none") || (["custom", "opencode", "opencode-go"].includes(transport) && family === "deepseek_v4")) {
       const gatewayEffortOptions = family === "deepseek_v4"
         ? deepSeekV4EffortOptions
         : (family === "gpt" && gptEffortOptions.length > 0
@@ -10854,7 +11489,7 @@
       };
     }
     if (family === "gemini") {
-      if ((normalizedProvider !== "gemini" && normalizedProvider !== "vertex") || geminiMode === "none") {
+      if (!["gemini", "vertex", "opencode"].includes(normalizedProvider) || geminiMode === "none") {
         return {
           family,
           mode: "unsupported",
@@ -10895,7 +11530,7 @@
         };
     }
     if (family === "claude") {
-      if (normalizedProvider === "claude" && claudeMode === "adaptive") {
+      if (["claude", "opencode", "opencode-go"].includes(normalizedProvider) && claudeMode === "adaptive") {
         return {
           family,
           mode: "claude_adaptive",
@@ -10909,7 +11544,7 @@
           guideModeText: "현재 모델 감지: Claude adaptive thinking + effort",
         };
       }
-      if (normalizedProvider === "claude" && claudeMode === "manual_budget") {
+      if (["claude", "opencode", "opencode-go"].includes(normalizedProvider) && claudeMode === "manual_budget") {
         return {
           family,
           mode: "claude_manual_budget",
@@ -11273,6 +11908,10 @@
       merged.coreObjectiveMemoryMaxItems,
       DEFAULT_SETTINGS.coreObjectiveMemoryMaxItems,
     );
+    merged.recentConversationReferenceCount = sanitizeTopKSetting(
+      merged.recentConversationReferenceCount,
+      DEFAULT_SETTINGS.recentConversationReferenceCount,
+    );
     merged.requestTimeoutMs = getRequestTimeoutSettingMs(merged.requestTimeoutMs);
     // Sprint 3-B: injection budget
     merged.maxInjectionChars = Math.max(0, Math.floor(Number(merged.maxInjectionChars) || DEFAULT_SETTINGS.maxInjectionChars));
@@ -11280,6 +11919,16 @@
     merged.lorebookReferenceMaxChars = sanitizeNumber(merged.lorebookReferenceMaxChars, DEFAULT_SETTINGS.lorebookReferenceMaxChars, 0, 30000);
     merged.injectionBudgetExtraChars = sanitizeNumber(merged.injectionBudgetExtraChars, 0, 0, 15000);
     merged.memoryDeliveryBudgetMode = String(merged.memoryDeliveryBudgetMode || "auto") === "custom" ? "custom" : "auto";
+    merged.memoryTransportMode = sanitizeEnumValue(
+      merged.memoryTransportMode,
+      DEFAULT_SETTINGS.memoryTransportMode,
+      MEMORY_TRANSPORT_MODE_OPTIONS,
+    );
+    merged.turnFinalizationMode = sanitizeEnumValue(
+      merged.turnFinalizationMode,
+      DEFAULT_SETTINGS.turnFinalizationMode,
+      TURN_FINALIZATION_MODE_OPTIONS,
+    );
     const rawMemoryDeliveryBudgets = merged.memoryDeliveryBudgets && typeof merged.memoryDeliveryBudgets === "object"
       ? merged.memoryDeliveryBudgets
       : DEFAULT_SETTINGS.memoryDeliveryBudgets;
@@ -13887,35 +14536,35 @@
 
   const TURN_WORKFLOW_HUD_CONTRACT = "turn_workflow_hud.v3";
   const TURN_WORKFLOW_HUD_RECOVERY_REQUEST_CONTRACT = "turn_workflow_recovery_request.v1";
-  const TURN_WORKFLOW_HUD_ROOT_STYLE = "position:fixed;top:50%;right:max(5px,env(safe-area-inset-right));transform:translateY(-50%);z-index:1000;width:min(140px,calc(100vw - 10px));pointer-events:none;font-family:Pretendard Variable,Pretendard,Inter,Geist,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;font-size:10px;line-height:1.25;color:#F4F5F7";
+  const TURN_WORKFLOW_HUD_ROOT_STYLE = "position:fixed;top:50%;right:max(8px,env(safe-area-inset-right));transform:translateY(-50%);z-index:1000;display:flex;flex-direction:column;gap:7px;width:min(224px,calc(100vw - 16px));max-height:calc(100vh - 16px);pointer-events:none;font-family:Pretendard Variable,Pretendard,Inter,Geist,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;font-size:11px;line-height:1.35;color:#F4F5F7";
   const TURN_WORKFLOW_HUD_ROOT_SELECTOR = ".mo-turn-workflow-hud-root";
   const TURN_WORKFLOW_HUD_SURFACE_SELECTOR = ".mo-turn-workflow-hud-root > div";
-  const TURN_WORKFLOW_HUD_CARD_STYLE = "position:relative;box-sizing:border-box;width:100%;max-height:calc(100vh - 20px);border:1px solid rgba(255,255,255,.07);border-radius:12px;background:#181C24;box-shadow:0 16px 40px rgba(0,0,0,.48);padding:8px;pointer-events:auto;font-size:10px;line-height:1.25;letter-spacing:-.01em;color:#F4F5F7;white-space:normal;overflow:auto;overflow-wrap:anywhere;overscroll-behavior:contain;scrollbar-width:thin";
+  const TURN_WORKFLOW_HUD_CARD_STYLE = "position:relative;box-sizing:border-box;width:100%;max-height:calc(100vh - 20px);border:1px solid rgba(255,255,255,.09);border-radius:12px;background:#181C24;box-shadow:0 12px 32px rgba(0,0,0,.35);padding:10px;pointer-events:auto;font-size:11px;line-height:1.35;letter-spacing:-.01em;color:#F4F5F7;white-space:normal;overflow:auto;overflow-wrap:anywhere;overscroll-behavior:contain;scrollbar-width:thin";
   const TURN_WORKFLOW_HUD_NOTICE_STYLE = ";border-color:rgba(143,167,255,.38);background:#171D2A";
   const TURN_WORKFLOW_HUD_WARNING_STYLE = ";border-color:rgba(138,85,247,.35);background:#1C1828";
   const TURN_WORKFLOW_HUD_ATTENTION_STYLE = ";border-color:rgba(245,196,81,.58);background:#262113;box-shadow:0 16px 40px rgba(0,0,0,.48),0 0 18px rgba(245,196,81,.10)";
   const TURN_WORKFLOW_HUD_ERROR_STYLE = ";border-color:rgba(225,88,166,.55);background:#2A151D;box-shadow:0 16px 40px rgba(0,0,0,.48),0 0 20px rgba(225,88,166,.10)";
-  const TURN_WORKFLOW_HUD_EYEBROW_STYLE = "padding-right:20px;font-size:8px;font-weight:500;line-height:1.2;letter-spacing:.12em;color:#5C626D";
-  const TURN_WORKFLOW_HUD_TITLE_STYLE = "margin-top:2px;padding-right:20px;font-size:11px;font-weight:500;line-height:1.25;letter-spacing:-.015em;color:#F4F5F7";
+  const TURN_WORKFLOW_HUD_EYEBROW_STYLE = "padding-right:20px;font-size:9px;font-weight:400;line-height:1.2;letter-spacing:.04em;color:#929BAB";
+  const TURN_WORKFLOW_HUD_TITLE_STYLE = "margin-top:4px;padding-right:20px;font-size:13px;font-weight:600;line-height:1.35;letter-spacing:-.015em;color:#F4F5F7";
   const TURN_WORKFLOW_HUD_DIVIDER_STYLE = "height:1px;margin:6px 0;background:rgba(255,255,255,.07)";
   const TURN_WORKFLOW_HUD_STAGE_STYLE = "display:flex;align-items:center;justify-content:space-between;gap:5px;margin-top:5px;font-size:9px;line-height:1.35;color:#8B909A";
   const TURN_WORKFLOW_HUD_ELAPSED_STYLE = "flex:none;font-size:9px;font-weight:600;color:#8FA7FF;font-variant-numeric:tabular-nums";
   const TURN_WORKFLOW_HUD_PROGRESS_STYLE = "height:3px;margin-top:7px;border-radius:999px;background:#0F1116;overflow:hidden";
   const TURN_WORKFLOW_HUD_PROGRESS_FILL_STYLE = "height:100%;border-radius:999px;background:linear-gradient(90deg,#5D73E6,#8FA7FF 55%,#8A55F7)";
   const TURN_WORKFLOW_HUD_CLOSE_STYLE = "position:absolute;top:5px;right:5px;display:flex;align-items:center;justify-content:center;box-sizing:border-box;width:18px;height:18px;margin:0;padding:0;border:1px solid rgba(255,255,255,.07);border-radius:6px;background:#0F1116;color:#8B909A;font-size:13px;line-height:1;cursor:pointer";
-  const TURN_WORKFLOW_HUD_TOTAL_STYLE = "display:flex;align-items:flex-end;justify-content:space-between;gap:6px;border:1px solid rgba(143,167,255,.30);border-radius:10px;background:linear-gradient(135deg,rgba(93,115,230,.18),rgba(138,85,247,.10) 58%,#13161C);padding:7px";
-  const TURN_WORKFLOW_HUD_TOTAL_LABEL_STYLE = "max-width:68px;font-size:8px;line-height:1.2;letter-spacing:.06em;color:#8B909A";
-  const TURN_WORKFLOW_HUD_TOTAL_VALUE_STYLE = "font-size:22px;line-height:.9;font-weight:500;letter-spacing:-.04em;color:#F4F5F7;font-variant-numeric:tabular-nums";
-  const TURN_WORKFLOW_HUD_LEDGER_STYLE = "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:8px;margin-top:4px";
-  const TURN_WORKFLOW_HUD_LEDGER_ROW_STYLE = "display:flex;align-items:center;justify-content:space-between;gap:4px;min-width:0;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.07)";
-  const TURN_WORKFLOW_HUD_COUNT_LABEL_STYLE = "min-width:0;font-size:8px;line-height:1.15;letter-spacing:.01em;color:#8B909A;white-space:normal;overflow-wrap:anywhere";
-  const TURN_WORKFLOW_HUD_COUNT_VALUE_STYLE = "flex:none;font-size:10px;line-height:1;font-weight:600;color:#F4F5F7;font-variant-numeric:tabular-nums";
-  const TURN_WORKFLOW_HUD_SECTION_LABEL_STYLE = "margin-top:6px;font-size:7px;font-weight:500;line-height:1.2;letter-spacing:.08em;color:#5C626D";
-  const TURN_WORKFLOW_HUD_STAGE_LEDGER_STYLE = "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 6px;margin-top:4px";
-  const TURN_WORKFLOW_HUD_STAGE_CELL_STYLE = "min-width:0;border:1px solid rgba(255,255,255,.07);border-radius:6px;background:#13161C;padding:4px";
-  const TURN_WORKFLOW_HUD_STAGE_LABEL_STYLE = "min-width:0;font-size:7px;font-weight:500;line-height:1.2;color:#8B909A;overflow-wrap:anywhere";
-  const TURN_WORKFLOW_HUD_STAGE_META_STYLE = "margin-top:2px;font-size:8px;font-weight:600;line-height:1.15;font-variant-numeric:tabular-nums";
-  const TURN_WORKFLOW_HUD_STAGE_REASON_STYLE = "margin-top:2px;font-size:6.5px;line-height:1.15;color:#8B909A;overflow-wrap:anywhere";
+  const TURN_WORKFLOW_HUD_TOTAL_STYLE = "padding:5px 6px;border:1px solid rgba(255,255,255,.08);border-radius:6px;background:#11151C;cursor:pointer";
+  const TURN_WORKFLOW_HUD_TOTAL_LABEL_STYLE = "font-size:11px;line-height:1.35;color:#BBC3CF";
+  const TURN_WORKFLOW_HUD_TOTAL_VALUE_STYLE = "font-size:13px;line-height:1.2;font-weight:600;color:#F4F5F7;font-variant-numeric:tabular-nums";
+  const TURN_WORKFLOW_HUD_LEDGER_STYLE = "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:5px";
+  const TURN_WORKFLOW_HUD_LEDGER_ROW_STYLE = "display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0;padding:6px;border:1px solid rgba(255,255,255,.07);border-radius:6px;background:#13161C";
+  const TURN_WORKFLOW_HUD_COUNT_LABEL_STYLE = "min-width:0;font-size:9px;line-height:1.3;color:#929BAB;white-space:normal;overflow-wrap:anywhere";
+  const TURN_WORKFLOW_HUD_COUNT_VALUE_STYLE = "flex:none;font-size:11px;line-height:1.2;font-weight:600;color:#F4F5F7;font-variant-numeric:tabular-nums";
+  const TURN_WORKFLOW_HUD_SECTION_LABEL_STYLE = "margin-top:10px;font-size:10px;font-weight:500;line-height:1.35;color:#AAB3C2";
+  const TURN_WORKFLOW_HUD_STAGE_LEDGER_STYLE = "display:flex;flex-direction:column;gap:4px;margin-top:6px";
+  const TURN_WORKFLOW_HUD_STAGE_CELL_STYLE = "min-width:0;border-bottom:1px solid rgba(255,255,255,.07);padding:5px 0";
+  const TURN_WORKFLOW_HUD_STAGE_LABEL_STYLE = "min-width:0;font-size:10px;font-weight:400;line-height:1.35;color:#BBC3CF;overflow-wrap:anywhere";
+  const TURN_WORKFLOW_HUD_STAGE_META_STYLE = "margin-top:2px;font-size:10px;font-weight:400;line-height:1.35;font-variant-numeric:tabular-nums";
+  const TURN_WORKFLOW_HUD_STAGE_REASON_STYLE = "margin-top:3px;font-size:9px;line-height:1.35;color:#929BAB;overflow-wrap:anywhere";
   const TURN_WORKFLOW_HUD_WARNING_LIST_STYLE = "margin-top:5px;border:1px solid rgba(138,85,247,.28);border-radius:7px;background:rgba(138,85,247,.08);padding:4px";
   const TURN_WORKFLOW_HUD_WARNING_ITEM_STYLE = "font-size:7px;line-height:1.25;color:#B9A4F7;overflow-wrap:anywhere";
   const TURN_WORKFLOW_HUD_WARNING_DETAIL_STYLE = "margin-top:2px;font-size:6.5px;line-height:1.25;color:#8B909A;white-space:normal;overflow-wrap:anywhere";
@@ -13926,20 +14575,30 @@
   const TURN_WORKFLOW_HUD_RECOVERY_WRAP_STYLE = "margin-top:7px;padding-top:6px;border-top:1px solid rgba(255,255,255,.07)";
   const TURN_WORKFLOW_HUD_RECOVERY_BUTTON_STYLE = "box-sizing:border-box;width:100%;min-height:26px;margin:0;padding:5px 7px;border:1px solid rgba(143,167,255,.45);border-radius:7px;background:#202A48;color:#F4F5F7;font:inherit;font-size:8px;font-weight:600;line-height:1.25;cursor:pointer";
   const TURN_WORKFLOW_HUD_RECOVERY_STATUS_STYLE = "font-size:7px;line-height:1.3;color:#B9A4F7;overflow-wrap:anywhere";
+  const TURN_WORKFLOW_HUD_SLOT_STYLE = "min-height:0;pointer-events:none";
+  const TURN_WORKFLOW_HUD_SLOT_LABEL_STYLE = "margin:0 0 3px 2px;font-size:7px;font-weight:600;line-height:1.15;letter-spacing:.04em;color:#8FA7FF";
 
   let _turnWorkflowHUDActiveRequestId = "";
   let _turnWorkflowHUDWatchToken = 0;
   let _turnWorkflowHUDWatchRunning = false;
   let _turnWorkflowHUDLastRevision = 0;
   let _turnWorkflowHUDTerminalRequestId = "";
+  let _turnWorkflowHUDLastView = null;
+  let _turnWorkflowHUDCurrentFinalizationMode = "immediate_after_response";
   let _turnWorkflowHUDStreamAbortController = null;
   let _turnWorkflowHUDStreamReader = null;
+  let _turnWorkflowHUDPreviousRequestId = "";
+  let _turnWorkflowHUDPreviousWatchToken = 0;
+  let _turnWorkflowHUDPreviousWatchRunning = false;
+  let _turnWorkflowHUDPreviousLastRevision = 0;
+  let _turnWorkflowHUDPreviousLastView = null;
+  let _turnWorkflowHUDPreviousStreamAbortController = null;
+  let _turnWorkflowHUDPreviousStreamReader = null;
   let _turnWorkflowHUDElapsedTimer = null;
   let _turnWorkflowHUDMainDocument = null;
   let _turnWorkflowHUDMainDOMPermissionPromise = null;
   let _turnWorkflowHUDRootUnavailableLogged = false;
   let _turnWorkflowHUDElapsedElement = null;
-  let _turnWorkflowHUDElapsedStartedAt = "";
   let _turnWorkflowHUDElapsedLastSecond = -1;
   let _turnWorkflowHUDRenderChain = Promise.resolve();
   let _turnWorkflowHUDDismissListenerIds = [];
@@ -14031,7 +14690,6 @@
     }
     _turnWorkflowHUDElapsedTimer = null;
     _turnWorkflowHUDElapsedElement = null;
-    _turnWorkflowHUDElapsedStartedAt = "";
     _turnWorkflowHUDElapsedLastSecond = -1;
   }
 
@@ -14042,14 +14700,15 @@
   }
 
   async function removeTurnWorkflowHUDDismissListeners(listenerIds) {
-    const ids = Array.isArray(listenerIds)
+    const listeners = Array.isArray(listenerIds)
       ? listenerIds
       : takeTurnWorkflowHUDDismissListenerIds();
-    if (!R || typeof R.removeRisuEventListener !== "function") return;
-    for (const listenerId of ids) {
+    for (const listener of listeners) {
       try {
-        await R.removeRisuEventListener(listenerId);
+        await listener.target.removeEventListener(listener.type, listener.id, listener.options);
       } catch (err) {
+        // Retain the owner for the next existing HUD cleanup operation.
+        _turnWorkflowHUDDismissListenerIds.push(listener);
         debugLog("turn workflow HUD listener cleanup failed:", err && err.message);
       }
     }
@@ -14063,6 +14722,14 @@
     _turnWorkflowHUDActiveRequestId = "";
     _turnWorkflowHUDLastRevision = 0;
     _turnWorkflowHUDTerminalRequestId = "";
+    _turnWorkflowHUDLastView = null;
+    _turnWorkflowHUDCurrentFinalizationMode = "immediate_after_response";
+    cancelTurnWorkflowHUDPreviousStream();
+    _turnWorkflowHUDPreviousWatchToken++;
+    _turnWorkflowHUDPreviousWatchRunning = false;
+    _turnWorkflowHUDPreviousRequestId = "";
+    _turnWorkflowHUDPreviousLastRevision = 0;
+    _turnWorkflowHUDPreviousLastView = null;
     _turnWorkflowHUDHostWarningsByRequestId.clear();
     clearTurnWorkflowHUDTimer();
     await _turnWorkflowHUDRenderChain;
@@ -14083,14 +14750,14 @@
 
   async function updateTurnWorkflowHUDElapsed() {
     try {
-      const target = _turnWorkflowHUDElapsedElement;
-      const startedAt = Date.parse(_turnWorkflowHUDElapsedStartedAt);
-      if (!target) return;
-      if (!Number.isFinite(startedAt)) return;
-      const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-      if (seconds === _turnWorkflowHUDElapsedLastSecond) return;
-      _turnWorkflowHUDElapsedLastSecond = seconds;
-      await target.setTextContent(" · " + tf("turn_hud.elapsed_seconds", { n: seconds }));
+      const targets = Array.isArray(_turnWorkflowHUDElapsedElement) ? _turnWorkflowHUDElapsedElement : [];
+      const now = Date.now();
+      if (Math.floor(now / 1000) === _turnWorkflowHUDElapsedLastSecond) return;
+      _turnWorkflowHUDElapsedLastSecond = Math.floor(now / 1000);
+      for (const target of targets) {
+        const seconds = Math.max(0, Math.floor((now - Date.parse(target.startedAt)) / 1000));
+        if (Number.isFinite(seconds)) await target.element.setTextContent(" · " + tf("turn_hud.elapsed_seconds", { n: seconds }));
+      }
     } catch { /* UI timer is best-effort only. */ }
   }
 
@@ -14132,20 +14799,24 @@
 
   function turnWorkflowHUDStageStatus(status) {
     const normalized = String(status || "unknown").toLowerCase();
-    const supported = ["succeeded", "skipped", "failed", "invalidated", "pending", "running"];
+    const supported = ["succeeded", "skipped", "failed", "invalidated", "pending", "running", "repaired", "partial", "no_recommendation"];
     return supported.includes(normalized) ? normalized : "unknown";
   }
 
   function turnWorkflowHUDStageStatusColor(status) {
     switch (turnWorkflowHUDStageStatus(status)) {
       case "succeeded":
+        return "#BBC3CF";
+      case "repaired":
       case "running":
         return "#8FA7FF";
       case "failed":
         return "#E158A6";
       case "invalidated":
+      case "partial":
         return "#A983FF";
       case "skipped":
+      case "no_recommendation":
         return "#8B909A";
       default:
         return "#5C626D";
@@ -14186,8 +14857,116 @@
         + (reasonText ? `<div style="${TURN_WORKFLOW_HUD_STAGE_REASON_STYLE}">${escapeTurnWorkflowHUDHTML(reasonText)}</div>` : "")
         + `</div>`;
     }).join("");
-    return `<div style="${TURN_WORKFLOW_HUD_SECTION_LABEL_STYLE}">${escapeTurnWorkflowHUDHTML(t("turn_hud.stage_ledger"))}</div>`
-      + `<div style="${TURN_WORKFLOW_HUD_STAGE_LEDGER_STYLE}">${stageHTML}</div>`;
+    if (!stages.length) return "";
+    return `<details style="margin-top:8px"><summary style="${TURN_WORKFLOW_HUD_SECTION_LABEL_STYLE};cursor:pointer">${escapeTurnWorkflowHUDHTML(t("turn_hud.stage_ledger"))}</summary>`
+      + `<div style="${TURN_WORKFLOW_HUD_STAGE_LEDGER_STYLE}">${stageHTML}</div></details>`;
+  }
+
+  function turnWorkflowHUDTimingHTML(view) {
+    const duration = ms => turnWorkflowHUDStageDuration({ status: "succeeded", duration_ms: ms });
+    const timing = view && view.host_timing;
+    const compactDuration = ms => ms >= 60000
+      ? tf("turn_hud.elapsed_minutes_seconds", {m: Math.floor(ms / 60000), s: Math.floor(ms % 60000 / 1000)}) : duration(ms);
+    const metrics = [];
+    if (timing && Number.isFinite(timing.response_received_ms)) {
+      if (Number.isFinite(timing.started_ms)) metrics.push(["turn_hud.timing.total", timing.response_received_ms - timing.started_ms]);
+    }
+    if (timing && Number.isFinite(timing.started_ms) && Number.isFinite(timing.main_started_ms)) {
+      metrics.push(["turn_hud.timing.prepare", timing.main_started_ms - timing.started_ms]);
+    }
+    if (timing && Number.isFinite(timing.response_received_ms) && Number.isFinite(timing.main_started_ms)) {
+      metrics.push(["turn_hud.timing.main", timing.response_received_ms - timing.main_started_ms]);
+    }
+    let html = metrics.length ? `<div style="display:grid;grid-template-columns:repeat(${metrics.length},minmax(0,1fr));gap:6px;margin-top:8px">` + metrics.map(([key, ms]) =>
+      `<div style="min-width:0;padding:7px 5px;border-radius:7px;background:#11151C;text-align:center"><div style="font-size:9px;color:#929BAB">${escapeTurnWorkflowHUDHTML(t(key))}</div><div style="margin-top:3px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap">${escapeTurnWorkflowHUDHTML(compactDuration(ms))}</div></div>`
+    ).join("") + `</div>` : "";
+    const roles = Array.isArray(view && view.preprocessing) ? view.preprocessing : [];
+    if (roles.length) {
+      const cellStyle = "padding:6px 2px;text-align:right;font-size:10px;font-variant-numeric:tabular-nums;border-bottom:1px solid rgba(255,255,255,.06)";
+      html += `<div style="${TURN_WORKFLOW_HUD_SECTION_LABEL_STYLE}">${escapeTurnWorkflowHUDHTML(t("turn_hud.preprocessing.title"))}</div>`;
+      html += `<table style="width:100%;table-layout:fixed;border-collapse:collapse;margin-top:4px"><colgroup><col style="width:40%"><col style="width:21%"><col style="width:21%"><col style="width:18%"></colgroup><thead><tr>`
+        + ["turn_hud.preprocessing.role", 1, 2, "turn_hud.preprocessing.selection"].map((label, i) => `<th scope="col" style="${cellStyle};font-size:9px;font-weight:400;color:#929BAB;${i === 0 ? "text-align:left" : ""}">${escapeTurnWorkflowHUDHTML(typeof label === "number" ? tf("turn_hud.preprocessing.round", {n:label}) : t(label))}</th>`).join("") + `</tr></thead><tbody>`;
+      html += roles.map(role => {
+        const calls = Array.isArray(role.calls) ? role.calls : [];
+        const label = t(role.label_key);
+        const cells = [1, 2].map(round => {
+          const call = calls.find(item => Number(item.round) === round);
+          if (!call) return `<td style="${cellStyle};color:#929BAB">—</td>`;
+          const status = turnWorkflowHUDStageStatus(call.status);
+          const statusText = t("turn_hud.stage_status." + status);
+          const detail = statusText + (status === "running" ? "" : " · " + duration(call.duration_ms));
+          const badge = status === "repaired" || status === "partial" ? t("turn_hud.preprocessing.outcome." + status) : statusText;
+          const time = status === "running" ? `<span data-turn-workflow-agent-time="${escapeTurnWorkflowHUDHTML(role.role + "-" + round)}">…</span>` : escapeTurnWorkflowHUDHTML(duration(call.duration_ms));
+          return `<td style="${cellStyle};color:${turnWorkflowHUDStageStatusColor(status)}" title="${escapeTurnWorkflowHUDHTML(detail)}">`
+            + (status === "succeeded" || status === "running" ? "" : `<span style="display:block;font-size:9px">${escapeTurnWorkflowHUDHTML(badge)}</span>`) + `<span style="white-space:nowrap">${time}</span></td>`;
+        }).join("");
+        const selection = role.selection_source ? t("turn_hud.preprocessing.selection." + role.selection_source) : "";
+        const selectionLabel = role.selection_source === "ai" ? "AI" : role.selection_source === "go_default" ? "Go" : "—";
+        return `<tr><th scope="row" title="${escapeTurnWorkflowHUDHTML(label + " · " + t("turn_hud.preprocessing.total") + " " + duration(role.duration_ms))}" style="${cellStyle};text-align:left;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeTurnWorkflowHUDHTML(label)}</th>`
+          + cells + `<td style="${cellStyle};color:#BBC3CF" title="${escapeTurnWorkflowHUDHTML(selection)}">${selectionLabel}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+    }
+    const search = view && view.preprocessing_search;
+    if (search) {
+      const statusLabel = status => status === "partial" ? t("turn_hud.search.partial") : t("turn_hud.stage_status." + turnWorkflowHUDStageStatus(status));
+      html += `<details style="margin-top:8px"><summary title="${escapeTurnWorkflowHUDHTML(t("turn_hud.search.details"))}" style="${TURN_WORKFLOW_HUD_STAGE_META_STYLE};cursor:pointer">`
+        + escapeTurnWorkflowHUDHTML(t("turn_hud.search.title") + " · " + (search.status === "succeeded" ? "" : statusLabel(search.status) + " · ") + tf("turn_hud.search.progress", {done: search.completed_count, total: search.query_count}))
+        + (search.status === "running" ? '<span data-turn-workflow-search-time></span>' : escapeTurnWorkflowHUDHTML(" · " + duration(search.duration_ms))) + `</summary>`
+        + `<div style="${TURN_WORKFLOW_HUD_STAGE_REASON_STYLE}">${escapeTurnWorkflowHUDHTML(statusLabel(search.status))}</div>`;
+      const queries = Array.isArray(search.queries) ? search.queries : [];
+      if (queries.length) {
+        html += queries.map(query => {
+          const label = t("turn_hud.preprocessing." + query.role);
+          const parts = Object.entries(query.breakdown_ms || {}).filter(([, ms]) => Number.isFinite(ms)).map(([key, ms]) => {
+            const labelKey = "turn_hud.search." + key;
+            return (t(labelKey) === labelKey ? key : t(labelKey)) + " " + duration(ms);
+          });
+          return `<div style="${TURN_WORKFLOW_HUD_STAGE_META_STYLE};margin-top:6px">`
+            + escapeTurnWorkflowHUDHTML(label + " · " + statusLabel(query.status) + (query.status === "running" || query.status === "pending" ? "" : " · " + duration(query.duration_ms))) + `</div>`
+            + (parts.length ? `<div style="${TURN_WORKFLOW_HUD_STAGE_REASON_STYLE}">${escapeTurnWorkflowHUDHTML(parts.join(" · "))}</div>` : "");
+        }).join("");
+      }
+      html += `</details>`;
+    }
+    const backendTiming = timing && timing.backend_timing;
+    if (backendTiming && Number.isFinite(backendTiming.total_ms)) {
+      html += `<details style="margin-top:8px"><summary style="${TURN_WORKFLOW_HUD_STAGE_META_STYLE};padding:5px 6px;border:1px solid rgba(255,255,255,.08);border-radius:6px;background:#11151C;color:#BBC3CF;cursor:pointer">${escapeTurnWorkflowHUDHTML(t("turn_hud.timing.backend"))}</summary>`;
+      html += `<div style="${TURN_WORKFLOW_HUD_FACT_STYLE};gap:5px;margin-top:5px">`;
+      html += `<div style="${TURN_WORKFLOW_HUD_FACT_CELL_STYLE};grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:5px;padding:6px">`
+        + `<span style="${TURN_WORKFLOW_HUD_STAGE_LABEL_STYLE}">${escapeTurnWorkflowHUDHTML(t("turn_hud.timing.backendTotal"))}</span>`
+        + `<span style="${TURN_WORKFLOW_HUD_COUNT_VALUE_STYLE}">${escapeTurnWorkflowHUDHTML(duration(backendTiming.total_ms))}</span></div>`;
+      Object.entries(backendTiming.stages_ms || {}).forEach(([key, elapsed]) => {
+        if (!Number.isFinite(elapsed)) return;
+        const labelKey = "turn_hud.timing." + key;
+        const label = t(labelKey) === labelKey ? key : t(labelKey);
+        html += `<div style="${TURN_WORKFLOW_HUD_FACT_CELL_STYLE};padding:6px">`
+          + `<div style="font-size:9px;line-height:1.3;color:#929BAB">${escapeTurnWorkflowHUDHTML(label)}</div>`
+          + `<div style="margin-top:3px;font-size:11px;font-weight:600;line-height:1.2;font-variant-numeric:tabular-nums;color:#F4F5F7">${escapeTurnWorkflowHUDHTML(duration(elapsed))}</div></div>`;
+      });
+      html += `</div></details>`;
+    }
+    return html;
+  }
+
+  // Host timestamps use one clock; backend durations are passed through for display only.
+  function observeTurnWorkflowHUDTiming(requestId, event, observedAt = Date.now(), backendTiming = null) {
+    const view = _turnWorkflowHUDLastView;
+    if (!view || view.request_id !== requestId || !view.host_timing) return;
+    const timing = Object.assign({}, view.host_timing);
+    if (event === "prepare_completed" && !timing.backend_timing && backendTiming) {
+      timing.backend_timing = Object.assign({}, backendTiming, {stages_ms: Object.assign({}, backendTiming.stages_ms)});
+    }
+    if (event === "main_started" && !Number.isFinite(timing.main_started_ms)) timing.main_started_ms = observedAt;
+    if (event === "response_received" && !Number.isFinite(timing.response_received_ms)) timing.response_received_ms = observedAt;
+    _turnWorkflowHUDLastView = Object.assign({}, view, { host_timing: timing });
+    if (event === "response_received") void renderTurnWorkflowHUD(_turnWorkflowHUDLastView);
+  }
+
+  function retainTurnWorkflowHUDHostTiming(view) {
+    return view && _turnWorkflowHUDLastView && view.request_id === _turnWorkflowHUDLastView.request_id
+      ? Object.assign({}, view, {host_timing: _turnWorkflowHUDLastView.host_timing || view.host_timing,
+          host_generation_finished: _turnWorkflowHUDLastView.host_generation_finished || view.host_generation_finished})
+      : view;
   }
 
   function turnWorkflowHUDWarningListHTML(view) {
@@ -14286,16 +15065,21 @@
 
   function turnWorkflowHUDCountLedgerHTML(presentation) {
     if (!presentation || presentation.available !== true) return "";
-    return `<div style="${TURN_WORKFLOW_HUD_TOTAL_STYLE}">`
+    return `<details style="margin-top:8px"><summary style="${TURN_WORKFLOW_HUD_TOTAL_STYLE}">`
       + `<span style="${TURN_WORKFLOW_HUD_TOTAL_LABEL_STYLE}">${escapeTurnWorkflowHUDHTML(presentation.totalLabel)}</span>`
-      + `<span style="${TURN_WORKFLOW_HUD_TOTAL_VALUE_STYLE}">${escapeTurnWorkflowHUDHTML(presentation.totalValue)}</span>`
-      + `</div>`
-      + `<div style="${TURN_WORKFLOW_HUD_LEDGER_STYLE}">${presentation.countHTML}</div>`;
+      + `<span style="${TURN_WORKFLOW_HUD_TOTAL_VALUE_STYLE};float:right">${escapeTurnWorkflowHUDHTML(presentation.totalValue)}</span>`
+      + `</summary>`
+      + `<div style="${TURN_WORKFLOW_HUD_LEDGER_STYLE}">${presentation.countHTML}</div></details>`;
   }
 
   function dismissTurnWorkflowHUD(requestId) {
-    if (requestId && _turnWorkflowHUDActiveRequestId && requestId !== _turnWorkflowHUDActiveRequestId) return;
-    const dismissedRequestId = String(requestId || _turnWorkflowHUDActiveRequestId || "").trim();
+    if (
+      requestId
+      && (_turnWorkflowHUDActiveRequestId || _turnWorkflowHUDPreviousRequestId)
+      && requestId !== _turnWorkflowHUDActiveRequestId
+      && requestId !== _turnWorkflowHUDPreviousRequestId
+    ) return;
+    const dismissedRequestId = String(requestId || _turnWorkflowHUDActiveRequestId || _turnWorkflowHUDPreviousRequestId || "").trim();
     if (dismissedRequestId) _turnWorkflowHUDHostWarningsByRequestId.delete(dismissedRequestId);
     else _turnWorkflowHUDHostWarningsByRequestId.clear();
     const listenerIds = takeTurnWorkflowHUDDismissListenerIds();
@@ -14305,6 +15089,14 @@
     _turnWorkflowHUDActiveRequestId = "";
     _turnWorkflowHUDLastRevision = 0;
     _turnWorkflowHUDTerminalRequestId = "";
+    _turnWorkflowHUDLastView = null;
+    _turnWorkflowHUDCurrentFinalizationMode = "immediate_after_response";
+    cancelTurnWorkflowHUDPreviousStream();
+    _turnWorkflowHUDPreviousWatchToken++;
+    _turnWorkflowHUDPreviousWatchRunning = false;
+    _turnWorkflowHUDPreviousRequestId = "";
+    _turnWorkflowHUDPreviousLastRevision = 0;
+    _turnWorkflowHUDPreviousLastView = null;
     clearTurnWorkflowHUDTimer();
     return queueTurnWorkflowHUDOperation("dismiss", async function() {
       await removeTurnWorkflowHUDDismissListeners(listenerIds);
@@ -14327,11 +15119,20 @@
       || typeof target.addEventListener !== "function"
       || typeof target.getBoundingClientRect !== "function"
     ) return;
+    let openDetails = closeButtonOnly ? 0 : await (await card.querySelectorAll("details[open]")).length();
     const dismiss = async function(event) {
       const clientX = Number(event && event.clientX);
       const clientY = Number(event && event.clientY);
       if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
       const rect = await target.getBoundingClientRect();
+      if (!closeButtonOnly) {
+        // Native toggling can move the centered card before the Host click arrives.
+        const currentOpenDetails = await (await card.querySelectorAll("details[open]")).length();
+        if (currentOpenDetails !== openDetails) {
+          openDetails = currentOpenDetails;
+          return;
+        }
+      }
       const left = Number(rect && (rect.left != null ? rect.left : rect.x));
       const top = Number(rect && (rect.top != null ? rect.top : rect.y));
       const right = Number(rect && (rect.right != null ? rect.right : left + Number(rect.width)));
@@ -14354,11 +15155,13 @@
     };
     const listenerId = await target.addEventListener("click", dismiss);
     if (listenerId === null || listenerId === undefined) return;
+    // SafeElement stores listener IDs per instance, including document events.
+    const listener = { target, type: "click", id: listenerId, options: undefined };
     if (_turnWorkflowHUDUnloaded) {
-      await removeTurnWorkflowHUDDismissListeners([listenerId]);
+      await removeTurnWorkflowHUDDismissListeners([listener]);
       return;
     }
-    _turnWorkflowHUDDismissListenerIds.push(listenerId);
+    _turnWorkflowHUDDismissListenerIds.push(listener);
   }
 
   async function requestTurnWorkflowHUDRecovery(view, action) {
@@ -14376,6 +15179,7 @@
       return;
     }
     if (requestId !== _turnWorkflowHUDActiveRequestId) return;
+    let updated = null;
     try {
       const result = await bridgeFetch("/turn-workflow/recovery", {
         method: "POST",
@@ -14386,15 +15190,9 @@
         },
       });
       if (!result) throw null;
-      const updated = result && result.turn_workflow_hud;
+      updated = result && result.turn_workflow_hud;
       if (!updated || updated.contract_version !== TURN_WORKFLOW_HUD_CONTRACT) {
         throw new Error("turn workflow recovery response is missing its HUD ViewModel");
-      }
-      await renderTurnWorkflowHUD(updated);
-      if (String(updated.status || "").trim() === "recovering") {
-        _turnWorkflowHUDTerminalRequestId = "";
-        stopTurnWorkflowHUDWatch(requestId, false);
-        startTurnWorkflowHUDWatch(requestId);
       }
     } catch (err) {
       const warning = classifyTurnWorkflowHUDTransportFailure(
@@ -14409,6 +15207,7 @@
         const backendMessage = String(backendFailure && backendFailure.error || "").trim();
         if (backendCode) warning.code = backendCode;
         if (backendMessage) warning.message = backendMessage;
+        updated = backendFailure && backendFailure.turn_workflow_hud;
       } catch { /* transport diagnostics already contain the raw backend response */ }
       if (err && err.message) {
         warning.detail = String(err.message);
@@ -14416,8 +15215,31 @@
           { key: "recovery_error", value: String(err.message) },
         ]);
       }
-      rememberTurnWorkflowHUDHostWarning(requestId, warning);
-      await renderTurnWorkflowHUD(view);
+      // A failed card's stream has ended. Reconcile this user action with one
+      // backend snapshot, including older backends whose 409 has no ViewModel.
+      if (!updated || updated.contract_version !== TURN_WORKFLOW_HUD_CONTRACT) {
+        try {
+          updated = await bridgeFetch("/turn-workflow/status?request_id=" + encodeURIComponent(requestId), { method: "GET" });
+        } catch { /* keep the recovery transport diagnostic when status is unavailable */ }
+      }
+      if (requestId !== _turnWorkflowHUDActiveRequestId) return;
+      if (!updated || updated.contract_version !== TURN_WORKFLOW_HUD_CONTRACT) {
+        rememberTurnWorkflowHUDHostWarning(requestId, warning);
+        await renderTurnWorkflowHUD(view);
+        return;
+      }
+      if (updated.status === "failed") rememberTurnWorkflowHUDHostWarning(requestId, warning);
+    }
+    if (requestId !== _turnWorkflowHUDActiveRequestId) return;
+    if (updated.status === "unknown") {
+      await dismissTurnWorkflowHUD(requestId);
+      return;
+    }
+    await renderTurnWorkflowHUD(updated);
+    if (String(updated.status || "").trim() === "recovering") {
+      _turnWorkflowHUDTerminalRequestId = "";
+      stopTurnWorkflowHUDWatch(requestId, false);
+      startTurnWorkflowHUDWatch(requestId);
     }
   }
 
@@ -14475,7 +15297,86 @@
     }).filter(Boolean).join("");
   }
 
-  function buildTurnWorkflowHUDPresentation(view) {
+  function projectTurnWorkflowHUDPhaseView(view, phase) {
+    const normalizedPhase = String(phase || "").trim();
+    if (!view || (normalizedPhase !== "generation" && normalizedPhase !== "finalization")) return view;
+    const firstOrdinal = normalizedPhase === "generation" ? 1 : 7;
+    const lastOrdinal = normalizedPhase === "generation" ? 6 : 12;
+    const offset = firstOrdinal - 1;
+    const sourceStages = Array.isArray(view.stages) ? view.stages : [];
+    const projectStage = function(stage) {
+      if (!stage || typeof stage !== "object") return stage;
+      const sourceOrdinal = Number(stage.ordinal || 0);
+      const projected = Object.assign({}, stage, {
+        ordinal: sourceOrdinal > 0 ? Math.min(6, Math.max(1, sourceOrdinal - offset)) : 1,
+        total: 6,
+      });
+      if (normalizedPhase === "generation" && view.host_generation_finished === true && stage.key === "awaiting_final_output") {
+        projected.status = "succeeded";
+        projected.label_key = "turn_hud.timing.response";
+        const timing = view.host_timing;
+        if (timing && Number.isFinite(timing.response_received_ms) && Number.isFinite(timing.main_started_ms)) {
+          projected.duration_ms = Math.max(0, timing.response_received_ms - timing.main_started_ms);
+        }
+      }
+      return projected;
+    };
+    const stages = sourceStages.filter(function(stage) {
+      const ordinal = Number(stage && stage.ordinal || 0);
+      return ordinal >= firstOrdinal && ordinal <= lastOrdinal;
+    }).map(projectStage);
+    let currentStage = view.current_stage && typeof view.current_stage === "object"
+      ? view.current_stage
+      : null;
+    const currentOrdinal = Number(currentStage && currentStage.ordinal || 0);
+    if (normalizedPhase === "finalization" && currentOrdinal < firstOrdinal) {
+      currentStage = sourceStages.find(function(stage) {
+        return Number(stage && stage.ordinal || 0) === firstOrdinal;
+      }) || {
+        key: "final_output_accepted",
+        label_key: "turn_hud.stage.final_output_accepted",
+        status: "running",
+        ordinal: firstOrdinal,
+        total: 12,
+        llm_call: false,
+      };
+    } else if (normalizedPhase === "generation" && currentOrdinal > lastOrdinal) {
+      currentStage = sourceStages.find(function(stage) {
+        return Number(stage && stage.ordinal || 0) === lastOrdinal;
+      }) || currentStage;
+    }
+    return Object.assign({}, view, {
+      current_stage: projectStage(currentStage),
+      stages,
+      counts: normalizedPhase === "generation" ? [] : view.counts,
+      error: normalizedPhase === "generation" && view.error ? Object.assign({}, view.error, {preserved_counts: []}) : view.error,
+      host_timing: normalizedPhase === "finalization" ? undefined : view.host_timing,
+      preprocessing: normalizedPhase === "finalization" ? [] : view.preprocessing,
+      preprocessing_search: normalizedPhase === "finalization" ? undefined : view.preprocessing_search,
+      host_generation_finished: normalizedPhase === "generation" && view.host_generation_finished === true,
+    });
+  }
+
+  function dismissTurnWorkflowHUDPrevious(requestId) {
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId || normalizedRequestId !== _turnWorkflowHUDPreviousRequestId) return false;
+    _turnWorkflowHUDHostWarningsByRequestId.delete(normalizedRequestId);
+    cancelTurnWorkflowHUDPreviousStream();
+    _turnWorkflowHUDPreviousWatchToken++;
+    _turnWorkflowHUDPreviousWatchRunning = false;
+    _turnWorkflowHUDPreviousRequestId = "";
+    _turnWorkflowHUDPreviousLastRevision = 0;
+    _turnWorkflowHUDPreviousLastView = null;
+    queueTurnWorkflowHUDOperation("dismiss previous", async function() {
+      await removeTurnWorkflowHUDDismissListeners();
+      const root = await ensureTurnWorkflowHUDRoot();
+      if (root) await applyTurnWorkflowHUDStack(root);
+    });
+    return true;
+  }
+
+  function buildTurnWorkflowHUDPresentation(view, phase = "") {
+    view = projectTurnWorkflowHUDPhaseView(view, phase);
     const severity = String(view.severity || "normal");
     if (String(view.display_mode || "") === "notice") {
       const failed = view.status === "failed" || severity === "error";
@@ -14503,6 +15404,7 @@
           + (messageKey ? `<div style="${TURN_WORKFLOW_HUD_ERROR_MESSAGE_STYLE}">${escapeTurnWorkflowHUDHTML(t(messageKey))}</div>` : "")
           + (meta ? `<div style="${failed ? TURN_WORKFLOW_HUD_ERROR_META_STYLE : TURN_WORKFLOW_HUD_STAGE_STYLE}">${escapeTurnWorkflowHUDHTML(meta)}</div>` : "")
           + turnWorkflowHUDCountLedgerHTML(countPresentation)
+          + turnWorkflowHUDTimingHTML(view)
           + turnWorkflowHUDWarningListHTML(view)
           + `</div>`,
       };
@@ -14513,20 +15415,25 @@
       const errorDetailsHTML = turnWorkflowHUDErrorDetailsHTML(error);
       const preservedCounts = Array.isArray(error.preserved_counts) ? error.preserved_counts : view.counts;
       const countPresentation = turnWorkflowHUDCountPresentation(preservedCounts);
+      const closeButtonOnly = turnWorkflowHUDCloseButtonOnly(view);
       const meta = [
         turnWorkflowHUDTurnLabel(view),
         String(error.code || "CRITIC_REPROCESSING_QUEUED"),
       ].filter(Boolean).join(" · ");
       return {
         terminal: false,
+        dismissible: closeButtonOnly,
+        closeButtonOnly,
         elapsedStartedAt: "",
-        html: `<div style="${TURN_WORKFLOW_HUD_CARD_STYLE + turnWorkflowHUDSeverityStyle("warning")}">`
+        html: `<div role="button" tabindex="0" style="${TURN_WORKFLOW_HUD_CARD_STYLE + turnWorkflowHUDSeverityStyle("warning")}">`
+          + (closeButtonOnly ? turnWorkflowHUDDismissButtonHTML() : "")
           + `<div style="${TURN_WORKFLOW_HUD_EYEBROW_STYLE}">ARCHIVE CENTER · ${BUILD_ID}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_TITLE_STYLE}">${escapeTurnWorkflowHUDHTML(t("turn_hud.recovery.running_title"))}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_DIVIDER_STYLE}"></div>`
           + `<div style="${TURN_WORKFLOW_HUD_ERROR_MESSAGE_STYLE}">${escapeTurnWorkflowHUDHTML(t("turn_hud.recovery.running"))}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_STAGE_STYLE}">${escapeTurnWorkflowHUDHTML(meta)}</div>`
           + errorDetailsHTML
+          + turnWorkflowHUDTimingHTML(view)
           + turnWorkflowHUDCountLedgerHTML(countPresentation)
           + turnWorkflowHUDStageLedgerHTML(view)
           + turnWorkflowHUDWarningListHTML(view)
@@ -14550,10 +15457,10 @@
       const errorDetailsHTML = turnWorkflowHUDErrorDetailsHTML(error);
       return {
         terminal: true,
-        closeButtonOnly: turnWorkflowHUDCloseButtonOnly(view),
+        closeButtonOnly: true,
         elapsedStartedAt: "",
         recoveryAction: recoveryPresentation.action,
-        html: `<div role="button" tabindex="0" style="${TURN_WORKFLOW_HUD_CARD_STYLE + TURN_WORKFLOW_HUD_ERROR_STYLE}">`
+        html: `<div style="${TURN_WORKFLOW_HUD_CARD_STYLE + TURN_WORKFLOW_HUD_ERROR_STYLE}">`
           + turnWorkflowHUDDismissButtonHTML()
           + `<div style="${TURN_WORKFLOW_HUD_EYEBROW_STYLE}">ARCHIVE CENTER · ${BUILD_ID}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_TITLE_STYLE}">${escapeTurnWorkflowHUDHTML(turnWorkflowHUDTurnLabel(view) + " · " + t("turn_hud.failed"))}</div>`
@@ -14562,6 +15469,7 @@
           + `<div style="${TURN_WORKFLOW_HUD_ERROR_META_STYLE}">${escapeTurnWorkflowHUDHTML(meta)}</div>`
           + errorDetailsHTML
           + `<div style="${TURN_WORKFLOW_HUD_DIVIDER_STYLE}"></div>`
+          + turnWorkflowHUDTimingHTML(view)
           + turnWorkflowHUDCountLedgerHTML(countPresentation)
           + turnWorkflowHUDStageLedgerHTML(view)
           + turnWorkflowHUDWarningListHTML(view)
@@ -14570,20 +15478,21 @@
       };
     }
 
-    if (view.status === "completed" || view.status === "completed_with_warning" || view.status === "invalidated") {
-      const completionLabel = view.status === "invalidated"
+    if (view.host_generation_finished || view.status === "completed" || view.status === "completed_with_warning" || view.status === "invalidated") {
+      const completionLabel = view.host_generation_finished ? t("turn_hud.timing.response") : view.status === "invalidated"
         ? t("turn_hud.invalidated")
         : (view.status === "completed_with_warning" ? t("turn_hud.completed_with_warning") : t("turn_hud.completed"));
       const countPresentation = turnWorkflowHUDCountPresentation(view.counts);
       return {
         terminal: true,
-        closeButtonOnly: turnWorkflowHUDCloseButtonOnly(view),
+        closeButtonOnly: severity === "normal" ? turnWorkflowHUDCloseButtonOnly(view) : true,
         elapsedStartedAt: "",
-        html: `<div role="button" tabindex="0" style="${TURN_WORKFLOW_HUD_CARD_STYLE + turnWorkflowHUDSeverityStyle(severity)}">`
+        html: `<div style="${TURN_WORKFLOW_HUD_CARD_STYLE + turnWorkflowHUDSeverityStyle(severity)}">`
           + turnWorkflowHUDDismissButtonHTML()
           + `<div style="${TURN_WORKFLOW_HUD_EYEBROW_STYLE}">ARCHIVE CENTER · ${BUILD_ID}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_TITLE_STYLE}">${escapeTurnWorkflowHUDHTML(turnWorkflowHUDTurnLabel(view) + " · " + completionLabel)}</div>`
           + `<div style="${TURN_WORKFLOW_HUD_DIVIDER_STYLE}"></div>`
+          + turnWorkflowHUDTimingHTML(view)
           + turnWorkflowHUDCountLedgerHTML(countPresentation)
           + turnWorkflowHUDStageLedgerHTML(view)
           + turnWorkflowHUDWarningListHTML(view)
@@ -14611,7 +15520,8 @@
         + (elapsedStartedAt ? `<time style="${TURN_WORKFLOW_HUD_ELAPSED_STYLE}"></time>` : "")
         + `</div>`
         + `<div style="${TURN_WORKFLOW_HUD_PROGRESS_STYLE}"><div style="${TURN_WORKFLOW_HUD_PROGRESS_FILL_STYLE};width:${progressPercent.toFixed(1)}%"></div></div>`
-        + turnWorkflowHUDWarningListHTML(view)
+        + turnWorkflowHUDTimingHTML(view)
+          + turnWorkflowHUDWarningListHTML(view)
         + `</div>`,
     };
   }
@@ -14620,7 +15530,161 @@
     return !settings || settings.turnWorkflowHUDEnabled !== false;
   }
 
+  function turnWorkflowHUDSlotHTML(presentation, slot, labelKey, dual) {
+    if (!presentation || !presentation.html) return "";
+    let cardHTML = String(presentation.html);
+    if (dual) {
+      cardHTML = cardHTML.replace(
+        "max-height:calc(100vh - 20px)",
+        "max-height:calc((100vh - 27px)/2)",
+      );
+    }
+    if (dual && slot === "previous" && !presentation.terminal && presentation.dismissible !== true && presentation.closeButtonOnly !== true) {
+      cardHTML = cardHTML.replace(turnWorkflowHUDDismissButtonHTML(), "");
+    }
+    cardHTML = cardHTML.replace(
+      "<div",
+      `<div data-turn-workflow-card="${escapeTurnWorkflowHUDHTML(slot)}"`,
+    );
+    return `<section data-turn-workflow-slot="${escapeTurnWorkflowHUDHTML(slot)}" style="${TURN_WORKFLOW_HUD_SLOT_STYLE}">`
+      + `<div style="${TURN_WORKFLOW_HUD_SLOT_LABEL_STYLE}">${escapeTurnWorkflowHUDHTML(t(labelKey))}</div>`
+      + cardHTML
+      + `</section>`;
+  }
+
+  function buildTurnWorkflowHUDStackPresentation(currentView, previousView, currentFinalizationMode = "immediate_after_response") {
+    const splitWorkflow = String(currentFinalizationMode || "") === "next_user_input" || !!previousView;
+    const projectedCurrentView = currentView
+      ? projectTurnWorkflowHUDPhaseView(currentView, splitWorkflow ? "generation" : "")
+      : null;
+    const projectedPreviousView = previousView
+      ? projectTurnWorkflowHUDPhaseView(previousView, "finalization")
+      : null;
+    const currentPresentation = projectedCurrentView
+      ? buildTurnWorkflowHUDPresentation(projectedCurrentView)
+      : null;
+    const previousPresentation = projectedPreviousView
+      ? buildTurnWorkflowHUDPresentation(projectedPreviousView)
+      : null;
+    if (currentPresentation && previousPresentation) {
+      return {
+        html: turnWorkflowHUDSlotHTML(currentPresentation, "current", "turn_hud.slot.current", true)
+          + turnWorkflowHUDSlotHTML(previousPresentation, "previous", "turn_hud.slot.previous", true),
+        currentPresentation,
+        previousPresentation,
+        dual: true,
+        currentCardSelector: '[data-turn-workflow-card="current"]',
+        previousCardSelector: '[data-turn-workflow-card="previous"]',
+        elapsedSelector: '[data-turn-workflow-card="current"] time',
+      };
+    }
+    if (currentPresentation) {
+      if (splitWorkflow) {
+        return {
+          html: turnWorkflowHUDSlotHTML(currentPresentation, "current", "turn_hud.slot.current", false),
+          currentPresentation,
+          previousPresentation: null,
+          dual: false,
+          currentCardSelector: '[data-turn-workflow-card="current"]',
+          previousCardSelector: "",
+          elapsedSelector: '[data-turn-workflow-card="current"] time',
+        };
+      }
+      return {
+        html: currentPresentation.html,
+        currentPresentation,
+        previousPresentation: null,
+        dual: false,
+        currentCardSelector: "div",
+        previousCardSelector: "",
+        elapsedSelector: "time",
+      };
+    }
+    if (previousPresentation) {
+      return {
+        html: turnWorkflowHUDSlotHTML(previousPresentation, "previous", "turn_hud.slot.previous", false),
+        currentPresentation: null,
+        previousPresentation,
+        dual: false,
+        currentCardSelector: "",
+        previousCardSelector: '[data-turn-workflow-card="previous"]',
+        elapsedSelector: "",
+      };
+    }
+    return { html: "", currentPresentation: null, previousPresentation: null, dual: false };
+  }
+
+  async function applyTurnWorkflowHUDStack(root) {
+    const currentView = _turnWorkflowHUDLastView;
+    const previousView = _turnWorkflowHUDPreviousLastView;
+    const stack = buildTurnWorkflowHUDStackPresentation(
+      currentView,
+      previousView,
+      _turnWorkflowHUDCurrentFinalizationMode,
+    );
+    clearTurnWorkflowHUDTimer();
+    await root.setInnerHTML(stack.html);
+    if (stack.currentPresentation && stack.currentPresentation.elapsedStartedAt && stack.elapsedSelector) {
+      const element = await root.querySelector(stack.elapsedSelector);
+      if (element) _turnWorkflowHUDElapsedElement = [{element, startedAt: stack.currentPresentation.elapsedStartedAt}];
+    }
+    if (currentView && currentView.preprocessing_search && currentView.preprocessing_search.status === "running") {
+      const element = await root.querySelector('[data-turn-workflow-search-time]');
+      if (element) {
+        if (!_turnWorkflowHUDElapsedElement) _turnWorkflowHUDElapsedElement = [];
+        _turnWorkflowHUDElapsedElement.push({element, startedAt: currentView.preprocessing_search.started_at});
+      }
+    }
+    for (const role of (currentView && currentView.preprocessing || [])) {
+      for (const call of (role.calls || [])) {
+        if (call.status !== "running") continue;
+        const element = await root.querySelector('[data-turn-workflow-agent-time="' + role.role + '-' + call.round + '"]');
+        if (element) {
+          if (!_turnWorkflowHUDElapsedElement) _turnWorkflowHUDElapsedElement = [];
+          _turnWorkflowHUDElapsedElement.push({element, startedAt: call.started_at});
+        }
+      }
+    }
+    if (_turnWorkflowHUDElapsedElement) {
+      await updateTurnWorkflowHUDElapsed();
+      scheduleTurnWorkflowHUDElapsedFrame();
+    }
+    if (
+      stack.currentPresentation
+      && (stack.currentPresentation.terminal || stack.currentPresentation.dismissible)
+      && stack.currentCardSelector
+    ) {
+      const currentCard = await root.querySelector(stack.currentCardSelector);
+      await attachTurnWorkflowHUDDismiss(
+        currentCard,
+        String(currentView && currentView.request_id || "").trim(),
+        stack.currentPresentation.closeButtonOnly === true,
+      );
+      await attachTurnWorkflowHUDRecovery(
+        stack.dual ? currentCard : root,
+        currentView,
+        stack.currentPresentation.recoveryAction,
+      );
+    }
+    if (stack.previousPresentation && stack.previousCardSelector) {
+      const previousCard = await root.querySelector(stack.previousCardSelector);
+      if (stack.previousPresentation.terminal || stack.previousPresentation.dismissible) {
+        const previousRequestId = String(previousView && previousView.request_id || "").trim();
+        await attachTurnWorkflowHUDDismiss(
+          previousCard,
+          previousRequestId,
+          stack.previousPresentation.closeButtonOnly === true,
+          async function() {
+            dismissTurnWorkflowHUDPrevious(previousRequestId);
+          },
+        );
+      }
+      await attachTurnWorkflowHUDRecovery(previousCard, previousView, stack.previousPresentation.recoveryAction);
+    }
+  }
+
   function renderTurnWorkflowHUD(view) {
+    view = retainTurnWorkflowHUDHostTiming(view);
     if (_turnWorkflowHUDUnloaded) return;
     if (!turnWorkflowHUDIsEnabled()) {
       dismissTurnWorkflowHUD();
@@ -14631,6 +15695,7 @@
     if (!requestId) return;
     if (_turnWorkflowHUDActiveRequestId && requestId !== _turnWorkflowHUDActiveRequestId) return;
     _turnWorkflowHUDActiveRequestId = requestId;
+    _turnWorkflowHUDLastView = view;
     const revision = Number(view.revision || 0);
     _turnWorkflowHUDLastRevision = Math.max(_turnWorkflowHUDLastRevision, revision);
     const presentation = buildTurnWorkflowHUDPresentation(view);
@@ -14643,24 +15708,7 @@
       await removeTurnWorkflowHUDDismissListeners();
       const root = await ensureTurnWorkflowHUDRoot();
       if (!root || requestId !== _turnWorkflowHUDActiveRequestId) return;
-      clearTurnWorkflowHUDTimer();
-      await root.setInnerHTML(presentation.html);
-      if (presentation.elapsedStartedAt) {
-        _turnWorkflowHUDElapsedElement = await root.querySelector("time");
-        _turnWorkflowHUDElapsedStartedAt = presentation.elapsedStartedAt;
-        if (_turnWorkflowHUDElapsedElement) {
-          await updateTurnWorkflowHUDElapsed();
-          scheduleTurnWorkflowHUDElapsedFrame();
-        }
-      }
-      if (presentation.terminal) {
-        await attachTurnWorkflowHUDDismiss(
-          await root.querySelector("div"),
-          requestId,
-          presentation.closeButtonOnly === true,
-        );
-        await attachTurnWorkflowHUDRecovery(root, view, presentation.recoveryAction);
-      }
+      await applyTurnWorkflowHUDStack(root);
     });
   }
 
@@ -14789,14 +15837,59 @@
     });
   }
 
+  function renderTurnWorkflowHUDPreviousTransportError(requestId, path, fallbackReasonCode) {
+    if (_turnWorkflowHUDUnloaded || !turnWorkflowHUDIsEnabled()) return;
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId || normalizedRequestId !== _turnWorkflowHUDPreviousRequestId) return;
+    rememberTurnWorkflowHUDHostWarning(
+      normalizedRequestId,
+      classifyTurnWorkflowHUDTransportFailure(path, fallbackReasonCode),
+    );
+    if (_turnWorkflowHUDPreviousLastView) {
+      renderTurnWorkflowHUDPrevious(_turnWorkflowHUDPreviousLastView);
+    }
+  }
+
   function consumeTurnWorkflowHUD(view) {
+    view = retainTurnWorkflowHUDHostTiming(view);
     if (!turnWorkflowHUDIsEnabled()) return false;
     if (!view || view.contract_version !== TURN_WORKFLOW_HUD_CONTRACT || view.status === "unknown") return false;
     const requestId = String(view.request_id || "");
     if (!requestId || (_turnWorkflowHUDActiveRequestId && requestId !== _turnWorkflowHUDActiveRequestId)) return false;
     const revision = Number(view.revision || 0);
     if (revision > 0 && revision < _turnWorkflowHUDLastRevision) return false;
+    _turnWorkflowHUDLastView = view;
     renderTurnWorkflowHUD(view);
+    return true;
+  }
+
+  function renderTurnWorkflowHUDPrevious(view) {
+    if (_turnWorkflowHUDUnloaded || !turnWorkflowHUDIsEnabled()) return;
+    if (!view || view.contract_version !== TURN_WORKFLOW_HUD_CONTRACT) return;
+    const requestId = String(view.request_id || "").trim();
+    if (!requestId || requestId !== _turnWorkflowHUDPreviousRequestId) return;
+    const revision = Number(view.revision || 0);
+    _turnWorkflowHUDPreviousLastRevision = Math.max(_turnWorkflowHUDPreviousLastRevision, revision);
+    _turnWorkflowHUDPreviousLastView = view;
+    return queueTurnWorkflowHUDOperation("render previous", async function() {
+      if (requestId !== _turnWorkflowHUDPreviousRequestId) return;
+      if (revision > 0 && revision < _turnWorkflowHUDPreviousLastRevision) return;
+      await removeTurnWorkflowHUDDismissListeners();
+      const root = await ensureTurnWorkflowHUDRoot();
+      if (!root || requestId !== _turnWorkflowHUDPreviousRequestId) return;
+      await applyTurnWorkflowHUDStack(root);
+    });
+  }
+
+  function consumeTurnWorkflowHUDPrevious(view) {
+    if (!turnWorkflowHUDIsEnabled()) return false;
+    if (!view || view.contract_version !== TURN_WORKFLOW_HUD_CONTRACT || view.status === "unknown") return false;
+    const requestId = String(view.request_id || "").trim();
+    if (!requestId || requestId !== _turnWorkflowHUDPreviousRequestId) return false;
+    const revision = Number(view.revision || 0);
+    if (revision > 0 && revision < _turnWorkflowHUDPreviousLastRevision) return false;
+    _turnWorkflowHUDPreviousLastView = view;
+    renderTurnWorkflowHUDPrevious(view);
     return true;
   }
 
@@ -14852,6 +15945,22 @@
     const controller = _turnWorkflowHUDStreamAbortController;
     _turnWorkflowHUDStreamReader = null;
     _turnWorkflowHUDStreamAbortController = null;
+    try {
+      if (controller) controller.abort();
+    } catch { /* no-op */ }
+    try {
+      if (reader && typeof reader.cancel === "function") {
+        const cancellation = reader.cancel();
+        if (cancellation && typeof cancellation.catch === "function") cancellation.catch(function() {});
+      }
+    } catch { /* no-op */ }
+  }
+
+  function cancelTurnWorkflowHUDPreviousStream() {
+    const reader = _turnWorkflowHUDPreviousStreamReader;
+    const controller = _turnWorkflowHUDPreviousStreamAbortController;
+    _turnWorkflowHUDPreviousStreamReader = null;
+    _turnWorkflowHUDPreviousStreamAbortController = null;
     try {
       if (controller) controller.abort();
     } catch { /* no-op */ }
@@ -14951,6 +16060,61 @@
     return true;
   }
 
+  async function consumeTurnWorkflowHUDPreviousStreamLine(line, token, requestId) {
+    const normalized = String(line || "").trim();
+    if (!normalized) return false;
+    let view;
+    try {
+      view = JSON.parse(normalized);
+    } catch {
+      throw turnWorkflowHUDStreamFailure("stream_decode_failed", "invalid previous-turn NDJSON event");
+    }
+    if (
+      token !== _turnWorkflowHUDPreviousWatchToken
+      || requestId !== _turnWorkflowHUDPreviousRequestId
+    ) return true;
+    if (String(view && view.request_id || "") !== requestId) {
+      throw turnWorkflowHUDStreamFailure("stream_request_mismatch", "previous-turn stream request mismatch");
+    }
+    if (consumeTurnWorkflowHUDPrevious(view)) {
+      await _turnWorkflowHUDRenderChain;
+    }
+    return view && (
+      view.status === "completed"
+      || view.status === "completed_with_warning"
+      || view.status === "failed"
+      || view.status === "invalidated"
+    );
+  }
+
+  async function consumeTurnWorkflowHUDPreviousStream(reader, token, requestId) {
+    const decoder = new TextDecoder();
+    let buffered = "";
+    while (
+      token === _turnWorkflowHUDPreviousWatchToken
+      && requestId === _turnWorkflowHUDPreviousRequestId
+    ) {
+      const chunk = await reader.read();
+      if (chunk && chunk.value) buffered += decoder.decode(chunk.value, { stream: chunk.done !== true });
+      let newlineIndex = buffered.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = buffered.slice(0, newlineIndex);
+        buffered = buffered.slice(newlineIndex + 1);
+        if (await consumeTurnWorkflowHUDPreviousStreamLine(line, token, requestId)) return true;
+        newlineIndex = buffered.indexOf("\n");
+      }
+      if (chunk && chunk.done === true) {
+        buffered += decoder.decode();
+        if (
+          buffered.trim()
+          && await consumeTurnWorkflowHUDPreviousStreamLine(buffered, token, requestId)
+        ) return true;
+        return false;
+      }
+    }
+    return true;
+  }
+
   // The backend cannot publish a workflow ViewModel until /prepare-turn has
   // registered the request. Render only the host-observed waiting state here;
   // the first backend revision replaces it with authoritative turn/stage data.
@@ -14964,9 +16128,13 @@
     _turnWorkflowHUDWatchToken++;
     _turnWorkflowHUDWatchRunning = false;
     _turnWorkflowHUDActiveRequestId = normalizedRequestId;
+    _turnWorkflowHUDCurrentFinalizationMode = String(settings && settings.turnFinalizationMode || "") === "next_user_input"
+      ? "next_user_input"
+      : "immediate_after_response";
     if (previousRequestId) _turnWorkflowHUDHostWarningsByRequestId.delete(previousRequestId);
     _turnWorkflowHUDLastRevision = 0;
     _turnWorkflowHUDTerminalRequestId = "";
+    _turnWorkflowHUDLastView = null;
     clearTurnWorkflowHUDTimer();
     consumeTurnWorkflowHUD({
       contract_version: TURN_WORKFLOW_HUD_CONTRACT,
@@ -14974,6 +16142,7 @@
       revision: 0,
       status: "running",
       severity: "normal",
+      host_timing: { started_ms: Date.now() },
       current_stage: {
         key: "prepare_source",
         label_key: "turn_hud.stage.prepare_source",
@@ -14984,6 +16153,55 @@
       },
     });
     return normalizedRequestId;
+  }
+
+  function finishTurnWorkflowHUDCurrentGeneration(requestId) {
+    const normalizedRequestId = String(requestId || "").trim();
+    if (
+      !normalizedRequestId
+      || normalizedRequestId !== _turnWorkflowHUDActiveRequestId
+    ) return false;
+    _turnWorkflowHUDHostWarningsByRequestId.delete(normalizedRequestId);
+    cancelTurnWorkflowHUDStream();
+    _turnWorkflowHUDWatchToken++;
+    _turnWorkflowHUDWatchRunning = false;
+    if (_turnWorkflowHUDLastView && _turnWorkflowHUDLastView.host_timing && Number.isFinite(_turnWorkflowHUDLastView.host_timing.response_received_ms)) {
+      void renderTurnWorkflowHUD(Object.assign({}, _turnWorkflowHUDLastView, {host_generation_finished: true}));
+      return true;
+    }
+    _turnWorkflowHUDActiveRequestId = "";
+    _turnWorkflowHUDLastRevision = 0;
+    _turnWorkflowHUDTerminalRequestId = "";
+    _turnWorkflowHUDLastView = null;
+    _turnWorkflowHUDCurrentFinalizationMode = "immediate_after_response";
+    clearTurnWorkflowHUDTimer();
+    queueTurnWorkflowHUDOperation("finish current generation", async function() {
+      await removeTurnWorkflowHUDDismissListeners();
+      const root = await ensureTurnWorkflowHUDRoot();
+      if (root) await applyTurnWorkflowHUDStack(root);
+    });
+    return true;
+  }
+
+  function renderTurnWorkflowHUDSameRequestRetry(requestId, attemptCount) {
+    if (_turnWorkflowHUDUnloaded || !turnWorkflowHUDIsEnabled()) return false;
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId || normalizedRequestId !== _turnWorkflowHUDActiveRequestId) return false;
+    const normalizedAttempt = Math.max(2, Math.trunc(Number(attemptCount || 2)));
+    rememberTurnWorkflowHUDHostWarning(normalizedRequestId, {
+      code: "",
+      message: tf("turn_hud.notice.risu_request_retry_observed", { n: normalizedAttempt }),
+      details: [],
+      path: "risu_beforeRequest",
+      status: 0,
+    });
+    if (
+      _turnWorkflowHUDLastView
+      && String(_turnWorkflowHUDLastView.request_id || "") === normalizedRequestId
+    ) {
+      renderTurnWorkflowHUD(_turnWorkflowHUDLastView);
+    }
+    return true;
   }
 
   function startTurnWorkflowHUDWatch(requestId) {
@@ -15070,6 +16288,65 @@
         _turnWorkflowHUDStreamAbortController = null;
         _turnWorkflowHUDStreamReader = null;
         _turnWorkflowHUDWatchRunning = false;
+      }
+    });
+  }
+
+  function startTurnWorkflowHUDPreviousWatch(requestId) {
+    if (!turnWorkflowHUDIsEnabled()) {
+      dismissTurnWorkflowHUD();
+      return;
+    }
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId) return;
+    if (settings.webDirectBridgeEnabled === true) {
+      debugLog("previous-turn workflow HUD live stream is unavailable in Web Risu direct bridge test mode");
+      return;
+    }
+    if (
+      _turnWorkflowHUDPreviousWatchRunning
+      && _turnWorkflowHUDPreviousRequestId === normalizedRequestId
+    ) return;
+    cancelTurnWorkflowHUDPreviousStream();
+    _turnWorkflowHUDPreviousWatchToken++;
+    const token = _turnWorkflowHUDPreviousWatchToken;
+    _turnWorkflowHUDPreviousWatchRunning = true;
+    _turnWorkflowHUDPreviousRequestId = normalizedRequestId;
+    _turnWorkflowHUDPreviousLastRevision = 0;
+    _turnWorkflowHUDPreviousLastView = null;
+    (async function() {
+      const bridgeRoute = resolveBridgeRuntimeRoute(settings.bridgeUrl);
+      if (!bridgeRoute.url) {
+        throw turnWorkflowHUDStreamFailure("hud_transport_unavailable", "bridge URL is unavailable");
+      }
+      const controller = new AbortController();
+      _turnWorkflowHUDPreviousStreamAbortController = controller;
+      const path = "/turn-workflow/events?request_id=" + encodeURIComponent(normalizedRequestId)
+        + "&after_revision=0";
+      const reader = await openTurnWorkflowHUDStream(bridgeRoute.url + path, controller.signal);
+      if (
+        token !== _turnWorkflowHUDPreviousWatchToken
+        || _turnWorkflowHUDPreviousRequestId !== normalizedRequestId
+      ) {
+        try { await reader.cancel(); } catch { /* no-op */ }
+        return;
+      }
+      _turnWorkflowHUDPreviousStreamReader = reader;
+      const terminal = await consumeTurnWorkflowHUDPreviousStream(reader, token, normalizedRequestId);
+      _turnWorkflowHUDPreviousStreamReader = null;
+      if (!terminal) {
+        throw turnWorkflowHUDStreamFailure(
+          "hud_transport_nonterminal_eof",
+          "previous-turn HUD stream ended before a terminal backend state",
+        );
+      }
+    })().catch(function(err) {
+      debugLog("previous-turn workflow HUD watcher failed:", err && err.message);
+    }).finally(function() {
+      if (token === _turnWorkflowHUDPreviousWatchToken) {
+        _turnWorkflowHUDPreviousStreamAbortController = null;
+        _turnWorkflowHUDPreviousStreamReader = null;
+        _turnWorkflowHUDPreviousWatchRunning = false;
       }
     });
   }
@@ -15757,6 +17034,13 @@
             content: String(parsed.text || (m && m.content) || ""),
           };
         }).filter(function(m) { return m.role || m.content; }),
+        recent_conversation_messages: (prepareOptions.recentConversationMessages || []).map(function(m) {
+          const parsed = getPayloadMessageRoleAndText(m);
+          return {
+            role: parsed.role || String((m && m.role) || ""),
+            content: String(parsed.text || (m && m.content) || ""),
+          };
+        }).filter(function(m) { return m.role || m.content; }),
         continuity_trigger_mode: (continuityInfo && continuityInfo.triggerMode) ? continuityInfo.triggerMode : "none",
         continuity_query: (continuityInfo && continuityInfo.query) ? String(continuityInfo.query) : "",
         settings: {
@@ -15766,6 +17050,8 @@
           takeover_mode: "off",  // 사용자 경로 단순화: takeover 비활성 고정
           injection_enabled: settings.injectionEnabled !== false,
           max_injection_chars: freshFirstTurnLightMode ? 0 : prepareInjectionBudget.configuredBudgetChars,
+          memory_transport_mode: settings.memoryTransportMode || DEFAULT_SETTINGS.memoryTransportMode,
+          turn_finalization_mode: settings.turnFinalizationMode || DEFAULT_SETTINGS.turnFinalizationMode,
           memory_delivery_budget_mode: settings.memoryDeliveryBudgetMode || "auto",
           memory_delivery_budgets: { ...(settings.memoryDeliveryBudgets || DEFAULT_SETTINGS.memoryDeliveryBudgets) },
           reference_injection_budget_basis_chars: Number(settings.referenceInjectionMaxChars ?? DEFAULT_SETTINGS.referenceInjectionMaxChars),
@@ -15778,6 +17064,10 @@
           episode_interval_turns: settings.episodeIntervalTurns || DEFAULT_SETTINGS.episodeIntervalTurns,
           supervisor_enabled: !guideDisabled,
           top_k: freshFirstTurnLightMode ? 0 : sanitizeTopKSetting(settings.topK, DEFAULT_SETTINGS.topK),
+          recent_conversation_reference_count: sanitizeTopKSetting(
+            settings.recentConversationReferenceCount,
+            DEFAULT_SETTINGS.recentConversationReferenceCount,
+          ),
           core_objective_memory_max_items: sanitizeTopKSetting(
             settings.coreObjectiveMemoryMaxItems,
             DEFAULT_SETTINGS.coreObjectiveMemoryMaxItems,
@@ -15899,6 +17189,7 @@
         turnWorkflowHUD: result.turn_workflow_hud || null,
         sourceContract: result.source_contract || null,
         currentInputDecision: result.current_input_decision || null,
+        turnFinalizationPolicy: result.turn_finalization_policy || null,
         messageSourceEnvelope: result.message_source_envelope || null,
         sessionBootstrap: result.session_bootstrap || null,
         risuHostContextSnapshot: result.risu_host_context_snapshot || null,
@@ -15920,6 +17211,9 @@
           // + Plugin Main 계약 placeholder: effective_user_input / apply_verdict (M-3b에서 채워짐)
           injectionPack:      result.injection_pack       || null,
           payloadApplicationPlan: result.payload_application_plan || (result.injection_pack && result.injection_pack.payload_application_plan) || null,
+          memoryTransportPlan: result.memory_transport_plan || (result.injection_pack && result.injection_pack.memory_transport_plan) || null,
+          memoryTransportPayload: result.memory_transport_payload || null,
+          turnFinalizationPolicy: result.turn_finalization_policy || null,
           sourceToPayloadLineage: result.source_to_payload_lineage || (result.injection_pack && result.injection_pack.source_to_payload_lineage) || null,
           supervisorResult:   result.supervisor_result    || null,
           memoryBudgetResolution: result.memory_budget_resolution || null,
@@ -18797,6 +20091,10 @@
         pendingContext: null,
         orchestrationResult: null,
         nonMainSkip: null,
+        beforeRequestAttemptCount: 1,
+        lastBeforeRequestAt: new Date().toISOString(),
+        retryPayloadReady: false,
+        payloadRewriteApplied: false,
         state: hostChatId ? "captured" : "unavailable",
       };
       updateRuntimeState("lastStreamingAfterRequest", "watching", {
@@ -18811,6 +20109,473 @@
       debugLog("[final-confirmation] request context unavailable:", err && err.message);
       return null;
     }
+  }
+
+  function finalConfirmationRequestContextOwnsPendingResponse(context) {
+    return !!(
+      context
+      && typeof context === "object"
+      && context.state !== "accepted"
+      && context.state !== "terminal"
+      && context.state !== "unavailable"
+    );
+  }
+
+  function finalConfirmationRequestContextRetryIdentityMatches(active, candidate) {
+    if (!active || !candidate || typeof active !== "object" || typeof candidate !== "object") return false;
+    const requiredStrings = [
+      "sessionId",
+      "requestType",
+      "hostChatId",
+      "userObservedContentHash",
+      "userObservedContent",
+      "userMessageChatId",
+      "baselineAssistantContentHash",
+      "baselineGenerationId",
+    ];
+    const requiredNumbers = [
+      "characterIndex",
+      "chatIndex",
+      "requestMessageCount",
+      "userMessageIndex",
+      "userObservedPairOrdinal",
+      "userMessageTimeMs",
+      "baselineAssistantIndex",
+      "baselineAssistantTimeMs",
+    ];
+    if (!String(active.sessionId || "").trim()
+        || !String(active.hostChatId || "").trim()
+        || !String(active.userObservedContentHash || "").trim()
+        || Number(active.userMessageIndex) < 0
+        || Number(active.userObservedPairOrdinal) < 1) {
+      return false;
+    }
+    for (const key of requiredStrings) {
+      if (String(active[key] || "") !== String(candidate[key] || "")) return false;
+    }
+    for (const key of requiredNumbers) {
+      if (!Number.isFinite(Number(active[key]))
+          || Number(active[key]) !== Number(candidate[key])) return false;
+    }
+    return true;
+  }
+
+  function finalConfirmationRequestContextHasReusablePayloadPlan(context) {
+    const orchResult = context && context.orchestrationResult;
+    const injectionPack = orchResult && orchResult._injectionPack;
+    const plan = injectionPack && injectionPack.payload_application_plan;
+    return !!(
+      plan
+      && plan.contract_version === "payload_application_plan.v1"
+      && plan.owner === "go"
+      && plan.apply_rule === "apply_exact_text_without_reassembly"
+      && (plan.status === "ready" || plan.status === "empty")
+    );
+  }
+
+  function reapplyFinalConfirmationRetryPayload(payload, context) {
+    if (!finalConfirmationRequestContextHasReusablePayloadPlan(context)) {
+      return { payload, reused: false, reason: "retry_payload_plan_unavailable" };
+    }
+    let outgoingPayload = payload;
+    if (
+      context.payloadRewriteApplied === true
+      && typeof context.payloadRewriteText === "string"
+      && context.payloadRewriteText.trim()
+    ) {
+      const rewriteResult = rewriteLastUserMessage(outgoingPayload, context.payloadRewriteText);
+      if (rewriteResult && rewriteResult.rewritten) outgoingPayload = rewriteResult.payload;
+    }
+    const applied = context.payloadInjectionReplayAllowed === true
+      ? applyContextInjection(outgoingPayload, context.orchestrationResult)
+      : { payload: outgoingPayload, injectionResult: null };
+    return {
+      payload: applied && Object.prototype.hasOwnProperty.call(applied, "payload") ? applied.payload : outgoingPayload,
+      reused: true,
+      reason: "same_logical_request_retry_reused",
+      injectionResult: applied && applied.injectionResult || null,
+    };
+  }
+
+  function markFinalConfirmationRetryPayloadReady(context, orchestrationResult, options = null) {
+    if (!context || typeof context !== "object") return false;
+    const opts = options && typeof options === "object" ? options : {};
+    const injectionRequested = opts.injectionRequested === true;
+    const observation = orchestrationResult && orchestrationResult._payloadApplicationObservation;
+    const applicationStatus = String(observation && observation.payload_application_status || "");
+    const injectionReplayAllowed = injectionRequested
+      && (applicationStatus === "applied" || applicationStatus === "empty");
+    context.payloadRewriteApplied = opts.payloadRewriteApplied === true;
+    context.payloadRewriteText = context.payloadRewriteApplied
+      ? String(opts.payloadRewriteText || "")
+      : "";
+    context.payloadInjectionReplayAllowed = injectionReplayAllowed;
+    context.retryPayloadReady = !!(
+      context.pendingContext
+      && context.pendingContext.status === "ready"
+      && finalConfirmationRequestContextHasReusablePayloadPlan(context)
+      && (!injectionRequested || injectionReplayAllowed)
+    );
+    context.retryPayloadReadyAt = context.retryPayloadReady ? new Date().toISOString() : "";
+    return context.retryPayloadReady;
+  }
+
+  function attachFinalConfirmationMemoryTransport(context, orchestrationResult, prepareBundle) {
+    if (!context || typeof context !== "object") return;
+    const injectionPack = orchestrationResult && orchestrationResult._injectionPack && typeof orchestrationResult._injectionPack === "object"
+      ? orchestrationResult._injectionPack
+      : null;
+    const bundle = prepareBundle && typeof prepareBundle === "object" ? prepareBundle : null;
+    const plan = (bundle && bundle.memoryTransportPlan)
+      || (injectionPack && injectionPack.memory_transport_plan)
+      || null;
+    const transient = bundle && bundle.memoryTransportPayload || null;
+    const selectedMode = String(plan && plan.selected_mode || "text");
+    if (
+      context.payloadInjectionReplayAllowed === true
+      && selectedMode === "provider_manager_pdf"
+      && plan
+    ) {
+      context.memoryTransportEnvelope = null;
+      context.memoryTransportObservation = orchestrationResult && orchestrationResult._memoryTransportObservation || null;
+      debugLog("memory Provider Manager PDF marker context attached:", {
+        selectedMode,
+        transportStatus: String(plan.transport_status || ""),
+        hasPlanId: !!String(plan.plan_id || ""),
+        markerApplied: !!(context.memoryTransportObservation && context.memoryTransportObservation.applied),
+        attemptCount: Number(context.beforeRequestAttemptCount || 1),
+      });
+      return;
+    }
+    if (
+      context.payloadInjectionReplayAllowed === true
+      && selectedMode !== "text"
+      && plan
+      && transient
+    ) {
+      context.memoryTransportEnvelope = { plan, transient };
+      debugLog("memory PDF transport context attached:", {
+        selectedMode,
+        transportStatus: String(plan.transport_status || ""),
+        hasPlanId: !!String(plan.plan_id || ""),
+        hasTransientPlanId: !!String(transient.plan_id || ""),
+        pdfBytes: Number(plan.pdf_bytes || 0),
+        attemptCount: Number(context.beforeRequestAttemptCount || 1),
+      });
+      return;
+    }
+    context.memoryTransportEnvelope = null;
+    debugLog("memory PDF transport context not attached:", {
+      selectedMode,
+      payloadInjectionReplayAllowed: context.payloadInjectionReplayAllowed === true,
+      hasPlan: !!plan,
+      hasTransient: !!transient,
+    });
+  }
+
+  function cloneMemoryTransportProviderBody(body) {
+    try {
+      const serialized = typeof body === "string";
+      const parsed = serialized ? JSON.parse(body) : body;
+      if (!parsed || typeof parsed !== "object") return null;
+      return {
+        value: JSON.parse(JSON.stringify(parsed)),
+        serialized,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function restoreMemoryTransportProviderBody(decoded) {
+    return decoded.serialized ? JSON.stringify(decoded.value) : decoded.value;
+  }
+
+  function replaceSelectedMemoryText(text, selectedMemoryText) {
+    const source = String(text || "");
+    const selected = String(selectedMemoryText || "");
+    if (!selected || source.indexOf(selected) < 0) return { text: source, count: 0 };
+    const parts = source.split(selected);
+    return { text: parts.join(""), count: parts.length - 1 };
+  }
+
+  function applyGoogleMemoryPDFBody(body, plan, transient) {
+    let removedTextCount = 0;
+    const selectedMemoryText = String(plan.long_term_memory_text || "");
+    const replaceParts = function(parts) {
+      if (!Array.isArray(parts)) return;
+      parts.forEach(function(part) {
+        if (!part || typeof part.text !== "string") return;
+        const replaced = replaceSelectedMemoryText(part.text, selectedMemoryText);
+        part.text = replaced.text;
+        removedTextCount += replaced.count;
+      });
+    };
+    if (body.systemInstruction && typeof body.systemInstruction === "object") {
+      replaceParts(body.systemInstruction.parts);
+    }
+    const contents = Array.isArray(body.contents) ? body.contents : [];
+    contents.forEach(function(content) {
+      replaceParts(content && content.parts);
+    });
+    if (removedTextCount === 0) {
+      return { applied: false, removedTextCount, reason: "google_selected_memory_text_unavailable" };
+    }
+    let currentUserContent = null;
+    for (let index = contents.length - 1; index >= 0; index--) {
+      if (contents[index] && String(contents[index].role || "").toLowerCase() === "user") {
+        currentUserContent = contents[index];
+        break;
+      }
+    }
+    if (!currentUserContent) return { applied: false, removedTextCount, reason: "google_current_user_content_unavailable" };
+    const pdfBase64 = String(transient.pdf_base64 || "");
+    const mimeType = String(plan.mime_type || "application/pdf");
+    const parts = Array.isArray(currentUserContent.parts) ? currentUserContent.parts.slice() : [];
+    currentUserContent.parts = parts.filter(function(part) {
+      return !(part && part.inlineData && part.inlineData.mimeType === mimeType && part.inlineData.data === pdfBase64);
+    });
+    currentUserContent.parts.push({
+      inlineData: {
+        mimeType,
+        data: pdfBase64,
+      },
+    });
+    return { applied: true, removedTextCount, fileBlockCount: 1 };
+  }
+
+  function applyLLMGatewayMemoryPDFBody(body, plan, transient) {
+    let removedTextCount = 0;
+    const selectedMemoryText = String(plan.long_term_memory_text || "");
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    messages.forEach(function(message) {
+      if (!message) return;
+      if (typeof message.content === "string") {
+        const replaced = replaceSelectedMemoryText(message.content, selectedMemoryText);
+        message.content = replaced.text;
+        removedTextCount += replaced.count;
+        return;
+      }
+      if (!Array.isArray(message.content)) return;
+      message.content.forEach(function(part) {
+        if (!part || typeof part.text !== "string") return;
+        const replaced = replaceSelectedMemoryText(part.text, selectedMemoryText);
+        part.text = replaced.text;
+        removedTextCount += replaced.count;
+      });
+    });
+    if (removedTextCount === 0) {
+      return { applied: false, removedTextCount, reason: "gateway_selected_memory_text_unavailable" };
+    }
+    let currentUserMessage = null;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index] && String(messages[index].role || "").toLowerCase() === "user") {
+        currentUserMessage = messages[index];
+        break;
+      }
+    }
+    if (!currentUserMessage) return { applied: false, removedTextCount, reason: "gateway_current_user_message_unavailable" };
+    const filename = String(plan.filename || "archive-center-long-term-memory.pdf");
+    const fileData = "data:" + String(plan.mime_type || "application/pdf") + ";base64," + String(transient.pdf_base64 || "");
+    let contentParts;
+    if (Array.isArray(currentUserMessage.content)) {
+      contentParts = currentUserMessage.content.slice();
+    } else if (typeof currentUserMessage.content === "string") {
+      contentParts = [{ type: "text", text: currentUserMessage.content }];
+    } else {
+      contentParts = [];
+    }
+    contentParts = contentParts.filter(function(part) {
+      return !(part && part.type === "file" && part.file && part.file.filename === filename && part.file.file_data === fileData);
+    });
+    contentParts.push({
+      type: "file",
+      file: {
+        filename,
+        file_data: fileData,
+      },
+    });
+    currentUserMessage.content = contentParts;
+    return { applied: true, removedTextCount, fileBlockCount: 1 };
+  }
+
+  async function onMemoryTransportBodyInterceptor(body, type) {
+    const active = _activeFinalConfirmationRequestContext;
+    const envelope = active && active.memoryTransportEnvelope;
+    const requestType = String(type || "");
+    debugLog("memory transport body interceptor entered:", {
+      requestType,
+      bodyEncoding: typeof body === "string" ? "json_string" : typeof body,
+      hasActiveContext: !!active,
+      hasEnvelope: !!envelope,
+      selectedMode: String(envelope && envelope.plan && envelope.plan.selected_mode || ""),
+    });
+    if (requestType === "meta_gemini") {
+      if (active && envelope) {
+        active.memoryTransportObservation = active.memoryTransportObservation || {};
+        active.memoryTransportObservation.usageMetadata = body && body.usageMetadata || null;
+        active.memoryTransportObservation.modelStatus = body && body.modelStatus || null;
+      }
+      debugLog("memory transport Gemini metadata observed:", {
+        hasActiveContext: !!active,
+        hasEnvelope: !!envelope,
+        hasUsageMetadata: !!(body && body.usageMetadata),
+        hasModelStatus: !!(body && body.modelStatus),
+      });
+      return body;
+    }
+    if (!active || !envelope || !envelope.plan || !envelope.transient) {
+      debugLog("memory PDF transport skipped before body application:", {
+        requestType,
+        reason: !active
+          ? "active_context_unavailable"
+          : !envelope
+            ? "memory_transport_envelope_unavailable"
+            : !envelope.plan
+              ? "memory_transport_plan_unavailable"
+              : "memory_transport_payload_unavailable",
+      });
+      return body;
+    }
+    const plan = envelope.plan;
+    const transient = envelope.transient;
+    if (String(transient.plan_id || "") !== String(plan.plan_id || "")) {
+      debugLog("memory PDF transport skipped before body application:", {
+        requestType,
+        reason: "memory_transport_plan_id_mismatch",
+      });
+      return body;
+    }
+    const mode = String(plan.selected_mode || "text");
+    const googleBody = mode === "google_pdf" && (requestType === "gemini_base" || requestType === "gemini_base_stream");
+    const gatewayBody = mode === "llm_gateway_pdf" && (requestType === "openai_basic" || requestType === "openai_streaming");
+    if (!googleBody && !gatewayBody) {
+      debugLog("memory PDF transport skipped before body application:", {
+        requestType,
+        selectedMode: mode,
+        reason: "memory_transport_request_type_not_selected_route",
+      });
+      return body;
+    }
+    const decoded = cloneMemoryTransportProviderBody(body);
+    if (!decoded) {
+      debugLog("memory PDF transport skipped before body application:", {
+        requestType,
+        selectedMode: mode,
+        reason: "memory_transport_body_decode_failed",
+      });
+      return body;
+    }
+    const application = googleBody
+      ? applyGoogleMemoryPDFBody(decoded.value, plan, transient)
+      : applyLLMGatewayMemoryPDFBody(decoded.value, plan, transient);
+    active.memoryTransportObservation = {
+      planId: String(plan.plan_id || ""),
+      selectedMode: mode,
+      interceptorType: requestType,
+      applied: application.applied === true,
+      removedTextCount: Number(application.removedTextCount || 0),
+      fileBlockCount: Number(application.fileBlockCount || 0),
+      reason: String(application.reason || ""),
+      attemptCount: Number(active.beforeRequestAttemptCount || 1),
+      logicalMemoryChars: Number(plan.logical_memory_chars || 0),
+      pdfBytes: Number(plan.pdf_bytes || 0),
+      pageCount: Number(plan.page_count || 0),
+      estimatedTextTokens: Number(plan.estimated_text_tokens || 0),
+      estimatedPdfTokens: Number(plan.estimated_pdf_tokens || 0),
+      observedAt: new Date().toISOString(),
+    };
+    if (!application.applied) {
+      debugLog("memory PDF transport body application failed open:", {
+        selectedMode: mode,
+        requestType,
+        removedTextCount: Number(application.removedTextCount || 0),
+        reason: String(application.reason || "memory_transport_body_application_unavailable"),
+      });
+      return body;
+    }
+    debugLog("memory PDF transport applied:", mode, requestType, "text blocks removed:", application.removedTextCount);
+    return restoreMemoryTransportProviderBody(decoded);
+  }
+
+  async function registerMemoryTransportBodyInterceptor() {
+    if (!R || typeof R.registerBodyIntercepter !== "function") return;
+    try {
+      _memoryTransportBodyInterceptorRegistration = await R.registerBodyIntercepter(onMemoryTransportBodyInterceptor);
+      if (_memoryTransportBodyInterceptorRegistration) {
+        console.log(LOG_PREFIX, "memory transport body interceptor registered");
+      }
+    } catch (err) {
+      _memoryTransportBodyInterceptorRegistration = null;
+      warnLog("memory transport body interceptor registration failed:", err && err.message);
+    }
+  }
+
+  function installFinalConfirmationRequestContext(context) {
+    const next = context && typeof context === "object" ? context : null;
+    const active = _activeFinalConfirmationRequestContext;
+    const activeOwnsPendingResponse = finalConfirmationRequestContextOwnsPendingResponse(active);
+    if (activeOwnsPendingResponse) {
+      const sameLogicalRequestRetry = finalConfirmationRequestContextRetryIdentityMatches(active, next);
+      const activePayloadReady = !!(
+        sameLogicalRequestRetry
+        && String(active.requestId || "").trim()
+        && active.retryPayloadReady === true
+        && active.pendingContext
+        && active.pendingContext.status === "ready"
+        && finalConfirmationRequestContextHasReusablePayloadPlan(active)
+      );
+      if (activePayloadReady) {
+        active.beforeRequestAttemptCount = Math.max(1, Math.trunc(Number(active.beforeRequestAttemptCount || 1))) + 1;
+        active.lastBeforeRequestAt = new Date().toISOString();
+        active.retryState = "same_logical_request_retry_reused";
+        if (next) {
+          next.state = "superseded";
+          next.terminalReason = "same_logical_request_retry_reused";
+          next.reusedRequestId = String(active.requestId || "");
+        }
+        updateRuntimeState("lastStreamingAfterRequest", "watching", {
+          detail: "same logical Risu request retry observed; prepared Archive request reused",
+          reason_code: "same_logical_request_retry_reused",
+          sessionId: String(active.sessionId || ""),
+          requestId: String(active.requestId || ""),
+          requestType: String(active.requestType || "model"),
+          attemptCount: active.beforeRequestAttemptCount,
+          promptMemoryAvailability: "same_request",
+        });
+        return {
+          status: "retry_reused",
+          context: active,
+          attemptCount: active.beforeRequestAttemptCount,
+        };
+      }
+      active.state = "terminal";
+      active.terminalReason = sameLogicalRequestRetry
+        ? "same_logical_request_retry_context_not_ready"
+        : "overlapping_before_request_without_host_correlation";
+      if (next) {
+        next.state = "terminal";
+        next.terminalReason = active.terminalReason;
+      }
+      // RisuAI's replacer callback exposes no request ID. Only an exact Host
+      // turn identity may reuse a ready context; every ambiguous overlap
+      // detaches both owners so completion order fails closed for persistence.
+      _activeFinalConfirmationRequestContext = null;
+      updateRuntimeState("lastStreamingAfterRequest", "warn", {
+        detail: sameLogicalRequestRetry
+          ? "same logical Risu request retried before its Archive payload became reusable; persistence not started"
+          : "overlapping beforeRequest contexts rejected; persistence not started",
+        reason_code: active.terminalReason,
+        sessionId: String(next && next.sessionId || active.sessionId || ""),
+        requestType: String(next && next.requestType || active.requestType || "model"),
+      });
+      return { status: "rejected", context: null, reason: active.terminalReason };
+    }
+    _activeFinalConfirmationRequestContext = next;
+    if (!next) return { status: "unavailable", context: null };
+    next.beforeRequestAttemptCount = Math.max(1, Math.trunc(Number(next.beforeRequestAttemptCount || 1)));
+    next.lastBeforeRequestAt = next.lastBeforeRequestAt || new Date().toISOString();
+    return { status: "installed", context: next, attemptCount: next.beforeRequestAttemptCount };
   }
 
   // RisuAI is the only owner that can observe which stored assistant messages
@@ -18964,6 +20729,14 @@
         snapshot && snapshot.char && snapshot.char.chaId || ""
       ).trim();
       const requestedSessionId = "char_" + String(characterIndex) + "_cid_" + hostChatId;
+      const worldlineHostContext = {
+        characterIndex,
+        stableCharacterId,
+        childMessages: messages.slice(0, worldlineObservation.marker_index).map((message, index) => ({
+          message_index: index, role: String(message && message.role || ""),
+          message_chat_id: String(message && message.chatId || ""), disabled: !!(message && message.disabled),
+        })),
+      };
       Promise.resolve().then(function routeFrozenWorldlineObservation() {
         return requestBackendSessionRoutingTurnResolution(requestedSessionId, "identity", {
           stableCharacterId,
@@ -18971,6 +20744,7 @@
           hostChatId,
           hostChatIdState: "observed",
           worldlineObservation,
+          worldlineHostContext,
         });
       }).then(function recordWorldlineRoutingResult(routing) {
         debugLog("[worldline] output branch observation routed:", String(
@@ -19010,6 +20784,8 @@
     }
     const finalContent = normalizeAssistantPersistenceCandidate(String(assistantContent || ""));
     if (!finalContent) {
+      requestContext.state = "terminal";
+      requestContext.terminalReason = "after_request_final_unavailable";
       return { observed: false, reason: "after_request_final_unavailable" };
     }
     const finalHash = computeOrchestrationDirtyHashOr1c(finalContent);
@@ -19795,6 +21571,40 @@
     };
   }
 
+  async function observeRisuWorldlineMessageOrigins(plan, hostContext) {
+    if (!plan || !hostContext || !Number.isInteger(hostContext.characterIndex)) return null;
+    if (!R || typeof R.getCharacterFromIndex !== "function") return null;
+    try {
+      const character = await R.getCharacterFromIndex(hostContext.characterIndex);
+      if (!character || (hostContext.stableCharacterId && character.chaId !== hostContext.stableCharacterId)) return null;
+      const parent = (Array.isArray(character.chats) ? character.chats : [])
+        .find(chat => chat && String(chat.id || "") === plan.parent_host_chat_id);
+      if (!parent || !Array.isArray(parent.message)) return null;
+      const end = parent.message.findIndex(message => message && String(message.chatId || "") === plan.source_message_id);
+      if (end < 0) return null;
+      const childMessages = Number(plan.ancestor_depth || 0) === 0 ? hostContext.childMessages
+        : (character.chats.find(chat => chat && String(chat.id || "") === plan.child_host_chat_id)?.message || [])
+          .slice(0, plan.child_marker_index).map((message, index) => ({
+            message_index: index, role: String(message && message.role || ""),
+            message_chat_id: String(message && message.chatId || ""), disabled: !!(message && message.disabled),
+          }));
+      const parentObservation = buildRisuWorldlineObservationFromMessages(parent.message, Date.now(), "active_chat_pre_backfill");
+      return {
+        contract_version: "risu_message_origins.v1",
+        parent_host_chat_id: String(parent.id),
+        parent_messages: parent.message.slice(0, end + 1).map((message, index) => ({
+          message_index: index, role: String(message && message.role || ""),
+          message_chat_id: String(message && message.chatId || ""), disabled: !!(message && message.disabled),
+        })),
+        child_messages: childMessages,
+        ...(parentObservation && parentObservation.marker_state === "observed" ? {parent_observation: parentObservation} : {}),
+      };
+    } catch (err) {
+      debugLog("[worldline] named parent observation unavailable:", err && err.message);
+      return null;
+    }
+  }
+
   async function requestBackendSessionRoutingTurnResolution(sessionId, mode, observation, requestOptions = {}) {
     const observed = observation && typeof observation === "object" && !Array.isArray(observation)
       ? observation
@@ -19808,13 +21618,14 @@
     const visibleCompletedTurns = observed.visibleCompletedTurns != null
       ? observed.visibleCompletedTurns
       : (cachedIdentity && cachedIdentity.completedTurnCount != null ? cachedIdentity.completedTurnCount : null);
+    const stableCharacterId = String(observed.stableCharacterId || (cachedIdentity && cachedIdentity.stableCharacterId) || "");
     const result = await bridgeFetch("/session-routing/turn-resolution", {
       method: "POST",
       timeoutMs: getRequestTimeoutSettingMs(),
       body: {
         chat_session_id: String(sessionId || ""),
         mode: String(mode || "pair"),
-        stable_character_id: String(observed.stableCharacterId || (cachedIdentity && cachedIdentity.stableCharacterId) || ""),
+        stable_character_id: stableCharacterId,
         stable_character_id_state: String(
           observed.stableCharacterIdState
           || ((cachedIdentity && cachedIdentity.stableCharacterId) ? "observed" : "unobserved")
@@ -19877,6 +21688,32 @@
         baseline: null,
         backendDecision: result || null,
       };
+    }
+    // Go requests named parent metadata while an origin map is absent. Older
+    // ancestor branches use the same route owner, within its 32-level scope.
+    if (Number(requestOptions.originReadCount || 0) < 32 && result.worldline && result.worldline.origin_read_request) {
+      const origins = await observeRisuWorldlineMessageOrigins(result.worldline.origin_read_request, {
+        ...observed.worldlineHostContext,
+        stableCharacterId,
+      });
+      if (origins) {
+        try {
+          const worldline = JSON.parse(JSON.stringify(observed.worldlineObservation));
+          let target = worldline;
+          for (let depth = 0; depth < Number(result.worldline.origin_read_request.ancestor_depth || 0); depth++) {
+            target = target.message_origins.parent_observation;
+          }
+          target.message_origins = origins;
+          const enriched = await requestBackendSessionRoutingTurnResolution(sessionId, mode, {
+            ...observed,
+            stableCharacterId,
+            worldlineObservation: worldline,
+          }, {...requestOptions, originReadCount: Number(requestOptions.originReadCount || 0) + 1});
+          if (enriched.backendDecision && enriched.backendDecision.status === "ok") return enriched;
+        } catch (err) {
+          debugLog("[worldline] origin metadata delivery unavailable:", err && err.message);
+        }
+      }
     }
     return {
       status: String(result.resolution || "normal"),
@@ -22318,9 +24155,18 @@
         && effectiveUserInput
         && observedFinalUserInput === effectiveUserInput
       );
+      const effectiveUserInputMatch = !!effectiveUserInput && observedFinalUserInput === effectiveUserInput;
       return {
 		status: payloadContentMatch ? "ready" : "mismatch",
         source: "js_host_adapter",
+		reasonCode: !payloadApplicationMatch
+          ? (applicationObservation && applicationObservation.status === "ready"
+            ? "payload_plan_observation_mismatch"
+            : String(applicationObservation && applicationObservation.reason_code || "payload_application_not_verified"))
+          : (!effectiveUserInputMatch ? "effective_user_text_not_observed" : "pre_request_components_observed"),
+		payloadApplicationMatch,
+		effectiveUserInputMatch,
+		finalProviderPayloadState: "not_exposed",
 		captureStage: "before_request_return",
 		capturedBeforeRequestReturn: true,
 		effectiveInputHash: computeOrchestrationDirtyHashOr1c(effectiveInput),
@@ -22454,11 +24300,14 @@
       }
 
       const parts = [];
-	  if (payloadVerificationMismatch) {
-		parts.push('<div class="mo-note">The pre-request payload verification did not match. The complete backend input is shown below for inspection, but it will not be stored as verified effective input.</div>');
-	  }
+      const payloadVerified = !!(fp && fp.capturedBeforeRequestReturn === true && !payloadVerificationMismatch);
+      parts.push('<div class="mo-note">' + escapeAttr(t('dash.preview.verification.' + (payloadVerified ? 'ready' : payloadVerificationMismatch ? 'mismatch' : 'unobserved'))) + '</div>');
+      if (payloadVerificationMismatch) {
+        const reason = fp.payloadContentMatch === true ? "effective_input_preview_hash_mismatch" : fp.reasonCode || "payload_application_not_verified";
+        parts.push(renderItBlock(t('dash.preview.verification.detail'), reason, false));
+      }
       if (actualUserText) {
-        parts.push(renderItBlock("Actual User Input", actualUserText, false));
+        parts.push(renderItBlock(t(payloadVerified ? 'dash.preview.verification.userObserved' : 'dash.preview.verification.userPlanned'), actualUserText, false));
       }
       if (languageContextText) {
         parts.push(renderItBlock("Language Context (trace only)", languageContextText, false));
@@ -22502,7 +24351,8 @@
               .map(function(entry) { return String(entry[0]) + "=" + String(entry[1]); }).join(", ")
             : "";
           ledgerLines.push(
-            label + " " + String(lane.final_delivery_chars ?? 0) + " / " + String(lane.configured_cap_chars ?? 0) + " chars"
+            label + " " + String(lane.final_delivery_chars ?? 0)
+              + (lane.budget_mode === "additional_observed" ? " chars · " + t('dash.preview.payloadBudget.additional') : " / " + String(lane.configured_cap_chars ?? 0) + " chars")
               + " · " + t('dash.preview.payloadBudget.candidate') + " " + String(lane.candidate_chars ?? 0)
               + " → " + t('dash.preview.payloadBudget.selected') + " " + String(lane.selected_chars ?? 0)
               + " → " + t('dash.preview.payloadBudget.final') + " " + String(lane.final_delivery_chars ?? 0)
@@ -22530,7 +24380,7 @@
       }
       appliedPlanLanes.forEach(function(lane) {
 		if (memoryDeliveryPlan && Array.isArray(memoryDeliveryPlan.classes) && String(lane.key || "") === "long_term_memory") return;
-        const title = String(lane.title || lane.key || "Auxiliary Context");
+        const title = lane.key === "preprocessing_notes" ? t('dash.preview.payloadBudget.lane.preprocessing_notes') : String(lane.title || lane.key || "Auxiliary Context");
         parts.push(renderItBlock(title, String(lane.text || ""), false));
       });
       return parts.join("");
@@ -24878,7 +26728,10 @@
     applyProviderRequestOverrideFields(proxyBody, "main");
 
     // bridgeFetch는 성공 시 파싱된 data 객체, 실패 시 null 반환
-    const data = await bridgeFetch("/proxy/plugin-main", {
+    const proxyPath = provider === "opencode-go"
+      ? "/proxy/plugin-main?chat_session_id=" + encodeURIComponent(opts.chatSessionId || await getCurrentChatSessionId())
+      : "/proxy/plugin-main";
+    const data = await bridgeFetch(proxyPath, {
       method:  "POST",
       body:    proxyBody,
       timeoutMs,
@@ -25313,7 +27166,10 @@
     applyReasoningFieldsToPayload(payload, reasoningControls, reasoningPreset, reasoningEffort, reasoningBudgetTokens);
     applyProviderRequestOverrideFields(payload, "sub");
 
-    const data = await bridgeFetch("/proxy/plugin-main", {
+    const proxyPath = provider === "opencode-go"
+      ? "/proxy/plugin-main?chat_session_id=" + encodeURIComponent(opts.chatSessionId || await getCurrentChatSessionId())
+      : "/proxy/plugin-main";
+    const data = await bridgeFetch(proxyPath, {
       method: "POST",
       body: payload,
       timeoutMs,
@@ -28111,6 +29967,12 @@
         payload_observation_stage: payloadObservation.observation_stage || "unobserved",
         final_provider_payload_state: payloadObservation.final_provider_payload_state || "not_exposed",
         payload_guidance_hash: payloadObservation.payload_guidance_hash || null,
+        memory_injection_baseline_id: payloadObservation.memory_injection_baseline_id
+          || lineage.memory_injection_baseline_id
+          || null,
+        surface_payload_application: Array.isArray(payloadObservation.surface_payload_application)
+          ? payloadObservation.surface_payload_application.slice(0, 32)
+          : [],
         hash_algorithm: "sha256_utf8.v1",
         final_observed_content_hash: sourceAcceptanceObservation && sourceAcceptanceObservation.observed_content_hash || null,
         final_hash_algorithm: sourceAcceptanceObservation && sourceAcceptanceObservation.hash_algorithm || null,
@@ -28241,6 +30103,14 @@
       if (sourceToFinalLineageObservation) {
         body.client_meta.source_to_final_lineage_observation = sourceToFinalLineageObservation;
       }
+      const memoryTransportObservation = sourceObservationOptions
+        && sourceObservationOptions.memoryTransportObservation
+        && typeof sourceObservationOptions.memoryTransportObservation === "object"
+        ? sourceObservationOptions.memoryTransportObservation
+        : null;
+      if (memoryTransportObservation) {
+        body.client_meta.memory_transport_observation = JSON.parse(JSON.stringify(memoryTransportObservation));
+      }
       return body;
     } catch (err) {
       debugLog("[M-4c] buildCompleteTurnRequestBody error:", err.message);
@@ -28258,7 +30128,7 @@
         : [];
       const meta = body.client_meta && typeof body.client_meta === "object" ? body.client_meta : {};
       const safeClientMeta = {};
-      ["episode_interval_turns", "long_session_refresh_enabled", "chapter_auto_enabled", "arc_auto_enabled", "saga_auto_enabled", "chapter_interval_episodes", "arc_interval_chapters", "saga_interval_arcs", "request_id", "idempotency_key", "reconciliation_retry_pending"].forEach(function(key) {
+      ["episode_interval_turns", "long_session_refresh_enabled", "chapter_auto_enabled", "arc_auto_enabled", "saga_auto_enabled", "chapter_interval_episodes", "arc_interval_chapters", "saga_interval_arcs", "request_id", "idempotency_key", "reconciliation_retry_pending", "turn_finalization_mode"].forEach(function(key) {
         if (Object.prototype.hasOwnProperty.call(meta, key)) safeClientMeta[key] = meta[key];
       });
       if (typeof meta.source_revision === "string" || typeof meta.source_revision === "number") {
@@ -28305,11 +30175,18 @@
           payload_observation_stage: lineage.payload_observation_stage || "unobserved",
           final_provider_payload_state: lineage.final_provider_payload_state || "not_exposed",
           payload_guidance_hash: lineage.payload_guidance_hash || null,
+          memory_injection_baseline_id: lineage.memory_injection_baseline_id || null,
+          surface_payload_application: Array.isArray(lineage.surface_payload_application)
+            ? lineage.surface_payload_application.slice(0, 32)
+            : [],
           hash_algorithm: lineage.hash_algorithm || "sha256_utf8.v1",
           final_observed_content_hash: lineage.final_observed_content_hash || null,
           final_hash_algorithm: lineage.final_hash_algorithm || null,
           semantic_outcome: "unobserved",
         };
+      }
+      if (meta.memory_transport_observation && typeof meta.memory_transport_observation === "object") {
+        safeClientMeta.memory_transport_observation = JSON.parse(JSON.stringify(meta.memory_transport_observation));
       }
       if (meta.risu_persona_observation && typeof meta.risu_persona_observation === "object") {
         safeClientMeta.risu_persona_observation = Object.assign({}, meta.risu_persona_observation);
@@ -28557,22 +30434,37 @@
   async function tryCompleteTurn(turnIdx, userInput, assistantContent, contextMessages, chatSessionId, improvementTrace, prebuiltBody) {
     if (!settings.enabled || !settings.dbEnabled) return null;
     let workflowRequestId = "";
+    let previousTurnHUD = false;
     try {
       const body = prebuiltBody || await buildCompleteTurnRequestBody(
         turnIdx, userInput, assistantContent, contextMessages, chatSessionId, improvementTrace
       );
       if (!body) return null;
       workflowRequestId = turnWorkflowHUDRequestIdFromCompleteBody(body);
-      if (workflowRequestId) startTurnWorkflowHUDWatch(workflowRequestId);
+      previousTurnHUD = String(body && body.client_meta && body.client_meta.turn_finalization_mode || "")
+        === "next_user_input";
+      if (workflowRequestId) {
+        if (previousTurnHUD) startTurnWorkflowHUDPreviousWatch(workflowRequestId);
+        else startTurnWorkflowHUDWatch(workflowRequestId);
+      }
       const result = await safeCall(
         () => bridgeFetchWithRetry("/complete-turn", { method: "POST", body, timeoutMs: 0 }, 1),
         null, "tryCompleteTurn"
       );
       if (workflowRequestId) {
         if (result && result.turn_workflow_hud) {
-          consumeTurnWorkflowHUD(result.turn_workflow_hud);
+          if (previousTurnHUD) consumeTurnWorkflowHUDPrevious(result.turn_workflow_hud);
+          else consumeTurnWorkflowHUD(result.turn_workflow_hud);
         } else if (!result) {
-          renderTurnWorkflowHUDTransportError(workflowRequestId, "/complete-turn", "complete_turn_transport_unavailable");
+          if (previousTurnHUD) {
+            renderTurnWorkflowHUDPreviousTransportError(
+              workflowRequestId,
+              "/complete-turn",
+              "complete_turn_transport_unavailable",
+            );
+          } else {
+            renderTurnWorkflowHUDTransportError(workflowRequestId, "/complete-turn", "complete_turn_transport_unavailable");
+          }
         }
       }
       const sourceAcceptance = result && result.source_acceptance;
@@ -28596,7 +30488,15 @@
     } catch (err) {
       debugLog("[M-4c] tryCompleteTurn error:", err.message);
       if (workflowRequestId) {
-        renderTurnWorkflowHUDTransportError(workflowRequestId, "/complete-turn", "complete_turn_transport_unavailable");
+        if (previousTurnHUD) {
+          renderTurnWorkflowHUDPreviousTransportError(
+            workflowRequestId,
+            "/complete-turn",
+            "complete_turn_transport_unavailable",
+          );
+        } else {
+          renderTurnWorkflowHUDTransportError(workflowRequestId, "/complete-turn", "complete_turn_transport_unavailable");
+        }
       }
       return null;
     }
@@ -28907,6 +30807,7 @@
           _injectionPack: preparedBundle.injectionPack || { payload_application_plan: compactPlan },
           _sourceToPayloadLineage: preparedBundle.sourceToPayloadLineage || null,
           _referenceInjection: preparedBundle.referenceInjection || null,
+          turnFinalizationPolicy: preparedBundle.turnFinalizationPolicy || null,
           _effectiveUserInput: userInput,
           _effectiveUserInputChanged: false,
           timestamp: Date.now(),
@@ -29873,7 +31774,7 @@
         trace.applyMode && trace.applyMode.payloadReplaced
       );
 
-      return { searchResult, wakeUpContext, supervisorResult, kgRecallResult, activeStatesResult, episodeRecallResult, storylineResult, characterResult, worldRulesResult, pendingThreadsResult, locationContextResult, continuityPackResult: continuityPackRequested ? continuityPackResult : null, continuityInfo, _trace: trace, _chatSessionId: chatSessionId, _improvementTrace, _injectionPack: (preparedBundle && preparedBundle.injectionPack) || null, _sourceToPayloadLineage: (preparedBundle && preparedBundle.sourceToPayloadLineage) || null, _referenceInjection: (preparedBundle && preparedBundle.referenceInjection) || null, _effectiveUserInput: userInput, _effectiveUserInputChanged: _effectiveUserInputChanged, timestamp: Date.now() };
+      return { searchResult, wakeUpContext, supervisorResult, kgRecallResult, activeStatesResult, episodeRecallResult, storylineResult, characterResult, worldRulesResult, pendingThreadsResult, locationContextResult, continuityPackResult: continuityPackRequested ? continuityPackResult : null, continuityInfo, _trace: trace, _chatSessionId: chatSessionId, _improvementTrace, _injectionPack: (preparedBundle && preparedBundle.injectionPack) || null, _sourceToPayloadLineage: (preparedBundle && preparedBundle.sourceToPayloadLineage) || null, _referenceInjection: (preparedBundle && preparedBundle.referenceInjection) || null, turnFinalizationPolicy: (preparedBundle && preparedBundle.turnFinalizationPolicy) || null, _effectiveUserInput: userInput, _effectiveUserInputChanged: _effectiveUserInputChanged, timestamp: Date.now() };
     } catch (err) {
       warnLog("orchestrateTurnHelpers failed:", err.message);
       updateRuntimeState("lastError", "error", { detail: err.message });
@@ -30910,9 +32811,61 @@
       const { messages, rebuild } = extractMessages(payload);
       if (!messages || messages.length === 0) return { payload, injected: false };
 
+      const auxiliaryPrefix = "[Archive Center — Auxiliary Context]";
+      const auxiliaryContent = auxiliaryPrefix + "\n\n" + auxiliaryText;
+      const exactIndexes = [];
+      const conflictingIndexes = [];
+      messages.forEach(function(message, index) {
+        const parsed = getPayloadMessageRoleAndText(message);
+        if (parsed.role !== "system" || !String(parsed.text || "").startsWith(auxiliaryPrefix)) return;
+        if (String(parsed.text || "") === auxiliaryContent) exactIndexes.push(index);
+        else conflictingIndexes.push(index);
+      });
+      if (conflictingIndexes.length > 0) {
+        return {
+          payload,
+          injected: false,
+          ambiguous: true,
+          reason: "archive_auxiliary_context_conflict",
+          exactCount: exactIndexes.length,
+          conflictingCount: conflictingIndexes.length,
+        };
+      }
+      if (exactIndexes.length === 1) {
+        return {
+          payload,
+          injected: true,
+          reused: true,
+          duplicateCollapsedCount: 0,
+          placement: {
+            insertIndex: exactIndexes[0],
+            resolvedMode: "existing_exact_block",
+            fallbackUsed: false,
+          },
+        };
+      }
+      if (exactIndexes.length > 1) {
+        const keepIndex = exactIndexes[0];
+        const exactSet = new Set(exactIndexes.slice(1));
+        const deduplicatedMessages = messages.filter(function(_message, index) {
+          return !exactSet.has(index);
+        });
+        return {
+          payload: rebuild(deduplicatedMessages),
+          injected: true,
+          reused: true,
+          duplicateCollapsedCount: exactIndexes.length - 1,
+          placement: {
+            insertIndex: keepIndex,
+            resolvedMode: "existing_exact_block_deduplicated",
+            fallbackUsed: false,
+          },
+        };
+      }
+
       const auxMessage = {
         role: "system",
-        content: "[Archive Center — Auxiliary Context]" + "\n\n" + auxiliaryText,
+        content: auxiliaryContent,
       };
 
       // system 메시지 바로 뒤에 삽입 (첫 번째 system 이후)
@@ -31070,6 +33023,17 @@
       const messages = Array.isArray(extracted.messages) ? extracted.messages : [];
       const expected = [];
       const auxiliaryText = String(plan && plan.auxiliary_text || "");
+      const auxiliaryPrefix = "[Archive Center — Auxiliary Context]";
+      let archiveAuxiliaryBlockCount = 0;
+      let archiveAuxiliaryConflictCount = 0;
+      messages.forEach(function(message) {
+        const parsed = getPayloadMessageRoleAndText(message);
+        if (parsed.role !== "system" || !String(parsed.text || "").startsWith(auxiliaryPrefix)) return;
+        archiveAuxiliaryBlockCount++;
+        if (auxiliaryText && String(parsed.text || "") !== auxiliaryPrefix + "\n\n" + auxiliaryText) {
+          archiveAuxiliaryConflictCount++;
+        }
+      });
       if (auxiliaryText) {
         expected.push({
           key: "auxiliary_context",
@@ -31104,7 +33068,13 @@
       });
       let payloadStatus = "empty";
       let reasonCode = "no_planned_injection_blocks";
-      if (blocks.some(function(block) { return block.match_count === 1 && block.hash_match !== true; })) {
+      if (auxiliaryText && archiveAuxiliaryConflictCount > 0) {
+        payloadStatus = "ambiguous";
+        reasonCode = "archive_auxiliary_context_conflict";
+      } else if (auxiliaryText && archiveAuxiliaryBlockCount > 1) {
+        payloadStatus = "ambiguous";
+        reasonCode = "archive_auxiliary_context_duplicate";
+      } else if (blocks.some(function(block) { return block.match_count === 1 && block.hash_match !== true; })) {
         payloadStatus = "ambiguous";
         reasonCode = "injected_block_hash_mismatch";
       } else if (blocks.some(function(block) { return block.status === "ambiguous"; })) {
@@ -31136,7 +33106,25 @@
           ? plan.guidance_application_trace.final_hash || null
           : null,
         blocks,
+        memory_injection_baseline_id: lineage.memory_injection_baseline_id
+          || (lineage.memory_injection_baseline && lineage.memory_injection_baseline.baseline_id)
+          || null,
+        surface_payload_application: lineage.memory_injection_baseline
+          && Array.isArray(lineage.memory_injection_baseline.surfaces)
+          ? lineage.memory_injection_baseline.surfaces.map(function(surface) {
+              const renderedCount = Number(surface && surface.rendered_count || 0);
+              return {
+                surface: String(surface && surface.surface || ""),
+                status: renderedCount <= 0 ? "empty" : payloadStatus,
+                rendered_count: renderedCount,
+                payload_character_count: Number(surface && surface.payload_character_count || 0),
+                displayed_effect: "unobserved",
+              };
+            })
+          : [],
         semantic_outcome: "unobserved",
+        archive_auxiliary_block_count: archiveAuxiliaryBlockCount,
+        archive_auxiliary_conflict_count: archiveAuxiliaryConflictCount,
       };
       return observation;
     } catch (err) {
@@ -31151,6 +33139,136 @@
     }
   }
 
+  function providerManagerMemoryPDFMarkerContent(transportPlan) {
+    const selectedMemoryText = String(transportPlan && transportPlan.long_term_memory_text || "");
+    if (!selectedMemoryText) return "";
+    return "<pm-pdf>\n" + selectedMemoryText + "\n</pm-pdf>";
+  }
+
+  function normalizeProviderManagerMemoryPDFPayload(payload, transportPlan) {
+    try {
+      if (String(transportPlan && transportPlan.selected_mode || "") !== "provider_manager_pdf") {
+        return { payload, normalized: false };
+      }
+      const markerContent = providerManagerMemoryPDFMarkerContent(transportPlan);
+      const auxiliaryText = String(transportPlan && transportPlan.auxiliary_text || "");
+      if (!markerContent || !auxiliaryText) return { payload, normalized: false };
+
+      const extracted = extractMessages(payload);
+      const messages = Array.isArray(extracted.messages) ? extracted.messages : [];
+      if (!extracted.hasMessageSlot || messages.length === 0) return { payload, normalized: false };
+
+      const auxiliaryPrefix = "[Archive Center — Auxiliary Context]";
+      const fullAuxiliaryContent = auxiliaryPrefix + "\n\n" + auxiliaryText;
+      const remainingAuxiliaryText = String(transportPlan.auxiliary_without_long_term_memory || "");
+      const remainingAuxiliaryContent = remainingAuxiliaryText
+        ? auxiliaryPrefix + "\n\n" + remainingAuxiliaryText
+        : "";
+      const markerIndexes = [];
+      const remainingIndexes = [];
+      messages.forEach(function(message, index) {
+        const parsed = getPayloadMessageRoleAndText(message);
+        if (parsed.role !== "system") return;
+        if (parsed.text === markerContent) markerIndexes.push(index);
+        if (remainingAuxiliaryContent && parsed.text === remainingAuxiliaryContent) remainingIndexes.push(index);
+      });
+      if (markerIndexes.length === 0) return { payload, normalized: false };
+
+      if (!remainingAuxiliaryContent) {
+        let restored = false;
+        const restoredMessages = messages.flatMap(function(message, index) {
+          if (markerIndexes.indexOf(index) < 0) return [message];
+          if (restored) return [];
+          restored = true;
+          return [{ ...message, role: "system", content: fullAuxiliaryContent }];
+        });
+        return {
+          payload: extracted.rebuild(restoredMessages),
+          normalized: true,
+          removedMarkerBlocks: markerIndexes.length,
+        };
+      }
+      if (remainingIndexes.length === 0) return { payload, normalized: false };
+
+      const keepRemainingIndex = remainingIndexes[0];
+      const restoredMessages = messages.flatMap(function(message, index) {
+        if (markerIndexes.indexOf(index) >= 0) return [];
+        if (remainingIndexes.indexOf(index) >= 0) {
+          if (index !== keepRemainingIndex) return [];
+          return [{ ...message, role: "system", content: fullAuxiliaryContent }];
+        }
+        return [message];
+      });
+      return {
+        payload: extracted.rebuild(restoredMessages),
+        normalized: true,
+        removedMarkerBlocks: markerIndexes.length,
+      };
+    } catch (err) {
+      debugLog("memory Provider Manager PDF marker normalization failed open:", err && err.message);
+      return { payload, normalized: false };
+    }
+  }
+
+  function applyProviderManagerMemoryPDFPayload(payload, transportPlan) {
+    try {
+      if (String(transportPlan && transportPlan.selected_mode || "") !== "provider_manager_pdf") {
+        return { payload, applied: false, reason: "provider_manager_mode_not_selected" };
+      }
+      const markerContent = providerManagerMemoryPDFMarkerContent(transportPlan);
+      const auxiliaryText = String(transportPlan && transportPlan.auxiliary_text || "");
+      if (!markerContent || !auxiliaryText) {
+        return { payload, applied: false, reason: "provider_manager_memory_text_empty" };
+      }
+
+      const extracted = extractMessages(payload);
+      const messages = Array.isArray(extracted.messages) ? extracted.messages : [];
+      if (!extracted.hasMessageSlot || messages.length === 0) {
+        return { payload, applied: false, reason: "provider_manager_payload_messages_unavailable" };
+      }
+
+      const auxiliaryPrefix = "[Archive Center — Auxiliary Context]";
+      const fullAuxiliaryContent = auxiliaryPrefix + "\n\n" + auxiliaryText;
+      const remainingAuxiliaryText = String(transportPlan.auxiliary_without_long_term_memory || "");
+      const remainingAuxiliaryContent = remainingAuxiliaryText
+        ? auxiliaryPrefix + "\n\n" + remainingAuxiliaryText
+        : "";
+      const withoutOldMarker = messages.filter(function(message) {
+        const parsed = getPayloadMessageRoleAndText(message);
+        return !(parsed.role === "system" && parsed.text === markerContent);
+      });
+      const auxiliaryIndex = withoutOldMarker.findIndex(function(message) {
+        const parsed = getPayloadMessageRoleAndText(message);
+        return parsed.role === "system" && parsed.text === fullAuxiliaryContent;
+      });
+      if (auxiliaryIndex < 0) {
+        return { payload, applied: false, reason: "provider_manager_text_baseline_unavailable" };
+      }
+
+      const outgoingMessages = withoutOldMarker.slice();
+      const markerMessage = { role: "system", content: markerContent };
+      if (remainingAuxiliaryContent) {
+        outgoingMessages[auxiliaryIndex] = {
+          ...outgoingMessages[auxiliaryIndex],
+          role: "system",
+          content: remainingAuxiliaryContent,
+        };
+        outgoingMessages.splice(auxiliaryIndex + 1, 0, markerMessage);
+      } else {
+        outgoingMessages[auxiliaryIndex] = markerMessage;
+      }
+      return {
+        payload: extracted.rebuild(outgoingMessages),
+        applied: true,
+        markerBlockCount: 1,
+        logicalMemoryChars: Number(transportPlan.logical_memory_chars || 0),
+      };
+    } catch (err) {
+      debugLog("memory Provider Manager PDF marker application failed open:", err && err.message);
+      return { payload, applied: false, reason: "provider_manager_marker_application_failed" };
+    }
+  }
+
   function applyGoPayloadApplicationPlan(payload, orchResult, emptyResult) {
     try {
       const injectionPack = orchResult && orchResult._injectionPack && typeof orchResult._injectionPack === "object"
@@ -31158,6 +33276,9 @@
         : null;
       const plan = injectionPack && injectionPack.payload_application_plan && typeof injectionPack.payload_application_plan === "object"
         ? injectionPack.payload_application_plan
+        : null;
+      const memoryTransportPlan = injectionPack && injectionPack.memory_transport_plan && typeof injectionPack.memory_transport_plan === "object"
+        ? injectionPack.memory_transport_plan
         : null;
       const planReady = !!(plan
         && plan.contract_version === "payload_application_plan.v1"
@@ -31174,7 +33295,8 @@
       }
 
       const auxiliaryText = String(plan.auxiliary_text || "");
-      let finalPayload = payload;
+      const normalizedTransportPayload = normalizeProviderManagerMemoryPDFPayload(payload, memoryTransportPlan);
+      let finalPayload = normalizedTransportPayload.payload;
       let injected = false;
       let placement = null;
       if (auxiliaryText) {
@@ -31190,7 +33312,8 @@
       );
       const observedBlocks = Array.isArray(payloadApplicationObservation.blocks) ? payloadApplicationObservation.blocks : [];
       injected = auxiliaryText
-        ? observedBlocks.some(function(block) { return block && block.key === "auxiliary_context" && block.status === "applied"; })
+        ? payloadApplicationObservation.payload_application_status === "applied"
+          && observedBlocks.some(function(block) { return block && block.key === "auxiliary_context" && block.status === "applied"; })
         : false;
       if (orchResult && typeof orchResult === "object") {
         orchResult._payloadApplicationObservation = payloadApplicationObservation;
@@ -31206,6 +33329,36 @@
             blocks: observedBlocks,
           };
         }
+      }
+
+      const memoryTransportApplication = applyProviderManagerMemoryPDFPayload(finalPayload, memoryTransportPlan);
+      if (memoryTransportApplication.applied) finalPayload = memoryTransportApplication.payload;
+      const memoryTransportObservation = memoryTransportPlan
+        && String(memoryTransportPlan.selected_mode || "") === "provider_manager_pdf"
+        ? {
+            planId: String(memoryTransportPlan.plan_id || ""),
+            selectedMode: "provider_manager_pdf",
+            bodyFormat: String(memoryTransportPlan.body_format || ""),
+            applied: memoryTransportApplication.applied === true,
+            markerBlockCount: Number(memoryTransportApplication.markerBlockCount || 0),
+            logicalMemoryChars: Number(memoryTransportPlan.logical_memory_chars || 0),
+            reason: String(memoryTransportApplication.reason || ""),
+            providerPDFCreation: "provider_manager_runtime_pending",
+            observedAt: new Date().toISOString(),
+          }
+        : null;
+      if (orchResult && typeof orchResult === "object") {
+        orchResult._memoryTransportObservation = memoryTransportObservation;
+      }
+      if (memoryTransportObservation) {
+        debugLog("memory Provider Manager PDF marker transport applied:", {
+          planId: memoryTransportObservation.planId,
+          markerApplied: memoryTransportObservation.applied,
+          markerBlockCount: memoryTransportObservation.markerBlockCount,
+          logicalMemoryChars: memoryTransportObservation.logicalMemoryChars,
+          providerPDFCreation: memoryTransportObservation.providerPDFCreation,
+          reason: memoryTransportObservation.reason,
+        });
       }
 
       const lanes = Array.isArray(plan.lanes) ? plan.lanes : [];
@@ -31274,6 +33427,7 @@
         payloadApplicationPlan: plan,
         guidanceApplicationTrace: guidanceTrace,
         payloadApplicationObservation,
+        memoryTransport: memoryTransportObservation,
         budgetPolicy: {
           owner: "go",
           contractVersion: plan.contract_version,
@@ -32062,12 +34216,14 @@
 
   async function onBeforeRequest(payload, type) {
     let orchSessionId = null;
+    let orchRequestId = "";
     let orchHostContext = null;
     let finalConfirmationRequestContext = null;
     let requestPendingContext = null;
     let lastOrchResult = null;
     let orchestrationDirtySignals = null;
     let orchestrationCacheDescriptor = null;
+    let nextInputFinalizationOwnership = { owned: false, started: false };
     try {
       recordRisuHookLifecycle("beforeRequest", "callback_observed");
       debugLog("beforeRequest hook fired, type:", type);
@@ -32118,22 +34274,65 @@
       if (!orchHostContext) {
         orchHostContext = captureSessionHostContextFromCache(orchSessionId);
       }
-      let mainRequestActiveMessages = [];
-      try {
-        mainRequestActiveMessages = await getCurrentActiveChatSourceObservationMessages(orchSessionId, orchHostContext);
-      } catch {
-        mainRequestActiveMessages = [];
-      }
-      const orchRequestId = makeOrchRequestId(orchSessionId);
-      primeTurnWorkflowHUD(orchRequestId);
-     await captureAssistantPrefillSeedForSession(orchSessionId, messages, orchHostContext);
+      const pendingResponseContext = finalConfirmationRequestContextOwnsPendingResponse(
+        _activeFinalConfirmationRequestContext
+      ) ? _activeFinalConfirmationRequestContext : null;
+      orchRequestId = pendingResponseContext && String(pendingResponseContext.requestId || "").trim()
+        ? String(pendingResponseContext.requestId).trim()
+        : makeOrchRequestId(orchSessionId);
       finalConfirmationRequestContext = await captureFinalConfirmationRequestContext(
         orchSessionId,
         type,
         orchRequestId,
         orchHostContext
       );
-      _activeFinalConfirmationRequestContext = finalConfirmationRequestContext;
+      const requestContextInstall = installFinalConfirmationRequestContext(finalConfirmationRequestContext);
+      if (requestContextInstall && requestContextInstall.status === "retry_reused") {
+        const reusedContext = requestContextInstall.context;
+        renderTurnWorkflowHUDSameRequestRetry(
+          String(reusedContext && reusedContext.requestId || orchRequestId),
+          requestContextInstall.attemptCount
+        );
+        const replay = reapplyFinalConfirmationRetryPayload(payload, reusedContext);
+        if (replay && replay.reused === true) return replay.payload;
+        updateRuntimeState("lastStreamingAfterRequest", "warn", {
+          detail: "same logical request retry payload replay became unavailable; persistence not started",
+          reason_code: "same_logical_request_retry_payload_replay_unavailable",
+          sessionId: orchSessionId,
+          requestId: orchRequestId,
+          requestType: String(type || "model"),
+        });
+        return payload;
+      }
+      if (requestContextInstall && requestContextInstall.status === "rejected") return payload;
+
+      primeTurnWorkflowHUD(orchRequestId);
+      await captureAssistantPrefillSeedForSession(orchSessionId, messages, orchHostContext);
+      let mainRequestActiveMessages = [];
+      let mainRequestActiveChat = null;
+      try {
+        const activeSourceObservation = await getCurrentActiveChatSourceObservationMessages(orchSessionId, orchHostContext, true);
+        mainRequestActiveMessages = activeSourceObservation.messages;
+        mainRequestActiveChat = activeSourceObservation.chat;
+      } catch {
+        mainRequestActiveMessages = [];
+        mainRequestActiveChat = null;
+      }
+      nextInputFinalizationOwnership = beginNextInputFinalizationPipeline(
+        orchSessionId,
+        finalConfirmationRequestContext,
+        orchHostContext,
+      );
+      const yumiArchiveReadContext = await buildYumiV1ArchiveReadContext(
+        messages,
+        mainRequestActiveMessages,
+        mainRequestActiveChat,
+      );
+      const archiveReadMessages = yumiArchiveReadContext.payloadMessages;
+      const archiveReadActiveMessages = yumiArchiveReadContext.activeMessages;
+      if (settings.debug && yumiArchiveReadContext.stats.markerBlocks > 0) {
+        debugLog("Yumi Translator original-source read context:", JSON.stringify(yumiArchiveReadContext.stats));
+      }
       const rawInputObservation = bindRawInputObservationToRequest(orchSessionId, orchRequestId);
       if (finalConfirmationRequestContext) {
         finalConfirmationRequestContext.rawInputObservation = rawInputObservation || null;
@@ -32210,7 +34409,7 @@
         observedChatId,
         activeTailIsUser,
       );
-      const sourceDecisionResult = await tryPrepareTurn(orchSessionId, "", messages, null, type, null, {
+      const sourceDecisionResult = await tryPrepareTurn(orchSessionId, "", archiveReadMessages, null, type, null, {
         hostContext: orchHostContext,
         sourceDecisionOnly: true,
         sourceObservation: prepareSourceObservations.sourceObservation,
@@ -32235,20 +34434,22 @@
         });
         return payload;
       }
-      Promise.resolve().then(function resolveBackfillIdentityAfterRollbackReconciliation() {
-        return preflightActiveChatBackfillIdentity(
-          orchSessionId,
-          { hostContext: orchHostContext }
-        );
-      }).then(function backfillCompletedTurnsWithResolvedIdentity(identityPreflight) {
-        return ensureActiveChatCompletedTurnsBackfilled(orchSessionId, {
-          reason: "before_request",
-          hostContext: orchHostContext,
-          identityPreflight,
+      if (!nextInputFinalizationOwnership.owned) {
+        Promise.resolve().then(function resolveBackfillIdentityAfterRollbackReconciliation() {
+          return preflightActiveChatBackfillIdentity(
+            orchSessionId,
+            { hostContext: orchHostContext }
+          );
+        }).then(function backfillCompletedTurnsWithResolvedIdentity(identityPreflight) {
+          return ensureActiveChatCompletedTurnsBackfilled(orchSessionId, {
+            reason: "before_request",
+            hostContext: orchHostContext,
+            identityPreflight,
+          });
+        }).catch(function(err) {
+          debugLog("active chat backfill beforeRequest failed:", err && err.message);
         });
-      }).catch(function(err) {
-        debugLog("active chat backfill beforeRequest failed:", err && err.message);
-      });
+      }
       let userInput = String(currentInputDecision.effective_user_input || "");
       let userInputInfo = {
         text: userInput,
@@ -32321,13 +34522,13 @@
 
       const turnLanguageContext = await buildLanguageContextTrace({
         userInput,
-        messages: mainRequestActiveMessages,
+        messages: archiveReadActiveMessages,
         sessionId: orchSessionId,
         hostContext: orchHostContext,
         stage: "beforeRequest",
       });
 
-      let continuityInfo = await resolveContinuityTriggerInfo(userInput, messages, orchSessionId, {
+      let continuityInfo = await resolveContinuityTriggerInfo(userInput, archiveReadMessages, orchSessionId, {
         metaOnlyInput: !!userInputInfo.metaOnly,
       });
       if (continuityInfo && continuityInfo.query) {
@@ -32365,8 +34566,9 @@
         debugLog("fresh-first-turn light mode:", freshFirstTurnLightMode ? "on" : "off", JSON.stringify(freshFirstTurnLightModeMeta));
       }
 
-      const preparedTurnResult = await tryPrepareTurn(orchSessionId, userInput, messages, continuityInfo, type, turnLanguageContext, {
+      const preparedTurnResult = await tryPrepareTurn(orchSessionId, userInput, archiveReadMessages, continuityInfo, type, turnLanguageContext, {
         hostContext: orchHostContext,
+        recentConversationMessages: archiveReadActiveMessages,
         freshFirstTurnLightMode,
         freshFirstTurnLightModeMeta,
         runtimeTokenInfo,
@@ -32375,6 +34577,7 @@
         hostObservations,
         bootstrapObservation,
       });
+      observeTurnWorkflowHUDTiming(orchRequestId, "prepare_completed", Date.now(), preparedTurnResult && preparedTurnResult.backendTiming);
       const fullCurrentInputDecision = preparedTurnResult && preparedTurnResult.currentInputDecision;
       if (!fullCurrentInputDecision || fullCurrentInputDecision.status !== "eligible") {
         const laneStatus = fullCurrentInputDecision && fullCurrentInputDecision.status
@@ -32436,7 +34639,7 @@
                 original_payload_preserved: !!ptLaneStatus.original_payload_preserved,
               } : null,
             });
-            _lastPrepareTurnBundle = (b && (b.sessionState || b.narrativeControl || b.progressionLedger || b.generationPacket || b.continuityPack || b.recallResult || b.supervisorInputPack || b.supervisorResult || b.injectionPack || b.payloadApplicationPlan || b.referenceInjection || b.inputTransparencyModel || b.effectiveInputPreview || b.responseExecutionContract || b.writebackPreview || b.tracePreview || b.sourceContract)) ? b : null;
+            _lastPrepareTurnBundle = (b && (b.sessionState || b.narrativeControl || b.progressionLedger || b.generationPacket || b.continuityPack || b.recallResult || b.supervisorInputPack || b.supervisorResult || b.injectionPack || b.payloadApplicationPlan || b.memoryTransportPlan || b.memoryTransportPayload || b.referenceInjection || b.inputTransparencyModel || b.effectiveInputPreview || b.responseExecutionContract || b.writebackPreview || b.tracePreview || b.sourceContract)) ? b : null;
           } else {
             _lastPrepareTurnSource = "backend-off";
             _lastPrepareTurnFallbackReason = "backend_off";
@@ -32470,7 +34673,7 @@
         }
       }
 
-      const recentContext = getHostContextMessages(messages);
+      const recentContext = getHostContextMessages(archiveReadMessages);
 
       requestPendingContext = {
         requestId: orchRequestId,
@@ -32667,6 +34870,7 @@
 
       let outgoingPayload = payload;
       let payloadMutated = false;
+      let payloadRewriteApplied = false;
       if (beforeRequestRecoveredForRead && payloadComparableMessageCountBeforeRecovery === 0 && extractedMessages && extractedMessages.hasMessageSlot && typeof extractedMessages.rebuild === "function" && Array.isArray(messages) && messages.length > 0) {
         outgoingPayload = extractedMessages.rebuild(messages);
       }
@@ -32680,6 +34884,7 @@
         if (rewriteResult.rewritten) {
           outgoingPayload = rewriteResult.payload;
           payloadMutated = true;
+          payloadRewriteApplied = true;
           lastOrchResult._userInput = effectiveUserInput;
           lastOrchResult._userInputSource = "input_improvement";
           if (lastOrchResult._trace) {
@@ -32954,6 +35159,12 @@
       const _finalPayloadParityEffectiveInput = _finalPayloadTransparency
         ? composeEffectiveInputFromTransparency(_finalPayloadTransparency)
         : "";
+      markFinalConfirmationRetryPayloadReady(finalConfirmationRequestContext, lastOrchResult, {
+        injectionRequested: contextInjectionAllowedForRequest,
+        payloadRewriteApplied,
+        payloadRewriteText: payloadRewriteApplied ? effectiveUserInput : "",
+      });
+      attachFinalConfirmationMemoryTransport(finalConfirmationRequestContext, lastOrchResult, _lastPrepareTurnBundle);
       if (payloadMutated) {
         attachFinalPayloadParityTrace(lastOrchResult && lastOrchResult._trace, payload, outgoingPayload, {
           chatSessionId: orchSessionId,
@@ -33021,6 +35232,8 @@
 
       _effectiveInputAwaitingNewTurn = false;
       return payload;
+    } finally {
+      observeTurnWorkflowHUDTiming(orchRequestId, "main_started");
     }
   }
 
@@ -33052,6 +35265,7 @@
       const persistenceOrchResult = persistenceRequestContext.orchestrationResult || null;
       const rawInputObservationForRequest = persistenceRequestContext.rawInputObservation || null;
       const rawAfterRequestText = typeof content === "string" ? content : "";
+      const responseReceivedAt = Date.now();
       let responseReturnContent = content;
       const nonMainSkip = persistenceRequestContext.nonMainSkip || null;
       if (nonMainSkip && nonMainSkip.reason === "post_output_secondary_request") {
@@ -33119,6 +35333,38 @@
         const sourceAcceptanceFinality = finalObservation.accepted === true
           ? finalObservation.observation
           : null;
+        observeTurnWorkflowHUDTiming(persistenceRequestContext.requestId, "response_received", responseReceivedAt);
+        const goFinalizationPolicy = persistenceOrchResult && (
+          persistenceOrchResult.turnFinalizationPolicy
+          || persistenceOrchResult.bundle && persistenceOrchResult.bundle.turnFinalizationPolicy
+        );
+        const goFinalizationMode = goFinalizationPolicy && goFinalizationPolicy.owner === "go"
+          ? String(goFinalizationPolicy.mode || "")
+          : "immediate_after_response";
+        if (goFinalizationMode === "next_user_input") {
+          if (persistenceOrchResult && persistenceOrchResult._trace) {
+            attachSanitizeTrace(persistenceOrchResult._trace, displaySanitizeTrace);
+          }
+          const queued = queueNextInputFinalization(
+            persistenceRequestContext,
+            sourceAcceptanceFinality,
+          );
+          if (queued) {
+            finishTurnWorkflowHUDCurrentGeneration(persistenceRequestContext.requestId);
+          }
+          updateRuntimeState("lastStreamingAfterRequest", queued ? "watching" : "warn", {
+            detail: queued
+              ? "accepted response waiting for the next user input"
+              : "next-input finalization marker unavailable",
+            reason_code: queued
+              ? "previous_turn_waiting_for_next_user_input"
+              : "next_input_finalization_marker_unavailable",
+            sessionId: chatSessionId,
+            requestType: persistenceRequestType,
+            promptMemoryAvailability: "through_previous_confirmed_turn",
+          });
+          return responseReturnContent;
+        }
         updateRuntimeState("lastStreamingAfterRequest", "ok", {
           detail: "afterRequest content accepted; persistence scheduled",
           reason_code: "after_request_content_accepted",
@@ -33490,52 +35736,6 @@
         debugLog("[M-4c] assistant content missing; skip empty assistant persistence and complete fallback");
         return responseReturnContent ?? "";
       }
-      const recentPersistedDuplicate = hasPersistedAssistantContent
-        ? await findRecentPersistedCompleteTurnPairForContent(chatSessionId, safeSavedUserInput, persistedAssistantContent)
-        : null;
-      if (recentPersistedDuplicate && Number(recentPersistedDuplicate.turnIndex || 0) > 0) {
-        const duplicateTurnIndex = Number(recentPersistedDuplicate.turnIndex);
-        trackTurnIndex(duplicateTurnIndex, chatSessionId);
-        setTurnCounterAtLeast(chatSessionId, duplicateTurnIndex);
-        promoteAssistantSnapshot(chatSessionId, persistedAssistantContent, duplicateTurnIndex);
-        updateRuntimeState("lastSaveStatus", "ok", {
-          turnIndex: duplicateTurnIndex,
-          reason_code: "idempotent_pair_replay",
-          detail: "idempotent pair replay; duplicate save skipped",
-        });
-        updateRuntimeState("lastCompleteStatus", "ok", {
-          turnIndex: duplicateTurnIndex,
-          reason_code: "accepted_existing_pair",
-          detail: "accepted (existing pair)",
-        });
-        updateRuntimeState("lastCompleteTurnStatus", "ok", {
-          turnIndex: duplicateTurnIndex,
-          source: "local",
-          reason_code: "idempotent_pair_replay",
-          detail: "idempotent_pair_replay",
-          failReasons: [],
-        });
-        if (requestOrchResult && requestOrchResult._trace) {
-          requestOrchResult._trace.duplicatePersistenceGuard = {
-            status: "skipped_duplicate_complete_turn",
-            source: recentPersistedDuplicate.source || "recent_backend_pair_duplicate_guard",
-            existingTurnIndex: duplicateTurnIndex,
-            latestBackendTurn: Number(recentPersistedDuplicate.latestBackendTurn || 0),
-            userChars: String(safeSavedUserInput || "").length,
-            assistantChars: String(persistedAssistantContent || "").length,
-          };
-          requestOrchResult._trace.endedAt = new Date().toISOString();
-          lastTurnTrace = requestOrchResult._trace;
-          pushTurnHistory(lastTurnTrace);
-          syncRuntimeStateFromTurnTrace(lastTurnTrace);
-        }
-        requestOrchResult = null;
-        if (panelOpen) {
-          await safeCall(() => refreshOpenArchiveCenterUI(), undefined, "afterRequestRenderDuplicatePairReplay");
-        }
-        debugLog("[M-4c] duplicate complete-turn pair skipped; existing turn:", duplicateTurnIndex);
-        return responseReturnContent ?? "";
-      }
       turnIdx = await reserveAfterRequestPersistenceTurnIndex(
         chatSessionId,
         safeSavedUserInput,
@@ -33653,6 +35853,7 @@
                 sourceAcceptanceFinality,
                 hostContext: persistenceHostContext,
                 risuRequestObservation: buildRisuRequestObservation(persistenceRequestType, "afterRequest", "assistant"),
+                memoryTransportObservation: persistenceRequestContext.memoryTransportObservation || null,
               }
             ),
             null, "buildCompleteTurnRequestBody"
@@ -34584,6 +36785,7 @@
       params.set("chat_session_id", sid);
       params.set("limit", String(EXPLORER_PAGE_SIZE));
       params.set("offset", String(state.offset));
+      if (state.source === "hypamemory") params.set("source", "hypamemory");
       const result = await safeCall(
         () => bridgeFetch("/explorer/memories?" + params.toString()),
         null, "explorerFetchMemories"
@@ -36930,6 +39132,7 @@
         if (!item || Number(item.observation_index) !== index ||
             Number(item.turn_index) < 1 ||
             String(item.turn_identity_state || "") === "unresolved" ||
+            String(item.resolution || "") === "skip_pre_route_visible_pair" ||
             String(item.resolution || "") === "inactive_assistant_observation") {
           return null;
         }
@@ -36946,7 +39149,8 @@
             return { role: String(message && message.role || ""), content: String(message && message.content || "") };
           });
         const userContent = String(item.stored_user_content || assistantObservation.adjacent_user_content || "");
-        const assistantContent = String(item.stored_assistant_content || assistantObservation.assistant_content || "");
+        const observedAssistantContent = String(item.stored_assistant_content || assistantObservation.assistant_content || "");
+        const assistantContent = normalizeAssistantPersistenceCandidate(observedAssistantContent) || observedAssistantContent;
         if (!assistantContent.trim()) return null;
         return {
           observedPairOrdinal: Number(assistantObservation.observedPairOrdinal || item.turn_index),
@@ -38133,13 +40337,24 @@
 
       _hypaImportState.loading = false;
 
-      if (!result || result.status !== "ok") {
+      if (!result || (result.status !== "ok" && result.code !== "hypamemory_import")) {
         _hypaImportState.error = (result && result.detail) ? result.detail : t('hypaImport.requestFailed');
         refreshExplorerUI();
         return;
       }
 
-      _hypaImportState.result = { total: count, detail: result.detail || "" };
+      _hypaImportState.result = {
+        total: result.total ?? count, saved: result.saved, existing: result.existing,
+        failed: result.failed, skipped: result.skipped,
+        analysis_succeeded: result.analysis_succeeded, analysis_failed: result.analysis_failed,
+        analysis_skipped: result.analysis_skipped, detail: result.detail || "",
+        errors: Array.isArray(result.errors) ? result.errors : [],
+        items: Array.isArray(result.items) ? result.items : [],
+      };
+      if (explorerSessionId() === sessionId) {
+        _explorer.memories.source = "hypamemory";
+        await explorerFetchMemories(true);
+      }
       refreshExplorerUI();
 
     } catch (err) {
@@ -40701,7 +42916,10 @@
 
   function renderExplorerMemories() {
     const state = _explorer.memories;
-    const batchToolbar = renderExplorerBatchDeleteToolbar('memories');
+    const batchToolbar = '<div class="mo-ex-actions">' +
+      '<button type="button" class="mo-btn" data-memory-source="" aria-pressed="' + (state.source !== "hypamemory") + '">' + t('hypaImport.allMemories') + '</button>' +
+      '<button type="button" class="mo-btn" data-memory-source="hypamemory" aria-pressed="' + (state.source === "hypamemory") + '">HypaMemory</button>' +
+      '</div>' + renderExplorerBatchDeleteToolbar('memories');
     if (state.loading && state.items.length === 0) return batchToolbar + '<div class="mo-note">' + t('explorer.memories.loading') + '</div>';
     if (state.items.length === 0) return batchToolbar + '<div class="mo-note">' + t('explorer.memories.empty') + '</div>';
 
@@ -40720,6 +42938,7 @@
       // sessionMatch: 현재 선택된 session과 row의 session이 같아야 편집 허용
       const sessionMatch = canEdit && item.chat_session_id === _explorer.selectedSessionId && item.mutation_allowed !== false;
       const historyBadge = renderExplorerHistoryBadge(item);
+      const hypa = item.hypamemory_import || {};
 
       let body;
       if (isEditing) {
@@ -40805,7 +43024,8 @@
           ? '<div class="mo-ex-item-meta" style="margin-top:4px;font-size:11px">🎭 ' + escapeAttr(signalParts.join(' · ')) + '</div>'
           : '';
 
-        body = '<div class="mo-ex-item-full mo-ex-json">' + escapeAttr(fullJson) + '</div>' + embModelLine + signalLine + evidenceHtml;
+        body = (hypa.original_text != null ? '<div class="mo-ex-item-full"><strong>' + t('hypaImport.original') + '</strong><pre class="mo-ex-json">' + escapeAttr(hypa.original_text) + '</pre></div>' : '') +
+          '<div class="mo-ex-item-full mo-ex-json">' + escapeAttr(fullJson) + '</div>' + embModelLine + signalLine + evidenceHtml;
       } else {
         // Phase 5-3: evidence count 힌트
         let evHint = '';
@@ -40848,7 +43068,7 @@
         '<div class="mo-ex-item-header">' +
           batchCheck +
           historyBadge +
-          '<span class="mo-ex-item-turn">turn ' + (item.source_turn ?? "?") + '</span>' +
+          '<span class="mo-ex-item-turn">' + (hypa.original_text != null ? 'HypaMemory #' + escapeAttr(hypa.source_order ?? '?') : 'turn ' + (item.source_turn ?? "?")) + '</span>' +
           (meta ? '<span class="mo-ex-item-meta">' + escapeAttr(meta) + '</span>' : '') +
           '<span class="mo-ex-item-id">#' + item.id + '</span>' +
           (item.created_at ? '<span class="mo-ex-item-time">' + escapeAttr(item.created_at.split(" ")[0] || item.created_at.slice(0,10)) + '</span>' : '') +
@@ -42716,6 +44936,19 @@
       '</aside>' + selectedWorkspaceHtml + '</div>';
   }
 
+  function renderHypaImportResult(result) {
+    const number = (key) => result[key] == null ? '—' : escapeAttr(String(result[key]));
+    const counts = ['total', 'saved', 'existing', 'failed', 'skipped'].map(key =>
+      t('hypaImport.count.' + key) + ' <b>' + number(key) + '</b>').join(' · ');
+    const analysis = ['analysis_succeeded', 'analysis_failed', 'analysis_skipped'].map(key =>
+      t('hypaImport.count.' + key) + ' <b>' + number(key) + '</b>').join(' · ');
+    const details = (result.items || []).filter(item => item.status === 'save_failed' || item.analysis_status === 'failed')
+      .map(item => '#' + item.index + ' · ' + item.status + ' · ' + (item.analysis_status || ''))
+      .concat(result.errors || []).join('\n');
+    return '<div class="mo-reindex-result"><strong>' + t('explorer.hypaImport.done') + '</strong><br>' +
+      counts + '<br>' + analysis + (details ? '<details><summary>' + t('hypaImport.details') + '</summary><pre class="mo-ex-json">' + escapeAttr(details) + '</pre></details>' : '') + '</div>';
+  }
+
   function renderExplorerSection(mode) {
     const managementMode = mode === "management";
     const viewModel = _explorer.viewModel;
@@ -43070,11 +45303,7 @@
     if (selectedSid && managementMode) {
       let hypaResultHtml = '';
       if (_hypaImportState.result) {
-        hypaResultHtml = '<div class="mo-reindex-result">' +
-          '<strong>✅ 가져오기 시작됨</strong><br>' +
-          '요약 수: ' + (_hypaImportState.result.total || 0) +
-          '<br><span style="font-size:11px;color:#888">Critic 분석이 백그라운드에서 진행 중입니다. 완료까지 시간이 걸릴 수 있습니다.</span>' +
-          '</div>';
+        hypaResultHtml = renderHypaImportResult(_hypaImportState.result);
       }
       if (_hypaImportState.error) {
         hypaResultHtml = '<div class="mo-reindex-error">❌ ' + escapeAttr(_hypaImportState.error) + '</div>';
@@ -43084,14 +45313,12 @@
         '<details><summary class="mo-reindex-summary">📥 HypaMemory 가져오기</summary>' +
         '<div class="mo-reindex-body">' +
           '<div class="mo-reindex-row" style="font-size:11px;color:#888">' +
-            '현재 RisuAI 챗의 HypaMemory 요약을 읽어 Critic이 분석합니다.<br>' +
-            'importance 점수, KG triple, 임베딩이 자동 생성됩니다.<br>' +
-            '가져오기 후 RisuAI의 HypaMemory를 꺼 주세요.' +
+            escapeAttr(t('explorer.hypaImport.desc')).replace(/\n/g, '<br>') +
           '</div>' +
           '<div class="mo-reindex-row">' +
             '<button class="mo-btn mo-btn-primary" id="mo-hypa-import-btn"' +
               (_hypaImportState.loading ? ' disabled' : '') + '>' +
-              (_hypaImportState.loading ? '⏳ 전송 중...' : '📥 HypaMemory 가져오기') +
+              (_hypaImportState.loading ? t('explorer.hypaImport.loading') : t('explorer.hypaImport.runBtn')) +
             '</button>' +
           '</div>' +
           hypaResultHtml +
@@ -43304,6 +45531,14 @@
   }
 
   function attachExplorerEvents() {
+    document.querySelectorAll('[data-memory-source]').forEach(button => {
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        _explorer.memories.source = button.getAttribute('data-memory-source') || '';
+        await explorerFetchMemories(true);
+        refreshExplorerUI();
+      });
+    });
     try {
       document.querySelectorAll("[data-memory-admin-session-id]").forEach((sessionButton) => {
         sessionButton.addEventListener("click", (event) => {
@@ -44657,9 +46892,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:#0B0D11}
 .mo-row label{font-size:12px;line-height:1.45;color:#8B909A;flex:0 0 min(220px,34%)}
 .mo-row input[type=text],.mo-row input[type=number],.mo-row input[type=url],.mo-row input[type=search],.mo-row input[type=file]{background:#181C24;border:1px solid rgba(255,255,255,.07);color:#F4F5F7;padding:9px 11px;border-radius:10px;font-size:13px;flex:1;min-width:0;max-width:100%}
 .mo-row input:focus,.mo-row select:focus{border-color:#8FA7FF;outline:none}
-.mo-chk{display:flex;align-items:center;gap:8px}
-.mo-chk input[type=checkbox]{width:16px;height:16px;accent-color:#5D73E6;cursor:pointer}
-.mo-chk label{cursor:pointer;font-size:13px}
+.mo-chk{display:flex;align-items:center;gap:8px;flex:1 1 240px;min-width:0}
+.mo-chk input[type=checkbox]{width:16px;height:16px;flex:0 0 16px;accent-color:#5D73E6;cursor:pointer}
+.mo-chk label{cursor:pointer;font-size:13px;flex:1 1 auto;min-width:0}
 .mo-footer{min-height:64px;background:rgba(19,22,28,.96);border-top:1px solid rgba(255,255,255,.07);padding:10px clamp(16px,3vw,40px);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mo-footer-language{display:flex;align-items:center;gap:8px;margin-left:8px}
 .mo-footer-language label{font-size:12px;color:#8B909A}
@@ -44683,6 +46918,53 @@ html,body{width:100%;height:100%;overflow:hidden;background:#0B0D11}
 .mo-model-grid .mo-field label{font-size:11px;color:#8B909A}
 .mo-model-grid .mo-field input{background:#181C24;border:1px solid rgba(255,255,255,.07);color:#F4F5F7;padding:6px 9px;border-radius:12px;font-size:12px;width:100%}
 .mo-model-grid .mo-field input:focus{border-color:#8FA7FF;outline:none}
+#mo-memory-preprocessing-root{display:flex;flex-direction:column;gap:16px;max-width:1180px;width:100%;margin:22px auto 0;font-size:13px;line-height:1.6;min-width:0;color:var(--mo-text);color-scheme:dark}
+#mo-memory-preprocessing-root .mo-ma-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}
+#mo-memory-preprocessing-root h3{font-size:22px;line-height:1.35;font-weight:650;letter-spacing:-.025em}
+#mo-memory-preprocessing-root h4{font-size:13px;font-weight:600}
+#mo-memory-preprocessing-root .mo-ma-copy{color:var(--mo-muted);font-size:12px;line-height:1.65;margin-top:6px}
+#mo-memory-preprocessing-root .mo-ma-eyebrow{font-size:10px;letter-spacing:.08em;color:var(--mo-blue-soft);margin-bottom:6px}
+#mo-memory-preprocessing-root .mo-ma-check{display:flex;align-items:center;gap:9px;cursor:pointer;font-size:12px;width:fit-content;max-width:100%}
+#mo-memory-preprocessing-root input[type=checkbox]{width:16px;height:16px;flex:0 0 16px;accent-color:var(--mo-blue)}
+#mo-memory-preprocessing-root .mo-ma-enable{padding:10px 14px;border:1px solid var(--mo-line);border-radius:10px;background:var(--mo-float);white-space:nowrap;margin-top:4px}
+#mo-memory-preprocessing-root .mo-ma-flow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;background:var(--mo-bg-soft);border:1px solid var(--mo-line);border-radius:12px;color:var(--mo-muted);font-size:11px}
+#mo-memory-preprocessing-root .mo-ma-flow b{font-weight:500;color:var(--mo-text)}
+#mo-memory-preprocessing-root .mo-ma-role{min-width:0;border:1px solid var(--mo-line);border-radius:14px;background:var(--mo-card);overflow:hidden}
+#mo-memory-preprocessing-root .mo-ma-role>summary{display:flex;align-items:center;gap:12px;cursor:pointer;list-style:none;padding:16px 20px}
+#mo-memory-preprocessing-root summary::-webkit-details-marker{display:none}
+#mo-memory-preprocessing-root .mo-ma-role>summary:after{content:"⌄";font-size:18px;color:var(--mo-muted);margin-left:4px}
+#mo-memory-preprocessing-root .mo-ma-role[open]>summary:after{transform:rotate(180deg)}
+#mo-memory-preprocessing-root .mo-ma-role[open]>summary{border-bottom:1px solid var(--mo-line)}
+#mo-memory-preprocessing-root .mo-ma-number{display:grid;place-items:center;width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:#181E2B;color:var(--mo-blue-soft);font-size:11px;font-weight:600}
+#mo-memory-preprocessing-root .mo-ma-role-title{font-size:13px;font-weight:600;min-width:0;overflow-wrap:anywhere}
+#mo-memory-preprocessing-root .mo-ma-connection{margin-left:auto;font-size:11px;color:var(--mo-muted);text-align:right;overflow-wrap:anywhere;max-width:42%}
+#mo-memory-preprocessing-root .mo-ma-role-body{display:flex;flex-direction:column;gap:20px;padding:20px}
+#mo-memory-preprocessing-root .mo-ma-role-toolbar{display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+#mo-memory-preprocessing-root .mo-ma-editor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:28px;align-items:start}
+#mo-memory-preprocessing-root .mo-ma-editor>section{min-width:0}
+#mo-memory-preprocessing-root fieldset{border:0;min-width:0;margin-top:12px;display:grid;gap:12px}
+#mo-memory-preprocessing-root .mo-ma-inherited{display:flex;flex-direction:column;gap:6px;padding:16px;margin-top:16px;border:1px solid var(--mo-line);border-radius:10px;background:var(--mo-bg-soft);overflow-wrap:anywhere}
+#mo-memory-preprocessing-root .mo-ma-inherited span{font-size:11px;color:var(--mo-muted)}
+#mo-memory-preprocessing-root .mo-ma-inherited strong{font-size:13px;font-weight:500}
+#mo-memory-preprocessing-root .mo-row{display:grid;grid-template-columns:minmax(0,1fr);align-content:start;gap:6px;min-width:0;padding:0}
+#mo-memory-preprocessing-root .mo-row>label{font-size:11px;color:var(--mo-muted);width:auto;min-width:0;margin:0;line-height:1.5}
+#mo-memory-preprocessing-root .mo-row input,#mo-memory-preprocessing-root .mo-row textarea,#mo-memory-preprocessing-root .mo-row select{display:block;width:100%;min-width:0;max-width:100%;background:var(--mo-float);border:1px solid var(--mo-line);border-radius:9px;color:var(--mo-text);font:inherit;font-size:12px;padding:10px 12px}
+#mo-memory-preprocessing-root .mo-ma-generation{display:grid;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid var(--mo-line)}
+#mo-memory-preprocessing-root .mo-row textarea{min-height:270px;resize:vertical;line-height:1.8}
+#mo-memory-preprocessing-root fieldset:disabled{opacity:.6}
+#mo-memory-preprocessing-root .mo-ma-prompt-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+#mo-memory-preprocessing-root .mo-ma-prompt-head .mo-btn{min-height:30px;padding:5px 10px;font-size:11px}
+#mo-memory-preprocessing-root .mo-ma-advanced{border-top:1px solid var(--mo-line);padding-top:14px}
+#mo-memory-preprocessing-root .mo-ma-advanced>summary,#mo-memory-preprocessing-root .mo-ma-help>summary{cursor:pointer;font-size:12px;color:var(--mo-muted);list-style-position:inside}
+#mo-memory-preprocessing-root .mo-ma-advanced-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding-top:14px}
+#mo-memory-preprocessing-root .mo-ma-help{padding:16px 20px;border:1px solid var(--mo-line);border-radius:12px;background:var(--mo-bg-soft);min-width:0}
+#mo-memory-preprocessing-root .mo-ma-help .mo-row{max-width:340px;margin-top:14px}
+#mo-memory-preprocessing-root .mo-ma-help .mo-ma-shared-editor{max-width:none}
+#mo-memory-preprocessing-root pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:1.8;color:var(--mo-muted);margin-top:14px;max-height:380px;overflow:auto}
+#mo-memory-preprocessing-root .mo-ma-savebar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:14px 18px;background:var(--mo-bg-soft);border:1px solid var(--mo-line);border-radius:12px}
+#mo-memory-preprocessing-root #mo-ma-status{font-size:12px;color:var(--mo-blue-soft);overflow-wrap:anywhere}
+#mo-memory-preprocessing-root [hidden]{display:none}
+@media(max-width:760px){#mo-memory-preprocessing-root .mo-ma-heading{flex-direction:column;gap:12px}#mo-memory-preprocessing-root .mo-ma-editor{grid-template-columns:1fr;gap:24px}#mo-memory-preprocessing-root .mo-ma-advanced-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#mo-memory-preprocessing-root .mo-ma-role>summary{padding:14px;gap:9px}#mo-memory-preprocessing-root .mo-ma-role-body{padding:16px}#mo-memory-preprocessing-root .mo-ma-connection{max-width:30%;font-size:10px}#mo-memory-preprocessing-root h3{font-size:20px}#mo-memory-preprocessing-root .mo-row textarea{min-height:240px}}
 .mo-dash{display:flex;flex-direction:column;gap:10px}
 .mo-dash-row{display:flex;align-items:center;gap:10px;min-height:30px;font-size:12px}
 .mo-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
@@ -45108,6 +47390,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
 .mo-status{background:#13161C;border:1px solid rgba(255,255,255,.07);border-radius:12px;color:#8B909A}.mo-status-ok{border-color:rgba(110,190,145,.28);color:#91C9AA}.mo-status-notice{border-color:rgba(143,167,255,.30);color:#8FA7FF}.mo-status-wait{border-color:rgba(199,168,105,.28);color:#C7A869}.mo-status-fail{border-color:rgba(230,133,165,.32);color:#E685A5}
 .mo-session-normalize-status,.mo-session-normalize-result{background:#13161C;border-color:rgba(255,255,255,.07);border-radius:14px;color:#F4F5F7;box-shadow:0 12px 28px rgba(0,0,0,.18)}
 @media(max-width:600px){.mo-hdr{min-height:60px;padding:10px 14px;align-items:center}.mo-brand-mark{width:32px;height:32px;flex-basis:32px}.mo-hdr-left{min-width:0;flex:1 1 auto}.mo-hdr-ver{display:none}.mo-hdr-actions{min-width:0;flex-wrap:nowrap;gap:5px}.mo-hdr-actions>.mo-dash-header-card,.mo-hdr-actions>.mo-hdr-danger-btn{display:none}.mo-debug-toggle{padding:6px 8px}.mo-app-nav{padding:0 14px}.mo-tabs{gap:20px;min-height:48px}.mo-tab-btn{padding:15px 0 13px;font-size:12px}.mo-workspace{padding:20px 14px 56px}.mo-memory-context{align-items:flex-start;flex-direction:column;gap:8px}.mo-memory-layout{display:block;padding-top:18px}.mo-memory-rail{position:static;margin-bottom:18px}.mo-memory-rail-label{display:none}.mo-ex-tabs{flex-direction:row;flex-wrap:nowrap;max-width:100%;overflow-x:auto;scrollbar-width:thin;border-bottom:1px solid rgba(255,255,255,.07)}.mo-ex-tab{width:auto;flex:0 0 auto;border-left:0;border-bottom:2px solid transparent;padding:10px 8px}.mo-ex-tab-active{border-bottom-color:#F4F5F7;background:transparent}.mo-memory-workspace-head{padding-bottom:10px}.mo-memory-management-stack{grid-template-columns:1fr}.mo-memory-admin-session-list{grid-template-columns:1fr}.mo-memory-admin-workspace-head{align-items:flex-start;flex-direction:column}.mo-memory-admin-actions,.mo-memory-admin-secondary{justify-content:flex-start}.mo-model-grid{grid-template-columns:1fr}.mo-row{display:block}.mo-row label{display:block;margin-bottom:7px}.mo-row input,.mo-row select,.mo-row textarea{width:100%}.mo-common-grid>*{grid-column:1/-1}.mo-settings-card,.mo-prompt-card{padding:16px}.mo-footer{padding:10px 14px}.mo-footer-language{margin-left:0}.mo-export-panel{width:100%;height:100%;max-height:100%;border-radius:0}}
+@media(max-width:600px){.mo-row .mo-chk{display:flex;width:100%;min-width:0}.mo-row .mo-chk label{display:inline;flex:1 1 auto;margin:0}}
 @media(max-width:600px){.mo-tl-toolbar{grid-template-columns:1fr;align-items:stretch;padding:12px}.mo-tl-session-chooser{min-width:100%}.mo-tl-session-actions{justify-content:flex-start;gap:5px}.mo-tl-toolbar-meta{grid-column:1;gap:6px 10px}.mo-tl-main{padding:8px}.mo-tl-canvas-tools{align-items:flex-start}.mo-tl-canvas-actions{width:100%}.mo-tl-canvas-actions .mo-btn{flex:1 1 auto}.mo-tl-canvas-frame{height:clamp(480px,72vh,680px);min-height:420px}.mo-tl-node-inspector{inset:8px}.mo-tl-node-inspector-body{padding:12px}.mo-tl-stream{gap:8px}.mo-tl-stream:before{left:36px}.mo-tl-entry{grid-template-columns:24px 18px minmax(0,1fr);gap:6px}.mo-tl-entry-meta{align-items:center;font-size:10px}.mo-tl-entry-time{display:none}.mo-tl-node{width:15px;height:15px;box-shadow:0 0 0 4px #13161C}.mo-tl-card{padding:10px 11px;border-radius:12px}.mo-tl-card-head{flex-direction:column;align-items:stretch;gap:6px}.mo-tl-badges{justify-content:flex-start}.mo-tl-title{font-size:13px;line-height:1.4}.mo-tl-summary{font-size:11px;line-height:1.4;-webkit-line-clamp:1}.mo-tl-turn-item{grid-template-columns:14px minmax(0,1fr);grid-template-areas:"dot kind" "dot text" "dot action";align-items:start;gap:5px 8px;padding:10px}.mo-tl-turn-item .mo-tl-turn-dot{grid-area:dot;margin-top:4px}.mo-tl-turn-kind{grid-area:kind;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mo-tl-turn-item>span:nth-child(3){grid-area:text;min-width:0}.mo-tl-turn-item-title,.mo-tl-turn-preview{white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}.mo-tl-turn-item-title{-webkit-line-clamp:2}.mo-tl-turn-preview{-webkit-line-clamp:2}.mo-tl-row-actions{grid-area:action;justify-self:start;flex-wrap:wrap}.mo-tl-row-actions .mo-btn{min-height:34px;padding:6px 12px}.mo-detail-header{align-items:flex-start}.mo-detail-header strong{min-width:0;overflow:hidden;text-overflow:ellipsis}.mo-detail-header .mo-note{font-size:10px}.mo-tl-node-inspector-head>div{align-items:flex-start;flex-direction:column;gap:2px}.mo-tl-inline-detail{margin-left:0;padding-left:8px}}
 `;
 
@@ -49410,6 +51693,119 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
     }
   }
 
+  // Host UI only: Go supplies roles, prompts, configuration and request traces.
+  async function loadMemoryPreprocessingPanel() {
+    const root = document.getElementById("mo-memory-preprocessing-root");
+    if (!root) return;
+    try {
+      const view = await bridgeFetch("/config/memory-preprocessing");
+      if (document.getElementById("mo-memory-preprocessing-root") !== root) return;
+      const config = view.settings;
+      const publisher = getSettings();
+      const field = (role, key, label, type = "text") => {
+        const id = 'mo-ma-' + role + '-' + key;
+        return '<div class="mo-row"><label for="' + id + '">' + escapeAttr(label) + '</label><input id="' + id + '" type="' + type
+          + '" value="' + escapeAttr(config.roles[role][key] == null ? '' : config.roles[role][key]) + '" autocomplete="off"'
+          + (key === 'temperature' ? ' step="0.1"' : '') + '></div>';
+      };
+      const select = (role, key, label, options) => {
+        const id = 'mo-ma-' + role + '-' + key;
+        return '<div class="mo-row" id="' + id + '-row"><label for="' + id + '">' + escapeAttr(label) + '</label><select id="' + id + '">'
+          + options.map(([value, title]) => '<option value="' + value + '"' + ((config.roles[role][key] || '') === value ? ' selected' : '') + '>' + escapeAttr(title) + '</option>').join('') + '</select></div>';
+      };
+      root.innerHTML = '<div class="mo-ma-heading"><div><div class="mo-ma-eyebrow">기억 준비 · 선택 기능</div><h3>전처리 다중 에이전트</h3>'
+        + '<p class="mo-ma-copy">다섯 담당에 사용할 모델·API와 역할 프롬프트를 각각 지정하세요.<br>담당별로 서로 다른 AI를 사용할 수 있으며, 공통 지침도 직접 편집할 수 있습니다.</p></div>'
+        + '<label class="mo-ma-check mo-ma-enable"><input id="mo-ma-enabled" type="checkbox"' + (config.enabled ? ' checked' : '') + '> 전처리 사용</label></div>'
+        + '<div class="mo-ma-flow"><span>현재 입력·최근 대화</span><span aria-hidden="true">→</span><b>담당별 기억 검토</b><span aria-hidden="true">→</span><span>출판사 서사 가이드</span></div>'
+        + view.role_order.map((role, index) => {
+          const c = config.roles[role];
+          return '<details class="mo-ma-role"' + (index === 0 ? ' open' : '') + '><summary><span class="mo-ma-number">' + String(index + 1).padStart(2, '0') + '</span>'
+            + '<span class="mo-ma-role-title">' + escapeAttr(view.role_names[role]) + '</span><span class="mo-ma-connection" id="mo-ma-' + role + '-connection-label">'
+            + escapeAttr(c.use_publisher ? '출판사 연결 사용' : c.model || '개별 AI 설정') + '</span></summary><div class="mo-ma-role-body">'
+            + '<div class="mo-ma-role-toolbar"><label class="mo-ma-check"><input id="mo-ma-' + role + '-enabled" type="checkbox"' + (c.enabled ? ' checked' : '') + '> 담당 사용</label>'
+            + '<label class="mo-ma-check"><input id="mo-ma-' + role + '-use_publisher" type="checkbox"' + (c.use_publisher ? ' checked' : '') + '> 출판사 연결 공유 (선택)</label></div>'
+            + '<div class="mo-ma-editor"><section><h4>AI 연결</h4><p class="mo-ma-copy">이 담당이 사용할 제공자·주소·모델·키를 지정하세요. 출판사 연결 공유를 켜도 담당 프롬프트는 각각 적용됩니다.</p>'
+            + '<div class="mo-ma-inherited" id="mo-ma-' + role + '-inherited"' + (c.use_publisher ? '' : ' hidden') + '><span>설정 → 일반 · 출판사 LLM</span><strong>'
+            + escapeAttr(publisher.pluginMainModel || '출판사 설정의 모델 사용') + '</strong><span>출판사의 Flex 설정도 함께 사용하며, 이 담당의 전용 프롬프트로 별도 호출합니다.</span></div>'
+            + '<fieldset aria-label="AI 연결 설정" id="mo-ma-' + role + '-connection"' + (c.use_publisher ? ' disabled hidden' : '') + '>'
+            + select(role, 'provider', '제공자', [['', '제공자 선택'], ...LLM_PROVIDER_OPTIONS.map(provider => [provider, ({ openai: 'OpenAI', gemini: 'Gemini · AI Studio', claude: 'Claude', llmgateway: 'LLM Gateway', vertex: 'Vertex AI', openrouter: 'OpenRouter', opencode: 'OpenCode Zen', 'opencode-go': 'OpenCode Go', neuralwatt: 'NeuralWatt', vercel: 'Vercel AI Gateway', copilot: 'Copilot', ollama: 'Ollama', custom: 'Custom' })[provider] || provider])])
+            + field(role, 'endpoint', 'Endpoint') + field(role, 'model', '모델 ID')
+            + field(role, 'api_key', 'API Key', 'password')
+            + select(role, 'llm_gateway_service_tier', '처리 모드 · 지원 모델에서 사용', [['', '기본값'], ['standard', 'Standard'], ['flex', 'Flex'], ['priority', 'Priority']])
+            + select(role, 'vertex_flex_mode', '처리 모드 · Vertex AI', [['', '기본값'], ['off', 'Flex 끄기'], ['provisioned_then_flex', '예약 용량 우선 · Flex'], ['flex_only', 'Flex 전용']])
+            + '</fieldset>'
+            + '<div class="mo-ma-generation"><h4>생성 설정 · 담당별 적용</h4>'
+            + field(role, 'temperature', '온도 (Temperature)', 'number') + field(role, 'max_tokens', '최대 출력 토큰', 'number')
+            + '<p class="mo-ma-copy">1차·보충 분석의 각 호출에 적용합니다. 출판사 연결을 공유해도 이 값을 사용합니다.</p></div></section>'
+            + '<section><div class="mo-ma-prompt-head"><h4>담당 프롬프트</h4><button type="button" class="mo-btn mo-btn-ghost" id="mo-ma-' + role + '-restore">기본값 복원</button></div>'
+            + '<div class="mo-row"><label for="mo-ma-' + role + '-prompt">이 담당이 기억을 고를 때 따를 지침</label><textarea rows="10" id="mo-ma-' + role + '-prompt">'
+            + escapeAttr(c.prompt || view.default_prompts[role]) + '</textarea></div><p class="mo-ma-copy">공통 지침과 함께 적용됩니다. 변경 내용은 저장 후 다음 요청부터 사용합니다.</p></section></div>'
+            + '<details class="mo-ma-advanced"><summary>호출 세부 설정</summary><div class="mo-ma-advanced-grid">'
+            + field(role, 'timeout_ms', '호출 대기 한도 (ms)', 'number') + field(role, 'reasoning_effort', '추론 설정 · 빈칸이면 연결 기본값')
+            + '</div></details></div></details>';
+        }).join('')
+        + '<details class="mo-ma-help" id="mo-ma-common-settings"><summary>공통 프롬프트·입력 설정</summary><p class="mo-ma-copy">공통 지침 뒤에 각 담당의 전용 프롬프트를 붙여 호출합니다. 첫 분석은 병렬이며, 필요한 담당만 한 번 더 분석합니다.</p>'
+        + '<div class="mo-row"><label for="mo-ma-candidate-chars">담당별 후보 기억 입력 한도 (글자)</label><input id="mo-ma-candidate-chars" type="number" value="' + escapeAttr(config.candidate_chars) + '"></div>'
+        + '<div class="mo-row mo-ma-shared-editor"><div class="mo-ma-prompt-head"><label for="mo-ma-shared-prompt">모든 담당에게 적용할 공통 프롬프트</label>'
+        + '<button type="button" class="mo-btn mo-btn-ghost" id="mo-ma-shared-restore">기본값 복원</button></div>'
+        + '<textarea id="mo-ma-shared-prompt" rows="14">' + escapeAttr(view.shared_prompt) + '</textarea></div>'
+        + '<p class="mo-ma-copy">기억 선택·비밀 유지·응답 형식 등 공통 지침입니다. 저장 후 다음 요청부터 적용되며, 빈칸은 기본 공통 지침을 사용합니다. 추천이 없는 영역은 Go 기본 선정을 사용합니다.</p></details>'
+        + '<details class="mo-ma-help"><summary>최근 요청의 프롬프트·분석·선정 결과</summary><pre id="mo-ma-trace"></pre></details>'
+        + '<div class="mo-ma-savebar"><div><p class="mo-ma-copy">이 백엔드에 연결된 모든 챗에 적용됩니다.</p><p id="mo-ma-status" role="status" aria-live="polite">편집만으로 기능이 켜지지는 않습니다.</p></div>'
+        + '<button type="button" class="mo-btn mo-btn-primary" id="mo-ma-save">전처리 설정 저장</button></div>';
+      const pack = _lastPrepareTurnBundle && _lastPrepareTurnBundle.injectionPack;
+      const trace = pack && pack.memory_delivery_plan && pack.memory_delivery_plan.preprocessing;
+      root.querySelector('#mo-ma-trace').textContent = trace ? JSON.stringify(trace, null, 2) : '아직 전처리 실행 결과가 없습니다.';
+      root.querySelector('#mo-ma-shared-restore').addEventListener('click', () => {
+        root.querySelector('#mo-ma-shared-prompt').value = view.default_shared_prompt;
+        root.querySelector('#mo-ma-status').textContent = '기본 공통 프롬프트를 불러왔습니다. 저장하면 적용됩니다.';
+      });
+      view.role_order.forEach(role => {
+        const syncFlexControls = () => {
+          const provider = root.querySelector('#mo-ma-' + role + '-provider').value.trim().toLowerCase();
+          root.querySelector('#mo-ma-' + role + '-llm_gateway_service_tier-row').hidden = !['openai', 'llmgateway', 'vercel', 'neuralwatt', 'custom', 'gemini'].includes(provider);
+          root.querySelector('#mo-ma-' + role + '-vertex_flex_mode-row').hidden = provider !== 'vertex';
+        };
+        root.querySelector('#mo-ma-' + role + '-provider').addEventListener('change', syncFlexControls);
+        syncFlexControls();
+        root.querySelector('#mo-ma-' + role + '-use_publisher').addEventListener('change', event => {
+          root.querySelector('#mo-ma-' + role + '-connection').disabled = event.target.checked;
+          root.querySelector('#mo-ma-' + role + '-connection').hidden = event.target.checked;
+          root.querySelector('#mo-ma-' + role + '-inherited').hidden = !event.target.checked;
+          root.querySelector('#mo-ma-' + role + '-connection-label').textContent = event.target.checked ? '출판사 연결 사용' : '개별 AI 설정';
+        });
+        root.querySelector('#mo-ma-' + role + '-restore').addEventListener('click', () => {
+          root.querySelector('#mo-ma-' + role + '-prompt').value = view.default_prompts[role];
+          root.querySelector('#mo-ma-status').textContent = '기본 프롬프트를 불러왔습니다. 저장하면 적용됩니다.';
+        });
+      });
+      root.querySelector('#mo-ma-save').addEventListener('click', async () => {
+        const button = root.querySelector('#mo-ma-save');
+        button.disabled = true;
+        const next = { enabled: root.querySelector('#mo-ma-enabled').checked, candidate_chars: Number(root.querySelector('#mo-ma-candidate-chars').value), shared_prompt: root.querySelector('#mo-ma-shared-prompt').value, roles: {} };
+        if (next.shared_prompt === view.default_shared_prompt) next.shared_prompt = '';
+        view.role_order.forEach(role => {
+          const c = { ...config.roles[role] };
+          ['enabled', 'use_publisher'].forEach(key => { c[key] = root.querySelector('#mo-ma-' + role + '-' + key).checked; });
+          ['provider', 'endpoint', 'model', 'api_key', 'reasoning_effort', 'prompt', 'llm_gateway_service_tier', 'vertex_flex_mode'].forEach(key => { c[key] = root.querySelector('#mo-ma-' + role + '-' + key).value; });
+          ['temperature', 'max_tokens', 'timeout_ms'].forEach(key => { c[key] = Number(root.querySelector('#mo-ma-' + role + '-' + key).value); });
+          if (c.prompt === view.default_prompts[role]) c.prompt = '';
+          next.roles[role] = c;
+        });
+        try {
+          const saved = await bridgeFetch('/config/memory-preprocessing', { method: 'PUT', body: next });
+          if (!saved) throw new Error('백엔드에 설정을 저장하지 못했습니다.');
+          await loadMemoryPreprocessingPanel();
+          const status = document.getElementById('mo-ma-status');
+          if (status) status.textContent = '저장했습니다. 다음 요청부터 적용됩니다.';
+        } catch (err) {
+          root.querySelector('#mo-ma-status').textContent = '저장 실패: ' + String(err && err.message || err);
+          button.disabled = false;
+        }
+      });
+    } catch (err) { root.textContent = '전처리 설정을 불러오지 못했습니다. 설정 → 일반의 Backend URL과 백엔드 실행 상태를 확인하세요.'; warnLog('preprocessing settings unavailable:', err && err.message || err); }
+  }
+
   async function savePromptEditorPrompt(promptName) {
     const entry = getPromptEditorEntry(promptName);
     if (!entry) return false;
@@ -49578,10 +51974,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
         ? { status: "ok", detail: String(lastGuideSupervisor.guideMode) + (lastGuideSupervisor.guideModeBasis ? " / " + String(lastGuideSupervisor.guideModeBasis) : "") }
         : { status: "unknown", detail: t("dash.status.value.notYet") };
       const settingsFamilyActive = ["settings", "review", "prompt", "dashboard", "debug"].includes(_settingsActiveTab);
-      const extensionsFamilyActive = ["reference", "persona", "lorebook"].includes(_settingsActiveTab);
-      const dashboardViewModel = settingsFamilyActive
-        ? await loadDashboardViewModel(rs, s, guideModeDashboardState)
-        : null;
+      const extensionsFamilyActive = ["reference", "persona", "lorebook", "memory-preprocessing"].includes(_settingsActiveTab);
       if (_settingsActiveTab === "persona") {
         await personaCapsuleResolveSessionDefaults();
       }
@@ -49605,6 +51998,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           ["reference", t('settings.tab.reference')],
           ["persona", t('persona.tab')],
           ["lorebook", t('settings.tab.lorebook')],
+          ["memory-preprocessing", "전처리 다중 에이전트"],
         ];
         return '<div class="mo-subtabs mo-settings-subtabs mo-extension-subtabs" role="tablist">' + tabs.map(([id, label]) =>
           '<button type="button" role="tab" aria-selected="' + (activeTab === id ? 'true' : 'false') + '" tabindex="' + (activeTab === id ? '0' : '-1') + '" class="mo-subtab-btn' + (activeTab === id ? ' is-active' : '') + '" data-tab-jump="' + id + '">' + escapeAttr(label) + '</button>'
@@ -49659,7 +52053,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
     <div class="mo-tab-panel${_settingsActiveTab === "dashboard" ? " is-active" : ""}" role="tabpanel" aria-hidden="${_settingsActiveTab === "dashboard" ? "false" : "true"}" data-tab-panel="dashboard">
     <!-- dashboard panel -->
     <div class="mo-dash" id="mo-dashboard">
-      ${renderDashboardViewModel(dashboardViewModel, dashLabel)}
+      <div class="mo-note" role="status">${escapeAttr(t('common.loading'))}</div>
     </div>
 
     </div>
@@ -49676,7 +52070,9 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
     ${activePrimaryTab === "extensions" ? `
     ${extensionsSubtabsHtml(_settingsActiveTab)}
     <div class="mo-tab-panel is-active" role="tabpanel" aria-hidden="false" data-tab-panel="${_settingsActiveTab}">
-      ${_settingsActiveTab === "persona"
+      ${_settingsActiveTab === "memory-preprocessing"
+        ? '<div id="mo-memory-preprocessing-root">전처리 설정을 불러오는 중입니다…</div>'
+        : _settingsActiveTab === "persona"
         ? '<div id="mo-persona-capsule-root">' + renderPersonaCapsuleSection() + '</div>'
         : (_settingsActiveTab === "lorebook"
           ? '<div id="mo-lorebook-reference-root">' + renderLorebookReferenceManagementSection() + '</div>'
@@ -49766,6 +52162,8 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           <option value="claude"${s.pluginMainProvider === "claude" ? " selected" : ""}>Claude</option>
           <option value="gemini"${s.pluginMainProvider === "gemini" ? " selected" : ""}>Gemini</option>
           <option value="openrouter"${s.pluginMainProvider === "openrouter" ? " selected" : ""}>OpenRouter</option>
+          <option value="opencode"${s.pluginMainProvider === "opencode" ? " selected" : ""}>OpenCode Zen</option>
+          <option value="opencode-go"${s.pluginMainProvider === "opencode-go" ? " selected" : ""}>OpenCode Go</option>
           <option value="llmgateway"${s.pluginMainProvider === "llmgateway" ? " selected" : ""}>LLM Gateway</option>
           <option value="vercel"${s.pluginMainProvider === "vercel" ? " selected" : ""}>Vercel AI Gateway</option>
           <option value="neuralwatt"${s.pluginMainProvider === "neuralwatt" ? " selected" : ""}>NeuralWatt</option>
@@ -49888,6 +52286,8 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           <option value="claude"${s.subLlmProvider === "claude" ? " selected" : ""}>Claude</option>
           <option value="gemini"${s.subLlmProvider === "gemini" ? " selected" : ""}>Gemini</option>
           <option value="openrouter"${s.subLlmProvider === "openrouter" ? " selected" : ""}>OpenRouter</option>
+          <option value="opencode"${s.subLlmProvider === "opencode" ? " selected" : ""}>OpenCode Zen</option>
+          <option value="opencode-go"${s.subLlmProvider === "opencode-go" ? " selected" : ""}>OpenCode Go</option>
           <option value="llmgateway"${s.subLlmProvider === "llmgateway" ? " selected" : ""}>LLM Gateway</option>
           <option value="vercel"${s.subLlmProvider === "vercel" ? " selected" : ""}>Vercel AI Gateway</option>
           <option value="neuralwatt"${s.subLlmProvider === "neuralwatt" ? " selected" : ""}>NeuralWatt</option>
@@ -50115,6 +52515,23 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           <input type="number" id="mo-embeddingTimeout" value="${s.embeddingTimeout ?? DEFAULT_SETTINGS.embeddingTimeout}" min="5" max="3000" step="5">
           <input class="mo-range" type="range" id="mo-embeddingTimeoutRange" data-sync-input="mo-embeddingTimeout" value="${s.embeddingTimeout ?? DEFAULT_SETTINGS.embeddingTimeout}" min="5" max="3000" step="5">
         </div>
+        <div class="mo-row">
+          <label>${t('settings.label.memoryTransportMode')}</label>
+          <select id="mo-memoryTransportMode">
+            <option value="text"${s.memoryTransportMode === "text" ? " selected" : ""}>${t('settings.memoryTransportMode.text')}</option>
+            <option value="google_pdf"${s.memoryTransportMode === "google_pdf" ? " selected" : ""}>${t('settings.memoryTransportMode.google_pdf')}</option>
+            <option value="llm_gateway_pdf"${s.memoryTransportMode === "llm_gateway_pdf" ? " selected" : ""}>${t('settings.memoryTransportMode.llm_gateway_pdf')}</option>
+            <option value="provider_manager_pdf"${s.memoryTransportMode === "provider_manager_pdf" ? " selected" : ""}>${t('settings.memoryTransportMode.provider_manager_pdf')}</option>
+          </select>
+          <small>${t('settings.hint.memoryTransportMode')}</small>
+        </div>
+        <div class="mo-row">
+          <label>${t('settings.label.turnFinalizationMode')}</label>
+          <select id="mo-turnFinalizationMode">
+            <option value="immediate_after_response"${s.turnFinalizationMode === "immediate_after_response" ? " selected" : ""}>${t('settings.turnFinalizationMode.immediate_after_response')}</option>
+            <option value="next_user_input"${s.turnFinalizationMode === "next_user_input" ? " selected" : ""}>${t('settings.turnFinalizationMode.next_user_input')}</option>
+          </select>
+        </div>
         <div class="mo-note">출판사·평론가 타임아웃은 각 LLM 설정의 Timeout (ms)가 백엔드 실제 호출에 그대로 적용됩니다.</div>
       </div>
       <div class="mo-settings-card mo-common-card-memory">
@@ -50127,6 +52544,11 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           <label>${t('settings.label.coreObjectiveMemoryMaxItems')}</label>
           <input type="number" id="mo-coreObjectiveMemoryMaxItems" value="${s.coreObjectiveMemoryMaxItems}" min="1" step="1">
           <small>${t('settings.label.coreObjectiveMemoryMaxItems.hint')}</small>
+        </div>
+        <div class="mo-row mo-range-row">
+          <label>${t('settings.label.recentConversationReferenceCount')}</label>
+          <input type="number" id="mo-recentConversationReferenceCount" value="${s.recentConversationReferenceCount}" min="1" step="1">
+          <small>${t('settings.label.recentConversationReferenceCount.hint')}</small>
         </div>
         <div class="mo-row mo-range-row">
           <label>${t('settings.label.llmRetryCount')}</label>
@@ -50235,7 +52657,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
             <option value="auto"${s.memoryDeliveryBudgetMode !== "custom" ? " selected" : ""}>자동</option>
             <option value="custom"${s.memoryDeliveryBudgetMode === "custom" ? " selected" : ""}>직접 설정</option>
           </select>
-          <small>0은 해당 자료를 끄는 값이 아니라 자동 배분 요청으로 처리합니다. 최종 선택과 순서는 Go 백엔드가 확정합니다.</small>
+          <small>직접 설정은 각 자료가 사용할 문자 상한입니다. 완성 턴 요약과 사건 기억은 ‘사건·최근 기억’ 예산을 함께 씁니다. 0은 해당 자료를 끄는 값이 아니라 자동 배분 요청이며, 최종 선택과 순서는 Go 백엔드가 확정합니다.</small>
         </div>
         <div class="mo-row mo-range-row"><label>사건·최근 기억</label><input type="number" id="mo-memoryBudgetEventRecent" data-memory-budget-control value="${memoryBudgets.event_recent}" min="0" max="50000" step="100"><input class="mo-range" type="range" id="mo-memoryBudgetEventRecentRange" data-sync-input="mo-memoryBudgetEventRecent" data-memory-budget-control value="${memoryBudgets.event_recent}" min="0" max="50000" step="100"></div>
         <div class="mo-row mo-range-row"><label>인물의 객관 상태</label><input type="number" id="mo-memoryBudgetCharacterObjective" data-memory-budget-control value="${memoryBudgets.character_objective}" min="0" max="50000" step="100"><input class="mo-range" type="range" id="mo-memoryBudgetCharacterObjectiveRange" data-sync-input="mo-memoryBudgetCharacterObjective" data-memory-budget-control value="${memoryBudgets.character_objective}" min="0" max="50000" step="100"></div>
@@ -50408,6 +52830,13 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
       document.body.appendChild(overlay);
 
       attachSettingsEvents();
+      // Keep connection settings editable while the backend status request is pending.
+      if (settingsFamilyActive) {
+        loadDashboardViewModel(rs, s, guideModeDashboardState).then(vm => {
+          if (renderRequestId !== _settingsPanelRenderRequestId) return;
+          overlay.querySelector('#mo-dashboard').innerHTML = renderDashboardViewModel(vm, dashLabel);
+        }).catch(err => warnLog('dashboard render failed:', err.message));
+      }
       if (activePrimaryTab === "settings" && s.debug) {
         attachStep17VisibilityEvents();
         attachStep17ReleaseGateEvents();
@@ -50435,6 +52864,9 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
 
       if (activePrimaryTab === "extensions" && _settingsActiveTab === "lorebook") {
         loadLorebookReferenceManagementProjection().catch(() => {});
+      }
+      if (activePrimaryTab === "extensions" && _settingsActiveTab === "memory-preprocessing") {
+        loadMemoryPreprocessingPanel().catch(() => {});
       }
 
       // iframe을 fullscreen으로 보이게 한다
@@ -50668,7 +53100,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
         const body = document.querySelector("#mo-settings-overlay .mo-workspace") || document.querySelector(".mo-workspace");
         const viewportScrollState = captureSettingsViewportScrollState();
         const settingsRoutes = ["settings", "review", "prompt", "dashboard", "debug"];
-        const extensionRoutes = ["reference", "persona", "lorebook"];
+        const extensionRoutes = ["reference", "persona", "lorebook", "memory-preprocessing"];
         const prevPrimaryTab = settingsRoutes.includes(prevTab) ? "settings" : (extensionRoutes.includes(prevTab) ? "reference" : prevTab);
         const nextPrimaryTab = settingsRoutes.includes(tab) ? "settings" : (extensionRoutes.includes(tab) ? "reference" : tab);
         if (body && prevTab && prevTab !== tab) {
@@ -51226,6 +53658,8 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
       const llmGatewayEndpointPlaceholder = "https://api.llmgateway.io/v1";
       const vercelEndpointPlaceholder = "https://ai-gateway.vercel.sh/v1";
       const neuralWattEndpointPlaceholder = "https://api.neuralwatt.com/v1";
+      const openCodeEndpointPlaceholder = "https://opencode.ai/zen/v1";
+      const openRouterEndpointPlaceholder = "https://openrouter.ai/api/v1";
       const syncVertexOverrideRows = (providerId, rowIds) => {
         const providerEl = $(providerId);
         if (!providerEl) return;
@@ -51267,6 +53701,9 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           const isLlmGateway = provider === "llmgateway";
           const isVercel = provider === "vercel";
           const isNeuralWatt = provider === "neuralwatt";
+          const isOpenCode = provider === "opencode";
+          const isOpenCodeGo = provider === "opencode-go";
+          const isOpenRouter = provider === "openrouter";
           const apiLabel = $(apiLabelId);
           const apiInput = $(apiInputId);
           const endpointLabel = $(endpointLabelId);
@@ -51278,7 +53715,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           if (endpointLabel) endpointLabel.textContent = isVertex ? "Vertex Endpoint (비워두면 global 자동)" : "Endpoint (비워두면 자동)";
           if (endpointInput) endpointInput.placeholder = isVertex
             ? vertexEndpointPlaceholder
-            : (isLlmGateway ? llmGatewayEndpointPlaceholder : (isVercel ? vercelEndpointPlaceholder : (isNeuralWatt ? neuralWattEndpointPlaceholder : (defaults.endpoint || ""))));
+            : (isLlmGateway ? llmGatewayEndpointPlaceholder : (isVercel ? vercelEndpointPlaceholder : (isNeuralWatt ? neuralWattEndpointPlaceholder : (isOpenCode ? openCodeEndpointPlaceholder : (isOpenCodeGo ? "https://opencode.ai/zen/go/v1" : (isOpenRouter ? openRouterEndpointPlaceholder : (defaults.endpoint || "")))))));
           if (modelInput) modelInput.placeholder = isVertex ? (defaults.vertexModel || "예: gemini-2.5-flash") : (defaults.model || "");
           if (hint) {
             hint.textContent = "비워두면 선택한 Provider의 공식 기본 Endpoint를 사용하며, 직접 입력하면 입력한 주소를 우선합니다.";
@@ -51338,6 +53775,7 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
             embeddingTimeout: $("mo-embeddingTimeout").value,
             topK: $("mo-topK").value,
             coreObjectiveMemoryMaxItems: $("mo-coreObjectiveMemoryMaxItems").value,
+            recentConversationReferenceCount: $("mo-recentConversationReferenceCount").value,
             lorebookReferenceMode: readChecked("mo-lorebookReferenceAssistEnabled", settings.lorebookReferenceMode !== "search_only")
               ? "reference_assist"
               : "search_only",
@@ -51346,6 +53784,8 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
             referenceInjectionMaxChars: readValue("mo-referenceInjectionMaxChars", settings.referenceInjectionMaxChars),
             lorebookReferenceMaxChars: readValue("mo-lorebookReferenceMaxChars", settings.lorebookReferenceMaxChars),
             memoryDeliveryBudgetMode: readValue("mo-memoryDeliveryBudgetMode", settings.memoryDeliveryBudgetMode, true),
+            memoryTransportMode: readValue("mo-memoryTransportMode", settings.memoryTransportMode, true),
+            turnFinalizationMode: readValue("mo-turnFinalizationMode", settings.turnFinalizationMode, true),
             memoryDeliveryBudgets: {
               event_recent: readValue("mo-memoryBudgetEventRecent", settings.memoryDeliveryBudgets.event_recent),
               character_objective: readValue("mo-memoryBudgetCharacterObjective", settings.memoryDeliveryBudgets.character_objective),
@@ -51480,9 +53920,12 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
           for (let i = 0; i < reasoningSyncRunners.length; i++) reasoningSyncRunners[i]();
           $("mo-topK").value = settings.topK;
           $("mo-coreObjectiveMemoryMaxItems").value = settings.coreObjectiveMemoryMaxItems;
+          $("mo-recentConversationReferenceCount").value = settings.recentConversationReferenceCount;
           $("mo-llmRetryCount").value = settings.llmRetryCount;
           $("mo-injectionBudgetExtraChars").value = settings.injectionBudgetExtraChars || 0;
           setValueIfPresent("mo-memoryDeliveryBudgetMode", settings.memoryDeliveryBudgetMode || "auto");
+          setValueIfPresent("mo-memoryTransportMode", settings.memoryTransportMode || "text");
+          setValueIfPresent("mo-turnFinalizationMode", settings.turnFinalizationMode || "immediate_after_response");
           setCheckedIfPresent("mo-lorebookReferenceAssistEnabled", settings.lorebookReferenceMode !== "search_only");
           const refreshedMemoryBudgets = settings.memoryDeliveryBudgets || DEFAULT_SETTINGS.memoryDeliveryBudgets;
           setValueIfPresent("mo-memoryBudgetEventRecent", refreshedMemoryBudgets.event_recent);
@@ -51877,9 +54320,10 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
       bindPasswordToggleEvents(document);
 
       // ── Sprint 3-C-1: 큐 비우기 버튼 ──
-      const clearBtn = $("mo-queue-clear-btn");
-      if (clearBtn) {
-        clearBtn.addEventListener("click", async () => {
+      const dashboard = $("mo-dashboard");
+      if (dashboard) {
+        dashboard.addEventListener("click", async (event) => {
+          if (!event.target.closest('#mo-queue-clear-btn')) return;
           if (!confirm(t('settings.queue.clearConfirm'))) return;
           await clearFailedQueue();
           await closeSettingsPanel();
@@ -51980,6 +54424,14 @@ button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.45;cur
         }
       } catch (err) {
         warnLog("Pending final confirmation restore failed (non-fatal):", err && err.message);
+      }
+      try {
+        const restoredNextInputFinalizations = await loadNextInputFinalizationsFromStorage();
+        if (restoredNextInputFinalizations > 0) {
+          console.log(LOG_PREFIX, `Next-input finalizations restored: ${restoredNextInputFinalizations} items`);
+        }
+      } catch (err) {
+        warnLog("Next-input finalization restore failed (non-fatal):", err && err.message);
       }
 
       try {

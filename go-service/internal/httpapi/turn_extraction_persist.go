@@ -122,7 +122,11 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 	}
 	rawTurnSummary := extraction["turn_summary"]
 	summary := normalizeCriticTurnSummary(rawTurnSummary)
-	if summary == "" && (isStructuredCriticTurnSummaryValue(rawTurnSummary) || looksLikeStructuredCriticPayloadText(extractionStringFromAny(rawTurnSummary))) {
+	if original, ok := mapFromAny(extraction["hypamemory_import"])["original_text"].(string); ok {
+		// Host-imported text is source material, not a Critic JSON response.
+		summary = original
+		extraction["turn_summary"] = original
+	} else if summary == "" && (isStructuredCriticTurnSummaryValue(rawTurnSummary) || looksLikeStructuredCriticPayloadText(extractionStringFromAny(rawTurnSummary))) {
 		if fallback := strings.Join(strings.Fields(content), " "); fallback != "" {
 			summary = fallback
 			extraction["turn_summary"] = fallback
@@ -181,6 +185,14 @@ func (s *Server) saveCriticExtractionArtifacts(ctx context.Context, sid string, 
 			return result
 		}
 		existingEvidence = admittedEvidence
+		if store.MemoryAdmissionVectorReplayRequested(ctx) {
+			// Reindex owns only the canonical memory/evidence/precise-memory
+			// vector materialization performed by the admission transaction.
+			// Replaying the remaining Critic artifact reducer would append active
+			// and canonical states, pending threads, storylines, and other derived
+			// rows every time an administrator refreshes vectors.
+			return result
+		}
 		s.savePostAdmissionPreciseMemoryProjections(ctx, sid, admittedPreciseUnits, now, &result)
 	}
 	if !admissionHandled {

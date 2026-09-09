@@ -93,6 +93,12 @@ func TestPrepareTurnSettingsDefaultMemoryInjectionBudget(t *testing.T) {
 	if settings.MaxInjectionChars == nil || *settings.MaxInjectionChars != 18000 {
 		t.Fatalf("expected default memory injection budget 18000, got %v", settings.MaxInjectionChars)
 	}
+	if settings.MemoryTransportMode == nil || *settings.MemoryTransportMode != "text" {
+		t.Fatalf("expected default memory transport mode text, got %v", settings.MemoryTransportMode)
+	}
+	if settings.RecentConversationReferenceCount == nil || *settings.RecentConversationReferenceCount != 5 {
+		t.Fatalf("expected default recent conversation reference count 5, got %v", settings.RecentConversationReferenceCount)
+	}
 }
 
 func TestActiveScopeRequestRequiredField(t *testing.T) {
